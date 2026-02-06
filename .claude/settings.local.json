@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx vitest run:*)",
+      "WebSearch",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:takopi.dev)",
+      "WebFetch(domain:commons.wikimedia.org)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:upload.wikimedia.org)",
+      "Bash(curl:*)",
+      "mcp__popmelt__reference",
+      "Bash(python3:*)"
+    ]
+  },
+  "disabledMcpjsonServers": [
+    "supabase"
+  ]
+}

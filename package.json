@@ -1,0 +1,36 @@
+{
+  "name": "@kit/popmelt",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "clean": "git clean -xdf .turbo node_modules",
+    "format": "prettier --check \"**/*.{ts,tsx}\"",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./provider": "./src/components/DevToolsProvider.tsx",
+    "./server": "./src/server/index.ts"
+  },
+  "dependencies": {
+    "modern-screenshot": "^4.4.39"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@kit/eslint-config": "workspace:*",
+    "@kit/prettier-config": "workspace:*",
+    "@kit/tsconfig": "workspace:*",
+    "@types/react": "19.1.0",
+    "@types/react-dom": "19.1.2",
+    "lucide-react": "^0.487.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "typescript": "^5.8.3",
+    "vitest": "^4.0.18"
+  }
+}
