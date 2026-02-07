@@ -25,6 +25,8 @@ type AnnotationCanvasProps = {
   inFlightStyleSelectors?: Set<string>;
   inFlightSelectorColors?: Map<string, string>;
   onReply?: (threadId: string, reply: string) => void;
+  onViewThread?: (threadId: string) => void;
+  isThreadPanelOpen?: boolean;
 };
 
 type ActiveTextInput = {
@@ -64,7 +66,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onReply }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onReply, onViewThread, isThreadPanelOpen }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeText, setActiveText] = useState<ActiveTextInput | null>(() => {
@@ -344,6 +346,27 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     }
     return map;
   }, [state.annotations, supersededIds]);
+
+  // Derive focused selector colors from selected annotations (for dotted outlines on inspector-created elements)
+  const focusedSelectorColors = useMemo(() => {
+    if (selectedAnnotationIds.length === 0) return null;
+    const map = new Map<string, string>();
+    for (const id of selectedAnnotationIds) {
+      const ann = state.annotations.find(a => a.id === id);
+      if (!ann) continue;
+      // Check this annotation and its group mates for linked selectors
+      const group = ann.groupId
+        ? state.annotations.filter(a => a.groupId === ann.groupId)
+        : [ann];
+      for (const a of group) {
+        if (a.linkedSelector && !inFlightSelectorColors?.has(a.linkedSelector)) {
+          const color = a.color || state.activeColor;
+          map.set(a.linkedSelector, color);
+        }
+      }
+    }
+    return map.size > 0 ? map : null;
+  }, [selectedAnnotationIds, state.annotations, state.activeColor, inFlightSelectorColors]);
 
   // Redraw when state changes or scroll position changes
   useEffect(() => {
@@ -1572,6 +1595,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           scrollY={scroll.y}
           annotationGroupMap={annotationGroupMap}
           onReply={onReply}
+          onViewThread={onViewThread}
+          isThreadPanelOpen={isThreadPanelOpen}
+          onSelectAnnotation={selectAnnotation}
         />
       )}
 
@@ -1590,6 +1616,11 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {/* Marching ants borders for in-flight style modifications */}
       {state.isAnnotating && inFlightSelectorColors && inFlightSelectorColors.size > 0 && (
         <MarchingAntsBorders inFlightSelectorColors={inFlightSelectorColors} />
+      )}
+
+      {/* Dotted outlines for focused (selected) inspector-created elements */}
+      {state.isAnnotating && focusedSelectorColors && (
+        <MarchingAntsBorders inFlightSelectorColors={focusedSelectorColors} animated={false} />
       )}
 
       {/* Inspector mode: Element highlight */}
@@ -1808,6 +1839,9 @@ function ResolutionBadges({
   scrollY,
   annotationGroupMap,
   onReply,
+  onViewThread,
+  isThreadPanelOpen,
+  onSelectAnnotation,
 }: {
   annotations: Annotation[];
   supersededIds: Set<string>;
@@ -1815,6 +1849,9 @@ function ResolutionBadges({
   scrollY: number;
   annotationGroupMap: Map<string, number>;
   onReply?: (threadId: string, reply: string) => void;
+  onViewThread?: (threadId: string) => void;
+  isThreadPanelOpen?: boolean;
+  onSelectAnnotation?: (id: string) => void;
 }) {
   // Find text annotations that are resolved/needs_review (or whose group mate is)
   const badgePositions: { annotation: Annotation; x: number; y: number; size: number; isNeedsReview: boolean; groupNumber?: number }[] = [];
@@ -1878,6 +1915,9 @@ function ResolutionBadges({
           isNeedsReview={!!isNeedsReview}
           groupNumber={groupNumber}
           onReply={onReply}
+          onViewThread={onViewThread}
+          isThreadPanelOpen={isThreadPanelOpen}
+          onSelectAnnotation={onSelectAnnotation}
         />
       ))}
     </>
@@ -1893,6 +1933,9 @@ function ResolutionBadge({
   isNeedsReview,
   groupNumber,
   onReply,
+  onViewThread,
+  isThreadPanelOpen,
+  onSelectAnnotation,
 }: {
   annotation: Annotation;
   annotations: Annotation[];
@@ -1902,6 +1945,9 @@ function ResolutionBadge({
   isNeedsReview: boolean;
   groupNumber?: number;
   onReply?: (threadId: string, reply: string) => void;
+  onViewThread?: (threadId: string) => void;
+  isThreadPanelOpen?: boolean;
+  onSelectAnnotation?: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [replyText, setReplyText] = useState('');
@@ -1964,14 +2010,19 @@ function ResolutionBadge({
         position: 'fixed',
         left: x,
         top: y,
-        zIndex: 9999,
+        zIndex: expanded ? 10002 : 9999,
         pointerEvents: 'auto',
       }}
     >
       {/* Collapsed badge */}
       {!expanded && (
         <div
-          onClick={() => setExpanded(true)}
+          onClick={() => {
+            onSelectAnnotation?.(annotation.id);
+            if (threadId && onViewThread) {
+              onViewThread(threadId);
+            }
+          }}
           style={{
             height: size,
             display: 'flex',
@@ -2043,49 +2094,75 @@ function ResolutionBadge({
             </div>
           )}
 
-          {/* Reply area */}
-          {threadId && onReply && (
+          {/* Reply area + View conversation */}
+          {threadId && (
             <div style={{ padding: PADDING }}>
-              <textarea
-                ref={textareaRef}
-                value={replyText}
-                onChange={(e) => setReplyText(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Reply..."
-                style={{
-                  width: '100%',
-                  minHeight: 40,
-                  padding: PADDING,
-                  fontSize: 12,
-                  fontFamily: FONT_FAMILY,
-                  backgroundColor: 'rgba(0, 0, 0, 0.04)',
-                  color: '#1f2937',
-                  border: '1px solid rgba(0, 0, 0, 0.1)',
-                  borderRadius: 0,
-                  outline: 'none',
-                  resize: 'vertical',
-                  lineHeight: 1.4,
-                  boxSizing: 'border-box',
-                }}
-              />
-              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+              {onReply && (
+                <>
+                  <textarea
+                    ref={textareaRef}
+                    value={replyText}
+                    onChange={(e) => setReplyText(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    placeholder="Reply..."
+                    style={{
+                      width: '100%',
+                      minHeight: 40,
+                      padding: PADDING,
+                      fontSize: 12,
+                      fontFamily: FONT_FAMILY,
+                      backgroundColor: 'rgba(0, 0, 0, 0.04)',
+                      color: '#1f2937',
+                      border: '1px solid rgba(0, 0, 0, 0.1)',
+                      borderRadius: 0,
+                      outline: 'none',
+                      resize: 'vertical',
+                      lineHeight: 1.4,
+                      boxSizing: 'border-box',
+                    }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+                    <button
+                      onClick={handleSubmit}
+                      disabled={!replyText.trim()}
+                      style={{
+                        padding: '4px 12px',
+                        fontSize: 11,
+                        fontFamily: FONT_FAMILY,
+                        fontWeight: 600,
+                        backgroundColor: replyText.trim() ? annotation.color : 'rgba(0,0,0,0.1)',
+                        color: replyText.trim() ? '#ffffff' : 'rgba(0,0,0,0.3)',
+                        border: 'none',
+                        cursor: replyText.trim() ? 'pointer' : 'default',
+                      }}
+                    >
+                      Send &#8984;&#9166;
+                    </button>
+                  </div>
+                </>
+              )}
+              {onViewThread && (
                 <button
-                  onClick={handleSubmit}
-                  disabled={!replyText.trim()}
+                  onClick={() => {
+                    onViewThread(threadId);
+                    setExpanded(false);
+                  }}
                   style={{
-                    padding: '4px 12px',
+                    width: '100%',
+                    padding: '5px 0',
                     fontSize: 11,
                     fontFamily: FONT_FAMILY,
-                    fontWeight: 600,
-                    backgroundColor: replyText.trim() ? annotation.color : 'rgba(0,0,0,0.1)',
-                    color: replyText.trim() ? '#ffffff' : 'rgba(0,0,0,0.3)',
-                    border: 'none',
-                    cursor: replyText.trim() ? 'pointer' : 'default',
+                    fontWeight: 500,
+                    backgroundColor: 'transparent',
+                    color: '#6b7280',
+                    border: '1px solid rgba(0, 0, 0, 0.1)',
+                    cursor: 'pointer',
+                    marginTop: onReply ? 8 : 0,
                   }}
                 >
-                  Send &#8984;&#9166;
+                  View conversation &rarr;
                 </button>
-              </div>
+              )}
             </div>
           )}
         </div>
@@ -2097,8 +2174,10 @@ function ResolutionBadge({
 // Marching ants border for in-flight style modifications
 function MarchingAntsBorders({
   inFlightSelectorColors,
+  animated = true,
 }: {
   inFlightSelectorColors: Map<string, string>;
+  animated?: boolean;
 }) {
   const [borders, setBorders] = useState<
     { selector: string; top: number; left: number; width: number; height: number; color: string }[]
@@ -2170,7 +2249,7 @@ function MarchingAntsBorders({
 
   return (
     <>
-      <style>{`@keyframes popmelt-march { to { stroke-dashoffset: -6; } }`}</style>
+      {animated && <style>{`@keyframes popmelt-march { to { stroke-dashoffset: -6; } }`}</style>}
       {borders.map((border) => (
         <div
           key={border.selector}
@@ -2196,7 +2275,7 @@ function MarchingAntsBorders({
               stroke={border.color}
               strokeWidth="1"
               strokeDasharray="2 4"
-              style={{ animation: 'popmelt-march 0.5s steps(2) infinite' }}
+              style={animated ? { animation: 'popmelt-march 0.5s steps(2) infinite' } : undefined}
             />
           </svg>
           <div style={{ ...cornerDotStyle, top: -1, left: -1, backgroundColor: border.color }} />
@@ -2357,7 +2436,7 @@ function QuestionBadge({
         position: 'fixed',
         left: x,
         top: y,
-        zIndex: 9999,
+        zIndex: expanded ? 10002 : 9999,
         pointerEvents: 'auto',
       }}
     >

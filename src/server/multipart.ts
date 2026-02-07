@@ -5,6 +5,12 @@ export type ParsedMultipart = {
   feedback: string;
   color?: string;
   provider?: string;
+  model?: string;
+  // Planner fields
+  goal?: string;
+  pageUrl?: string;
+  viewport?: string;
+  planId?: string;
 };
 
 /**
@@ -27,6 +33,11 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   let feedback: string | undefined;
   let color: string | undefined;
   let provider: string | undefined;
+  let model: string | undefined;
+  let goal: string | undefined;
+  let pageUrl: string | undefined;
+  let viewport: string | undefined;
+  let planId: string | undefined;
 
   // Split body by delimiter
   let offset = 0;
@@ -81,13 +92,24 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
       color = part.body.toString('utf-8');
     } else if (name === 'provider') {
       provider = part.body.toString('utf-8');
+    } else if (name === 'model') {
+      model = part.body.toString('utf-8');
+    } else if (name === 'goal') {
+      goal = part.body.toString('utf-8');
+    } else if (name === 'pageUrl') {
+      pageUrl = part.body.toString('utf-8');
+    } else if (name === 'viewport') {
+      viewport = part.body.toString('utf-8');
+    } else if (name === 'planId') {
+      planId = part.body.toString('utf-8');
     }
   }
 
   if (!screenshot) throw new Error('Missing screenshot field');
-  if (!feedback) throw new Error('Missing feedback field');
+  // feedback is optional for plan endpoints
+  if (!feedback) feedback = '';
 
-  return { screenshot, feedback, color, provider };
+  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

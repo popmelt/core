@@ -11,14 +11,17 @@ import {
   type PropsWithChildren,
 } from 'react';
 
-import { useBridgeConnection } from '../hooks/useBridgeConnection';
+import { useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution } from '../tools/types';
-import { sendReplyToBridge, sendToBridge } from '../utils/bridge-client';
-import { buildFeedbackData, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
+import { FONT_FAMILY } from '../tools/text';
+import { approvePlan, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge } from '../utils/bridge-client';
+import { resolveRegionToElement } from '../utils/dom';
+import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { BridgeEventStack } from './BridgeStatusPanel';
+import { ThreadPanel } from './ThreadPanel';
 
 type DevToolsContextValue = {
   isEnabled: boolean;
@@ -33,6 +36,92 @@ type DevToolsProviderProps = PropsWithChildren<{
 
 const DEFAULT_BRIDGE_URL = 'http://localhost:1111';
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
+const MODEL_STORAGE_KEY = 'devtools-model';
+
+// Model definitions per provider
+const CLAUDE_MODELS = [
+  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
+  { id: 'claude-sonnet-4-5-20250929', label: 'Sonn 4.5' },
+] as const;
+
+const CODEX_MODELS = [
+  { id: 'gpt-5.3-codex', label: 'Codex 5.3' },
+  { id: 'gpt-5.1-codex-mini', label: 'Mini 5.1' },
+] as const;
+
+export const MODEL_MAP = { claude: CLAUDE_MODELS, codex: CODEX_MODELS } as const;
+
+// Cross-provider equivalence: index 0 = fast, index 1 = thorough
+function equivalentModelIndex(fromProvider: string, toProvider: string, currentIndex: number): number {
+  const fromModels = fromProvider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  const toModels = toProvider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  return Math.min(currentIndex, toModels.length - 1);
+}
+
+function PlanApprovalBar({ taskCount, onApprove, onDismiss }: {
+  taskCount: number;
+  onApprove: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      data-devtools="plan-approval-bar"
+      style={{
+        position: 'fixed',
+        bottom: 72,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '8px 16px',
+        backgroundColor: '#ffffff',
+        border: '1px solid rgba(0, 0, 0, 0.1)',
+        zIndex: 10001,
+        fontFamily: FONT_FAMILY,
+        fontSize: 12,
+        color: '#1f2937',
+      }}
+    >
+      <span style={{ fontWeight: 600 }}>
+        {taskCount} task{taskCount !== 1 ? 's' : ''} planned
+      </span>
+      <span style={{ color: '#6b7280' }}>
+        Review annotations, then approve to start workers
+      </span>
+      <button
+        onClick={onApprove}
+        style={{
+          padding: '4px 14px',
+          fontSize: 11,
+          fontWeight: 600,
+          fontFamily: FONT_FAMILY,
+          backgroundColor: '#1f2937',
+          color: '#ffffff',
+          border: 'none',
+          cursor: 'pointer',
+        }}
+      >
+        Approve
+      </button>
+      <button
+        onClick={onDismiss}
+        style={{
+          padding: '4px 14px',
+          fontSize: 11,
+          fontWeight: 600,
+          fontFamily: FONT_FAMILY,
+          backgroundColor: 'transparent',
+          color: '#6b7280',
+          border: '1px solid rgba(0, 0, 0, 0.1)',
+          cursor: 'pointer',
+        }}
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
 
 export function DevToolsProvider({
   children,
@@ -45,13 +134,43 @@ export function DevToolsProvider({
     if (typeof window === 'undefined') return 'claude';
     return localStorage.getItem(PROVIDER_STORAGE_KEY) || 'claude';
   });
+  const [modelIndex, setModelIndex] = useState<number>(() => {
+    if (typeof window === 'undefined') return 0;
+    const saved = localStorage.getItem(MODEL_STORAGE_KEY);
+    return saved ? parseInt(saved, 10) || 0 : 0;
+  });
+
+  const models = provider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  const currentModel = models[modelIndex] ?? models[0]!;
 
   const handleProviderChange = useCallback((newProvider: string) => {
+    const oldProvider = provider;
     setProvider(newProvider);
     localStorage.setItem(PROVIDER_STORAGE_KEY, newProvider);
+    // Map to equivalent model tier
+    const newIndex = equivalentModelIndex(oldProvider, newProvider, modelIndex);
+    setModelIndex(newIndex);
+    localStorage.setItem(MODEL_STORAGE_KEY, String(newIndex));
+  }, [provider, modelIndex]);
+
+  const handleModelChange = useCallback((newIndex: number) => {
+    setModelIndex(newIndex);
+    localStorage.setItem(MODEL_STORAGE_KEY, String(newIndex));
   }, []);
-  // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors }
-  const [inFlightJobs, setInFlightJobs] = useState<Map<string, { annotationIds: Set<string>; styleSelectors: Set<string>; color: string }>>(new Map());
+  // Thread panel state (declared early so callbacks can reference setOpenThreadId)
+  const [openThreadId, setOpenThreadId] = useState<string | null>(null);
+
+  // Active plan state
+  const [activePlan, setActivePlan] = useState<{
+    planId: string;
+    threadId?: string;
+    goal: string;
+    tasks?: PendingPlan['tasks'];
+    status: 'planning' | 'awaiting_approval' | 'executing' | 'reviewing' | 'done';
+  } | null>(null);
+
+  // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors, color, threadId }
+  const [inFlightJobs, setInFlightJobs] = useState<Map<string, { annotationIds: Set<string>; styleSelectors: Set<string>; color: string; threadId?: string; planId?: string }>>(new Map());
 
   // Flatten all in-flight annotation IDs and style selectors for the canvas
   const inFlightAnnotationIds = useMemo(() => {
@@ -195,7 +314,10 @@ export function DevToolsProvider({
     if (latestDone && Array.isArray(latestDone.data.resolutions)) {
       dispatch({
         type: 'APPLY_RESOLUTIONS',
-        payload: { resolutions: latestDone.data.resolutions as AnnotationResolution[] },
+        payload: {
+          resolutions: latestDone.data.resolutions as AnnotationResolution[],
+          threadId: latestDone.data.threadId as string | undefined,
+        },
       });
     }
   }, [bridge.events, dispatch]);
@@ -225,9 +347,105 @@ export function DevToolsProvider({
     return success;
   }, [state.annotations, state.styleModifications, dispatch]);
 
+  // Plan goal handler: captures full-page screenshot and sends to planner
+  const handlePlanGoal = useCallback(async (goal: string): Promise<boolean> => {
+    try {
+      const screenshotBlob = await captureFullPage(document.body);
+      if (!screenshotBlob) return false;
+
+      const { planId, threadId } = await sendPlanToBridge(
+        screenshotBlob,
+        goal,
+        bridgeUrl,
+        provider,
+        currentModel.id,
+        window.location.href,
+        { width: window.innerWidth, height: window.innerHeight },
+      );
+
+      setActivePlan({
+        planId,
+        threadId,
+        goal,
+        status: 'planning',
+      });
+
+      // Open thread panel to show planner streaming
+      if (threadId) setOpenThreadId(threadId);
+
+      return true;
+    } catch (err) {
+      console.error('[DevTools] Failed to send plan:', err);
+      return false;
+    }
+  }, [bridgeUrl, provider, currentModel.id]);
+
+  // Materialize plan tasks as annotations on the canvas
+  const materializePlan = useCallback(async (tasks: PendingPlan['tasks']) => {
+    const planId = activePlan?.planId;
+    if (!planId) return;
+
+    // Stagger annotation creation for visual effect
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i]!;
+
+      // Scroll the region into view
+      const regionCenterY = task.region.y + task.region.height / 2;
+      const viewportH = window.innerHeight;
+      if (regionCenterY < window.scrollY || regionCenterY > window.scrollY + viewportH) {
+        window.scrollTo({
+          top: Math.max(0, regionCenterY - viewportH / 2),
+          behavior: 'smooth',
+        });
+        // Wait for scroll to settle
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      // Resolve region to DOM element
+      const resolved = resolveRegionToElement(task.region);
+
+      const groupId = Math.random().toString(36).substring(2, 9);
+      // Use the resolved element's bounding rect (in page coords) for tighter fit
+      const region = resolved
+        ? {
+            x: resolved.rect.left + window.scrollX,
+            y: resolved.rect.top + window.scrollY,
+            width: resolved.rect.width,
+            height: resolved.rect.height,
+          }
+        : task.region;
+
+      dispatch({
+        type: 'ADD_PLAN_ANNOTATION',
+        payload: {
+          groupId,
+          planId,
+          planTaskId: task.id,
+          instruction: task.instruction,
+          region,
+          color: state.activeColor,
+          linkedSelector: resolved?.selector,
+          elements: resolved ? [resolved.info] : undefined,
+        },
+      });
+
+      // 200ms stagger between annotations
+      if (i < tasks.length - 1) {
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  }, [activePlan?.planId, state.activeColor, dispatch]);
+
   const handleSendToClaude = useCallback(async (): Promise<boolean> => {
     const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
     if (!canvas) return false;
+
+    // Detect planner mode: no pending annotations = planner goal
+    const activeAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
+    if (activeAnnotations.length === 0 && state.styleModifications.filter(m => !m.captured).length === 0) {
+      // No annotations or style changes — this is handled by the toolbar goal input
+      return false;
+    }
 
     // Capture screenshot
     const blobs = await captureScreenshot(document.body, canvas, state.annotations);
@@ -238,14 +456,13 @@ export function DevToolsProvider({
     if (!stitchedBlob) return false;
 
     // Build feedback data
-    const activeAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
     const feedbackData = buildFeedbackData(activeAnnotations, state.styleModifications);
     const feedbackJson = JSON.stringify(feedbackData);
 
     // Send to bridge
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId } = await sendToBridge(stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider);
+      const { jobId, threadId: assignedThreadId } = await sendToBridge(stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id);
 
       // Track which annotations and style modifications are in-flight for this job
       const sentAnnotationIds = new Set(activeAnnotations.map(a => a.id));
@@ -256,6 +473,7 @@ export function DevToolsProvider({
         annotationIds: sentAnnotationIds,
         styleSelectors: sentStyleSelectors,
         color: state.activeColor,
+        threadId: assignedThreadId,
       }));
 
       dispatch({ type: 'MARK_CAPTURED' });
@@ -271,35 +489,36 @@ export function DevToolsProvider({
       console.error('[DevTools] Failed to send to bridge:', err);
       return false;
     }
-  }, [state.annotations, state.styleModifications, state.activeColor, dispatch, bridgeUrl, provider]);
+  }, [state.annotations, state.styleModifications, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string) => {
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider);
+      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id);
 
       // Track the new continuation job (no specific annotations — reuses thread context)
       setInFlightJobs(prev => new Map(prev).set(jobId, {
         annotationIds: new Set<string>(),
         styleSelectors: new Set<string>(),
         color: state.activeColor,
+        threadId,
       }));
 
-      // Transition annotations back to in_flight
-      const waitingAnnotations = state.annotations.filter(
-        a => a.threadId === threadId && a.status === 'waiting_input'
+      // Transition thread annotations back to in_flight (from waiting_input, resolved, or needs_review)
+      const threadAnnotations = state.annotations.filter(
+        a => a.threadId === threadId && (a.status === 'waiting_input' || a.status === 'resolved' || a.status === 'needs_review')
       );
-      if (waitingAnnotations.length > 0) {
+      if (threadAnnotations.length > 0) {
         dispatch({
           type: 'SET_ANNOTATION_STATUS',
-          payload: { ids: waitingAnnotations.map(a => a.id), status: 'in_flight' },
+          payload: { ids: threadAnnotations.map(a => a.id), status: 'in_flight' },
         });
         // Re-track them as in-flight for the new job
         setInFlightJobs(prev => {
           const job = prev.get(jobId);
           if (job) {
-            for (const a of waitingAnnotations) job.annotationIds.add(a.id);
+            for (const a of threadAnnotations) job.annotationIds.add(a.id);
           }
           return new Map(prev);
         });
@@ -309,7 +528,75 @@ export function DevToolsProvider({
     } catch (err) {
       console.error('[DevTools] Failed to send reply:', err);
     }
-  }, [state.activeColor, state.annotations, bridgeUrl, bridge.dismissQuestion, dispatch, provider]);
+  }, [state.activeColor, state.annotations, bridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
+
+  // Handle plan approval: dispatch workers for each approved annotation
+  const handleApprovePlan = useCallback(async () => {
+    if (!activePlan || !activePlan.planId) return;
+
+    try {
+      // Approve on server side
+      await approvePlan(activePlan.planId, bridgeUrl);
+
+      setActivePlan(prev => prev ? { ...prev, status: 'executing' } : null);
+
+      // Collect plan annotations that are still pending (user may have deleted some)
+      const planAnnotations = state.annotations.filter(
+        a => a.planId === activePlan.planId && a.type !== 'text' && (a.status ?? 'pending') === 'pending'
+      );
+
+      const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
+      if (!canvas) return;
+
+      // Send each annotation as a worker job
+      for (const ann of planAnnotations) {
+        const blobs = await captureScreenshot(document.body, canvas, [ann]);
+        if (blobs.length === 0) continue;
+
+        const stitchedBlob = await stitchBlobs(blobs);
+        if (!stitchedBlob) continue;
+
+        const feedbackData = buildFeedbackData([ann], []);
+        const feedbackJson = JSON.stringify(feedbackData);
+        const hexColor = cssColorToHex(ann.color);
+
+        const { jobId, threadId: assignedThreadId } = await sendToBridge(
+          stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id
+        );
+
+        // Track in-flight
+        setInFlightJobs(prev => new Map(prev).set(jobId, {
+          annotationIds: new Set([ann.id]),
+          styleSelectors: new Set<string>(),
+          color: ann.color,
+          threadId: assignedThreadId,
+          planId: activePlan.planId,
+        }));
+
+        // Mark annotation as in-flight
+        dispatch({
+          type: 'SET_ANNOTATION_STATUS',
+          payload: { ids: [ann.id], status: 'in_flight' },
+        });
+      }
+
+      dispatch({ type: 'MARK_CAPTURED' });
+
+    } catch (err) {
+      console.error('[DevTools] Failed to approve plan:', err);
+    }
+  }, [activePlan, state.annotations, bridgeUrl, provider, currentModel.id, dispatch]);
+
+  const handleDismissPlan = useCallback(() => {
+    setActivePlan(null);
+    // Clear plan annotations
+    if (activePlan?.planId) {
+      const planAnnotations = state.annotations.filter(a => a.planId === activePlan.planId);
+      for (const ann of planAnnotations) {
+        dispatch({ type: 'DELETE_ANNOTATION', payload: { id: ann.id } });
+      }
+    }
+  }, [activePlan, state.annotations, dispatch]);
 
   // Handle question events from bridge → dispatch SET_ANNOTATION_QUESTION
   const processedQuestionJobIdsRef = useRef(new Set<string>());
@@ -331,6 +618,93 @@ export function DevToolsProvider({
     }
   }, [bridge.pendingQuestions, dispatch]);
 
+  // Handle plan_ready events → trigger materialization (and auto-approve single-task plans)
+  const processedPlanIdsRef = useRef(new Set<string>());
+  const pendingAutoApproveRef = useRef<string | null>(null);
+  useEffect(() => {
+    for (const plan of bridge.pendingPlans) {
+      if (processedPlanIdsRef.current.has(plan.planId)) continue;
+      processedPlanIdsRef.current.add(plan.planId);
+
+      const isSingleTask = plan.tasks.length === 1;
+
+      setActivePlan(prev => {
+        if (prev?.planId !== plan.planId) return prev;
+        return {
+          ...prev,
+          tasks: plan.tasks,
+          threadId: plan.threadId,
+          status: isSingleTask ? 'executing' : 'awaiting_approval',
+        };
+      });
+
+      // Materialize annotations then auto-approve if single task
+      materializePlan(plan.tasks).then(() => {
+        if (isSingleTask) {
+          pendingAutoApproveRef.current = plan.planId;
+        }
+      });
+
+      bridge.dismissPlan(plan.planId);
+    }
+  }, [bridge.pendingPlans]);
+
+  // Auto-approve single-task plans after materialization completes
+  useEffect(() => {
+    if (!pendingAutoApproveRef.current) return;
+    if (!activePlan || activePlan.planId !== pendingAutoApproveRef.current) return;
+
+    // Check that the plan annotations have been materialized
+    const planAnns = state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text');
+    if (planAnns.length === 0) return;
+
+    pendingAutoApproveRef.current = null;
+    handleApprovePlan();
+  }, [activePlan, state.annotations, handleApprovePlan]);
+
+  // Handle plan review events
+  useEffect(() => {
+    for (const review of bridge.planReviews) {
+      if (!activePlan || activePlan.planId !== review.planId) continue;
+      if (review.verdict === 'pass') {
+        setActivePlan(prev => prev ? { ...prev, status: 'done' } : null);
+      }
+      // If fail, the plan stays in executing state — could trigger re-work
+    }
+  }, [bridge.planReviews, activePlan]);
+
+  // Track when all plan workers complete → trigger review
+  const reviewTriggeredRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (!activePlan || activePlan.status !== 'executing') return;
+    if (reviewTriggeredRef.current.has(activePlan.planId)) return;
+
+    // Check if any plan-related jobs are still in flight
+    const planJobs = Array.from(inFlightJobs.entries()).filter(([_, j]) => j.planId === activePlan.planId);
+    if (planJobs.length > 0) return;
+
+    // All workers done — check if there are any plan annotations with resolved/needs_review status
+    const planAnnotations = state.annotations.filter(a =>
+      a.planId === activePlan.planId && (a.status === 'resolved' || a.status === 'needs_review')
+    );
+    if (planAnnotations.length === 0) return;
+
+    // Guard against re-triggering
+    reviewTriggeredRef.current.add(activePlan.planId);
+
+    // Trigger review pass
+    (async () => {
+      try {
+        setActivePlan(prev => prev ? { ...prev, status: 'reviewing' } : null);
+        const screenshotBlob = await captureFullPage(document.body);
+        if (!screenshotBlob) return;
+        await sendPlanReview(activePlan.planId, screenshotBlob, bridgeUrl, provider, currentModel.id);
+      } catch (err) {
+        console.error('[DevTools] Failed to trigger review:', err);
+      }
+    })();
+  }, [activePlan, inFlightJobs, state.annotations, bridgeUrl, provider, currentModel.id]);
+
   // Compute the active job's annotation color for the toolbar spinner
   const activeJobColor = useMemo(() => {
     if (bridge.activeJobId && inFlightJobs.has(bridge.activeJobId)) {
@@ -339,6 +713,25 @@ export function DevToolsProvider({
     const entries = Array.from(inFlightJobs.values());
     return entries.length > 0 ? entries[entries.length - 1]!.color : undefined;
   }, [bridge.activeJobId, inFlightJobs]);
+
+  const handleViewThread = useCallback((threadId: string) => {
+    setOpenThreadId(threadId);
+  }, []);
+
+  // Find the active jobId for the open thread (for per-job streaming data)
+  // Falls back to any active job so the panel always shows current activity
+  const threadActiveJobId = useMemo(() => {
+    if (!openThreadId) return null;
+    // Prefer the job matched to this thread
+    for (const [jobId, job] of inFlightJobs) {
+      if (job.threadId === openThreadId) return jobId;
+    }
+    // Fall back to any active job so tool activity still shows in the panel
+    if (bridge.activeJobIds.length > 0) {
+      return bridge.activeJobIds[bridge.activeJobIds.length - 1]!;
+    }
+    return null;
+  }, [openThreadId, inFlightJobs, bridge.activeJobIds]);
 
   // Event stream hover visibility (debounced to bridge gap between crosshair and stack)
   const [eventStreamVisible, setEventStreamVisible] = useState(false);
@@ -393,6 +786,8 @@ export function DevToolsProvider({
         inFlightStyleSelectors={inFlightStyleSelectors}
         inFlightSelectorColors={inFlightSelectorColors}
         onReply={bridge.isConnected ? handleReply : undefined}
+        onViewThread={bridge.isConnected ? handleViewThread : undefined}
+        isThreadPanelOpen={openThreadId !== null}
       />
 
       <AnnotationToolbar
@@ -400,20 +795,55 @@ export function DevToolsProvider({
         dispatch={dispatch}
         onScreenshot={handleScreenshot}
         onSendToClaude={bridge.isConnected ? handleSendToClaude : undefined}
-        hasActiveJobs={inFlightJobs.size > 0 || bridge.status === 'streaming'}
+        onPlanGoal={bridge.isConnected ? handlePlanGoal : undefined}
+        hasActiveJobs={inFlightJobs.size > 0 || bridge.activeJobIds.length > 0}
         activeJobColor={activeJobColor}
         onCrosshairHover={handleEventStreamHover}
         onClear={handleClearEventStream}
         provider={provider}
         onProviderChange={bridge.isConnected ? handleProviderChange : undefined}
+        modelIndex={modelIndex}
+        modelCount={models.length}
+        modelLabel={currentModel.label}
+        onModelChange={bridge.isConnected ? handleModelChange : undefined}
+        onViewThread={bridge.isConnected ? handleViewThread : undefined}
+        isThreadPanelOpen={openThreadId !== null}
+        activePlan={activePlan}
       />
+
+      {/* Plan approval bar */}
+      {activePlan?.status === 'awaiting_approval' && (
+        <PlanApprovalBar
+          taskCount={activePlan.tasks?.length ?? 0}
+          onApprove={handleApprovePlan}
+          onDismiss={handleDismissPlan}
+        />
+      )}
+
+      {openThreadId && bridge.isConnected && (
+        <ThreadPanel
+          threadId={openThreadId}
+          bridgeUrl={bridgeUrl}
+          accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
+          isStreaming={threadActiveJobId !== null}
+          streamingResponse={threadActiveJobId ? (bridge.jobResponses[threadActiveJobId] ?? '') : ''}
+          streamingThinking={threadActiveJobId ? (bridge.jobThinking[threadActiveJobId] ?? '') : ''}
+          streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
+          onClose={() => setOpenThreadId(null)}
+          onReply={handleReply}
+          activePlan={activePlan}
+          planAnnotations={activePlan ? state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text') : undefined}
+          inFlightJobs={inFlightJobs}
+          onViewThread={handleViewThread}
+        />
+      )}
 
       {bridge.isConnected && (
         <BridgeEventStack
           bridge={bridge}
           bridgeUrl={bridgeUrl}
           inFlightJobs={inFlightJobs}
-          isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.status === 'streaming'}
+          isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
           onHover={handleEventStreamHover}
           clearSignal={clearSignal}
           onReply={handleReply}

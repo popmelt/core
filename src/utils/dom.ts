@@ -625,5 +625,37 @@ export function revertAllStyles(modifications: StyleModification[]): void {
   }
 }
 
+/**
+ * Resolve a page-coordinate region to a DOM element.
+ * Uses elementFromPoint at the region center, tags it with data-pm,
+ * and returns the selector, element info, and bounding rect.
+ */
+export function resolveRegionToElement(
+  region: { x: number; y: number; width: number; height: number },
+): { selector: string; info: ElementInfo; rect: DOMRect } | null {
+  const centerX = region.x + region.width / 2;
+  const centerY = region.y + region.height / 2;
+
+  // Convert from page coordinates to viewport coordinates
+  const viewportX = centerX - window.scrollX;
+  const viewportY = centerY - window.scrollY;
+
+  const el = getTopmostElementAtPoint(viewportX, viewportY);
+  if (!el || !(el instanceof HTMLElement)) return null;
+
+  // Tag with data-pm for selector stability
+  if (!el.hasAttribute('data-pm')) {
+    const pmId = Math.random().toString(36).substring(2, 9);
+    el.setAttribute('data-pm', pmId);
+  }
+
+  const pmValue = el.getAttribute('data-pm')!;
+  const selector = `[data-pm="${pmValue}"]`;
+  const info = extractElementInfo(el);
+  const rect = el.getBoundingClientRect();
+
+  return { selector, info, rect };
+}
+
 // Export extractElementInfo for use in components
 export { extractElementInfo, getTopmostElementAtPoint };

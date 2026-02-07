@@ -11,7 +11,7 @@ import type {
 
 const initialState: AnnotationState = {
   isAnnotating: false,
-  activeTool: 'freehand',
+  activeTool: 'inspector',
   activeColor: '#ff0000',
   strokeWidth: 3,
   annotations: [],
@@ -567,8 +567,54 @@ function annotationReducer(
             resolutionSummary: resolution.summary,
             replyCount: (a.replyCount ?? 0) + 1,
             question: undefined,
+            threadId: a.threadId || action.payload.threadId,
           };
         }),
+      };
+    }
+
+    case 'ADD_PLAN_ANNOTATION': {
+      const { groupId, planId, planTaskId, instruction, region, color, linkedSelector, elements } = action.payload;
+
+      // Create a rectangle annotation for the region
+      const rectAnnotation: Annotation = {
+        id: generateId(),
+        type: 'rectangle',
+        points: [
+          { x: region.x, y: region.y },
+          { x: region.x + region.width, y: region.y + region.height },
+        ],
+        color,
+        strokeWidth: 2,
+        timestamp: Date.now(),
+        groupId,
+        linkedSelector,
+        elements,
+        planId,
+        planTaskId,
+        status: 'pending' as AnnotationLifecycleStatus,
+      };
+
+      // Create a text annotation with the instruction
+      const textAnnotation: Annotation = {
+        id: generateId(),
+        type: 'text',
+        points: [{ x: region.x, y: region.y + region.height + 4 }],
+        text: instruction,
+        fontSize: 12,
+        color,
+        strokeWidth: 2,
+        timestamp: Date.now(),
+        groupId,
+        linkedSelector,
+        elements,
+        planId,
+        planTaskId,
+      };
+
+      return {
+        ...state,
+        annotations: [...state.annotations, rectAnnotation, textAnnotation],
       };
     }
 

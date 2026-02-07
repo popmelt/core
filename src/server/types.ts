@@ -69,15 +69,22 @@ export type Job = {
   threadId?: string;
   annotationIds?: string[];
   provider?: Provider;
+  model?: string;
+  // Planner fields
+  planId?: string;
+  planTaskId?: string;
 };
 
 export type SSEEvent =
   | { type: 'job_started'; jobId: string; position: number }
-  | { type: 'delta'; text: string }
-  | { type: 'tool_use'; tool: string; file?: string }
+  | { type: 'delta'; jobId: string; text: string }
+  | { type: 'thinking'; jobId: string; text: string }
+  | { type: 'tool_use'; jobId: string; tool: string; file?: string }
   | { type: 'done'; jobId: string; success: boolean; resolutions?: AnnotationResolution[]; responseText?: string; threadId?: string }
   | { type: 'error'; jobId: string; message: string }
   | { type: 'question'; jobId: string; threadId: string; question: string; annotationIds?: string[] }
+  | { type: 'plan_ready'; jobId: string; planId: string; tasks: PlanTask[]; threadId?: string }
+  | { type: 'plan_review'; planId: string; verdict: 'pass' | 'fail'; summary: string; issues?: string[] }
   | { type: 'queue_drained' };
 
 export type SSEClient = {
@@ -113,3 +120,27 @@ export type Thread = {
 };
 
 export type ThreadStore = { version: 1; threads: Record<string, Thread> };
+
+// Planner types
+export type PlanTask = {
+  id: string;
+  instruction: string;
+  region: { x: number; y: number; width: number; height: number };
+  priority?: number;
+};
+
+export type JobGroupStatus = 'planning' | 'awaiting_approval' | 'executing' | 'reviewing' | 'done' | 'error';
+
+export type JobGroup = {
+  id: string;
+  goal: string;
+  status: JobGroupStatus;
+  plannerJobId: string;
+  plannerThreadId?: string;
+  plan?: PlanTask[];
+  workerJobIds: string[];
+  screenshotPath: string;
+  pageUrl: string;
+  viewport: { width: number; height: number };
+  createdAt: number;
+};

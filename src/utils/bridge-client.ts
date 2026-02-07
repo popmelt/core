@@ -3,6 +3,7 @@ const DEFAULT_BRIDGE_URL = 'http://localhost:1111';
 export type BridgeStatus = {
   ok: boolean;
   activeJob: { id: string; status: string } | null;
+  activeJobs?: { id: string; status: string }[];
   queueDepth: number;
 };
 
@@ -31,12 +32,14 @@ export async function sendToBridge(
   bridgeUrl = DEFAULT_BRIDGE_URL,
   color?: string,
   provider?: string,
-): Promise<{ jobId: string; position: number }> {
+  model?: string,
+): Promise<{ jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
   formData.append('feedback', feedbackJson);
   if (color) formData.append('color', color);
   if (provider) formData.append('provider', provider);
+  if (model) formData.append('model', model);
 
   const res = await fetch(`${bridgeUrl}/send`, {
     method: 'POST',
@@ -59,17 +62,93 @@ export async function cancelBridgeJob(
   return res.json();
 }
 
+export async function sendPlanToBridge(
+  screenshotBlob: Blob,
+  goal: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  provider?: string,
+  model?: string,
+  pageUrl?: string,
+  viewport?: { width: number; height: number },
+): Promise<{ planId: string; jobId: string; position: number; threadId?: string }> {
+  const formData = new FormData();
+  formData.append('screenshot', screenshotBlob, 'screenshot.png');
+  formData.append('goal', goal);
+  if (pageUrl) formData.append('pageUrl', pageUrl);
+  if (viewport) formData.append('viewport', JSON.stringify(viewport));
+  if (provider) formData.append('provider', provider);
+  if (model) formData.append('model', model);
+
+  const res = await fetch(`${bridgeUrl}/plan`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+
+  return res.json();
+}
+
+export async function approvePlan(
+  planId: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  approvedTaskIds?: string[],
+): Promise<{ planId: string; tasks: unknown[]; status: string }> {
+  const res = await fetch(`${bridgeUrl}/plan/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId, approvedTaskIds }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+
+  return res.json();
+}
+
+export async function sendPlanReview(
+  planId: string,
+  screenshotBlob: Blob,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  provider?: string,
+  model?: string,
+): Promise<{ jobId: string; planId: string; position: number }> {
+  const formData = new FormData();
+  formData.append('screenshot', screenshotBlob, 'screenshot.png');
+  formData.append('planId', planId);
+  if (provider) formData.append('provider', provider);
+  if (model) formData.append('model', model);
+
+  const res = await fetch(`${bridgeUrl}/plan/review`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+
+  return res.json();
+}
+
 export async function sendReplyToBridge(
   threadId: string,
   reply: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
   color?: string,
   provider?: string,
-): Promise<{ jobId: string; position: number }> {
+  model?: string,
+): Promise<{ jobId: string; position: number; threadId?: string }> {
   const res = await fetch(`${bridgeUrl}/reply`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId, reply, color, provider }),
+    body: JSON.stringify({ threadId, reply, color, provider, model }),
   });
 
   if (!res.ok) {

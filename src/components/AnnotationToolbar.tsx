@@ -12,21 +12,77 @@ import {
   Undo2,
 } from 'lucide-react';
 
-import type { AnnotationAction, AnnotationState, ToolType } from '../tools/types';
+import type { Annotation, AnnotationAction, AnnotationState, ToolType } from '../tools/types';
 import { applyStyleModifications, extractElementInfo, findElementBySelector, revertAllStyles } from '../utils/dom';
 import { colors, ToolButton, ToolSeparator } from './ToolButton';
+
+const BROAD_GOAL_THRESHOLD = 0.5; // 50% of viewport area
+
+/**
+ * Detect if pending annotations represent a single broad goal (one large annotation group
+ * covering >50% of the viewport with a text instruction).
+ * Returns the goal text if detected, null otherwise.
+ */
+function detectBroadGoal(pendingAnnotations: Annotation[]): string | null {
+  // Collect unique groups
+  const groups = new Map<string, Annotation[]>();
+  const ungrouped: Annotation[] = [];
+  for (const a of pendingAnnotations) {
+    if (a.groupId) {
+      const group = groups.get(a.groupId) || [];
+      group.push(a);
+      groups.set(a.groupId, group);
+    } else {
+      ungrouped.push(a);
+    }
+  }
+
+  // Must be exactly one annotation group (plus its text), no ungrouped shapes
+  if (groups.size !== 1) return null;
+  if (ungrouped.some(a => a.type !== 'text')) return null;
+
+  const [group] = [...groups.values()];
+  if (!group) return null;
+
+  const shape = group.find(a => a.type !== 'text');
+  const text = group.find(a => a.type === 'text');
+  if (!shape || !text?.text) return null;
+
+  // Calculate area from annotation points
+  if (shape.points.length < 2) return null;
+  const xs = shape.points.map(p => p.x);
+  const ys = shape.points.map(p => p.y);
+  const annWidth = Math.max(...xs) - Math.min(...xs);
+  const annHeight = Math.max(...ys) - Math.min(...ys);
+  const annArea = annWidth * annHeight;
+
+  const viewportArea = window.innerWidth * window.innerHeight;
+  if (annArea / viewportArea < BROAD_GOAL_THRESHOLD) return null;
+
+  // Include any ungrouped text annotations as additional context
+  const allText = [text.text, ...ungrouped.filter(a => a.text).map(a => a.text!)];
+  return allText.join('. ');
+}
 
 type AnnotationToolbarProps = {
   state: AnnotationState;
   dispatch: React.Dispatch<AnnotationAction>;
   onScreenshot: () => Promise<boolean>;
   onSendToClaude?: () => Promise<boolean>;
+  onPlanGoal?: (goal: string) => Promise<boolean>;
   hasActiveJobs?: boolean;
   activeJobColor?: string;
   onCrosshairHover?: (hovering: boolean) => void;
   onClear?: () => void;
   provider?: string;
   onProviderChange?: (provider: string) => void;
+  modelIndex?: number;
+  modelCount?: number;
+  modelLabel?: string;
+  onModelChange?: (index: number) => void;
+  onViewThread?: (threadId: string) => void;
+  isThreadPanelOpen?: boolean;
+  activePlan?: { planId: string; status: string; goal: string } | null;
 };
 
 type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: string };
@@ -57,7 +113,7 @@ const baseToolbarStyle: CSSProperties = {
   fontFamily: 'system-ui, -apple-system, sans-serif',
   cursor: 'pointer',
   overflow: 'visible',
-  transition: 'all 200ms cubic-bezier(0.4, 0, 0.2, 1)',
+  transition: 'all 0ms cubic-bezier(0.4, 0, 0.2, 1)',
 };
 
 const STORAGE_KEY = 'devtools-toolbar-expanded';
@@ -91,12 +147,20 @@ export function AnnotationToolbar({
   dispatch,
   onScreenshot,
   onSendToClaude,
+  onPlanGoal,
   hasActiveJobs,
   activeJobColor,
   onCrosshairHover,
   onClear,
   provider = 'claude',
   onProviderChange,
+  modelIndex = 0,
+  modelCount = 2,
+  modelLabel = 'Opus 4.6',
+  onModelChange,
+  onViewThread,
+  isThreadPanelOpen,
+  activePlan,
 }: AnnotationToolbarProps) {
   const [isExpanded, setIsExpanded] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -353,9 +417,34 @@ export function AnnotationToolbar({
   }, [onScreenshot]);
 
   const handleSendToClaude = useCallback(async () => {
+    const pendingAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
+    const pendingStyleMods = state.styleModifications.filter(m => !m.captured);
+    const hasShapes = pendingAnnotations.some(a => a.type !== 'text');
+
+    if (onPlanGoal) {
+      // Path A: text-only annotations (no shapes, no style mods) = plan goal
+      if (!hasShapes && pendingStyleMods.length === 0) {
+        const textAnnotations = pendingAnnotations.filter(a => a.type === 'text' && a.text);
+        if (textAnnotations.length > 0) {
+          const goal = textAnnotations.map(a => a.text).join('. ');
+          await onPlanGoal(goal);
+          return;
+        }
+      }
+
+      // Path B: single large annotation covering >50% of viewport = broad goal
+      if (hasShapes && pendingStyleMods.length === 0) {
+        const broadGoal = detectBroadGoal(pendingAnnotations);
+        if (broadGoal) {
+          await onPlanGoal(broadGoal);
+          return;
+        }
+      }
+    }
+
     if (!onSendToClaude) return;
     await onSendToClaude();
-  }, [onSendToClaude]);
+  }, [onSendToClaude, onPlanGoal, state.annotations, state.styleModifications]);
 
   const handleCollapse = useCallback(() => {
     dispatch({ type: 'SET_ANNOTATING', payload: false });
@@ -526,12 +615,23 @@ export function AnnotationToolbar({
     }
   }, [totalFocusableItems, focusedGroupIndex]);
 
-  // Reset to total when selection is cleared and no element is inspected
+  // Sync focused index from external selection changes (e.g. badge clicks)
+  // Reset to null when selection is cleared and no element is inspected
   useEffect(() => {
     if (state.selectedAnnotationIds.length === 0 && !state.inspectedElement) {
       setFocusedGroupIndex(null);
+      return;
     }
-  }, [state.selectedAnnotationIds, state.inspectedElement]);
+    if (state.selectedAnnotationIds.length > 0) {
+      const selectedId = state.selectedAnnotationIds[0];
+      const groupIdx = annotationGroups.findIndex(g =>
+        g.id === selectedId || g.annotations.some(a => a.id === selectedId)
+      );
+      if (groupIdx >= 0 && groupIdx !== focusedGroupIndex) {
+        setFocusedGroupIndex(groupIdx);
+      }
+    }
+  }, [state.selectedAnnotationIds, state.inspectedElement, annotationGroups]);
 
   // Cycle through annotations and style modifications
   const handleCycleAnnotation = useCallback(() => {
@@ -562,9 +662,13 @@ export function AnnotationToolbar({
 
       // Get the primary (non-text) annotation for tool and color
       const primaryAnnotation = group.annotations.find(a => a.type !== 'text') || group.annotations[0];
+      const isLinkedAnnotation = group.annotations.some(a => a.linkedSelector);
 
       // Switch to the annotation's tool type
-      if (primaryAnnotation?.type && primaryAnnotation.type !== 'inspector') {
+      if (isLinkedAnnotation) {
+        // Inspector-created annotations — switch to inspector
+        dispatch({ type: 'SET_TOOL', payload: 'inspector' });
+      } else if (primaryAnnotation?.type && primaryAnnotation.type !== 'text' && primaryAnnotation.type !== 'inspector') {
         dispatch({ type: 'SET_TOOL', payload: primaryAnnotation.type });
         const shapeIdx = shapeTools.findIndex(s => s.type === primaryAnnotation.type);
         if (shapeIdx >= 0) setActiveShapeIndex(shapeIdx);
@@ -597,6 +701,12 @@ export function AnnotationToolbar({
         top: centerY - window.innerHeight / 2,
         behavior: 'smooth',
       });
+
+      // Switch the thread panel to this group's thread if open
+      if (isThreadPanelOpen && onViewThread) {
+        const threadId = group.annotations.find(a => a.threadId)?.threadId;
+        if (threadId) onViewThread(threadId);
+      }
     } else {
       // Focus on style modification
       const modIndex = nextIndex - annotationGroups.length;
@@ -628,7 +738,7 @@ export function AnnotationToolbar({
         behavior: 'smooth',
       });
     }
-  }, [annotationGroups, state.styleModifications, totalFocusableItems, focusedGroupIndex, dispatch, parseHueFromColor]);
+  }, [annotationGroups, state.styleModifications, totalFocusableItems, focusedGroupIndex, dispatch, parseHueFromColor, isThreadPanelOpen, onViewThread]);
 
   // Keyboard shortcuts for tools (only when expanded and not editing text)
   useEffect(() => {
@@ -643,7 +753,7 @@ export function AnnotationToolbar({
 
       // Cmd/Ctrl+Enter to send to Claude (when bridge connected and annotations exist)
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        if (onSendToClaude && (state.annotations.length > 0 || state.styleModifications.length > 0)) {
+        if ((onSendToClaude || onPlanGoal) && (state.annotations.length > 0 || state.styleModifications.length > 0)) {
           e.preventDefault();
           handleSendToClaude();
         }
@@ -693,7 +803,7 @@ export function AnnotationToolbar({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, handleClear, state.annotations.length, state.styleModifications.length]);
+  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, onPlanGoal, handleClear, state.annotations.length, state.styleModifications.length]);
 
   const canUndo = state.undoStack.length > 0;
 
@@ -968,12 +1078,57 @@ export function AnnotationToolbar({
             );
           })()}
           {onProviderChange && (
-            <ToolButton
-              onClick={() => onProviderChange(provider === 'claude' ? 'codex' : 'claude')}
-              title={`Provider: ${provider === 'claude' ? 'Claude' : 'Codex'} (click to switch)`}
-            >
-              {provider === 'claude' ? <ClaudeIcon /> : <CodexIcon />}
-            </ToolButton>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+              <ToolButton
+                onClick={() => onProviderChange(provider === 'claude' ? 'codex' : 'claude')}
+                title={`Provider: ${provider === 'claude' ? 'Claude' : 'Codex'} (click to switch)`}
+              >
+                {provider === 'claude' ? <ClaudeIcon /> : <CodexIcon />}
+              </ToolButton>
+              <button
+                type="button"
+                onClick={() => {
+                  const nextIndex = (modelIndex + 1) % modelCount;
+                  onModelChange?.(nextIndex);
+                }}
+                title={`Model: ${modelLabel} (click to cycle)`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  height: 32,
+                  border: 'none',
+                  background: 'none',
+                  cursor: 'pointer',
+                  padding: '0 4px 0 0',
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  fontSize: 10,
+                  fontWeight: 500,
+                  color: colors.iconDefault,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <span>{modelLabel}</span>
+                <span style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 2,
+                }}>
+                  {Array.from({ length: modelCount }, (_, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        width: 3,
+                        height: 3,
+                        borderRadius: '50%',
+                        backgroundColor: i === modelIndex ? colors.iconDefault : 'rgba(0,0,0,0.2)',
+                        transition: 'background-color 150ms ease',
+                      }}
+                    />
+                  ))}
+                </span>
+              </button>
+            </div>
           )}
           <div
             onMouseEnter={() => onCrosshairHover?.(true)}

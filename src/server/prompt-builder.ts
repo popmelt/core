@@ -1,5 +1,5 @@
 import type { AnnotationResolution } from '../tools/types';
-import type { FeedbackPayload, Provider, ThreadMessage } from './types';
+import type { FeedbackPayload, PlanTask, Provider, ThreadMessage } from './types';
 
 /** Format feedback annotations and style modifications into prompt-ready text */
 export function formatFeedbackContext(feedback: FeedbackPayload): string {
@@ -115,7 +115,7 @@ export function buildPrompt(
 
   lines.push('');
   lines.push(
-    'Apply the requested changes to the source files. The dev server has HMR so the developer will see your changes immediately in the browser.',
+    'Follow the developer\'s instructions. If they ask for changes, apply them to the source files — the dev server has HMR so changes appear immediately. If they ask a question or request analysis, respond in text without modifying code.',
   );
   lines.push('');
   lines.push(
@@ -202,8 +202,7 @@ export function buildReplyPrompt(
 
   lines.push('');
   lines.push('The developer answered your question. Continue working based on their reply.');
-  lines.push('');
-  lines.push('Apply the requested changes to the source files. The dev server has HMR so the developer will see your changes immediately in the browser.');
+  lines.push('Follow their instructions — apply code changes only if requested. The dev server has HMR so changes appear immediately.');
   lines.push('');
   lines.push('IMPORTANT: If any elements you modify have a `data-pm` attribute, preserve it in the source. This attribute tracks annotation positions.');
 
@@ -246,5 +245,145 @@ export function parseResolutions(responseText: string): AnnotationResolution[] {
     );
   } catch {
     return [];
+  }
+}
+
+// ============================
+// Planner prompt + parser
+// ============================
+
+export function buildPlannerPrompt(
+  screenshotPath: string,
+  goal: string,
+  pageUrl: string,
+  viewport: { width: number; height: number },
+): string {
+  const lines: string[] = [];
+
+  lines.push('You are a UI design planner. You are looking at a full-page screenshot of a web application.');
+  lines.push('');
+  lines.push(`IMPORTANT: First, use the Read tool to view the screenshot at: ${screenshotPath}`);
+  lines.push('');
+  lines.push(`Page: ${pageUrl}`);
+  lines.push(`Viewport: ${viewport.width}x${viewport.height}`);
+  lines.push('');
+  lines.push('## Goal');
+  lines.push(goal);
+  lines.push('');
+  lines.push('## Your Task');
+  lines.push('Analyze the screenshot and decompose the goal into specific, element-level tasks.');
+  lines.push('Each task targets a specific region of the page and gives a clear instruction for a worker agent.');
+  lines.push('');
+  lines.push('Output your plan as a JSON array inside a <plan> tag. Each task has:');
+  lines.push('- `id`: A short unique identifier (e.g., "t1", "t2")');
+  lines.push('- `instruction`: Clear, specific instruction for a worker agent (what to change and how)');
+  lines.push('- `region`: Bounding box in page coordinates `{x, y, width, height}` — where (x,y) is top-left corner');
+  lines.push('- `priority`: Optional 1-5 (1=highest). Tasks with no dependency can share a priority level.');
+  lines.push('');
+  lines.push('Example:');
+  lines.push('<plan>');
+  lines.push('[');
+  lines.push('  {"id":"t1","instruction":"Increase heading font-size to 48px and change font-weight to 700","region":{"x":100,"y":50,"width":600,"height":80},"priority":1},');
+  lines.push('  {"id":"t2","instruction":"Add a subtle box-shadow to the card container","region":{"x":80,"y":200,"width":640,"height":300},"priority":2}');
+  lines.push(']');
+  lines.push('</plan>');
+  lines.push('');
+  lines.push('Guidelines:');
+  lines.push('- Be specific about values (colors, sizes, spacing) rather than vague ("make it look better")');
+  lines.push('- Each task should be independently actionable by a worker that can only see its region');
+  lines.push('- Regions should tightly bound the relevant UI element(s)');
+  lines.push('- Keep tasks atomic — one change per task, not multiple unrelated changes');
+  lines.push('- Order by priority: structural changes first, then visual polish');
+  lines.push('- If the goal can be accomplished as a single change, return a plan with just one task. Only decompose when the goal genuinely requires multiple independent changes.');
+  lines.push('- If the goal is unclear or you need more context, output a question instead:');
+  lines.push('<question>Your question here</question>');
+  lines.push('');
+  lines.push('Do NOT modify any files. You are a planner only — output a <plan> or <question>, nothing else.');
+
+  return lines.join('\n');
+}
+
+/** Parse a <plan> block from Claude's response text */
+export function parsePlan(responseText: string): PlanTask[] | null {
+  const match = responseText.match(/<plan>\s*([\s\S]*?)\s*<\/plan>/);
+  if (!match?.[1]) return null;
+
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!Array.isArray(parsed)) return null;
+
+    return parsed.filter(
+      (t: unknown): t is PlanTask => {
+        if (typeof t !== 'object' || t === null) return false;
+        const obj = t as Record<string, unknown>;
+        if (typeof obj.id !== 'string' || typeof obj.instruction !== 'string') return false;
+        if (typeof obj.region !== 'object' || obj.region === null) return false;
+        const r = obj.region as Record<string, unknown>;
+        return typeof r.x === 'number' && typeof r.y === 'number' &&
+               typeof r.width === 'number' && typeof r.height === 'number';
+      },
+    );
+  } catch {
+    return null;
+  }
+}
+
+// ============================
+// Reviewer prompt + parser
+// ============================
+
+export function buildReviewerPrompt(
+  screenshotPath: string,
+  goal: string,
+  completedTasks: { id: string; instruction: string; summary: string }[],
+): string {
+  const lines: string[] = [];
+
+  lines.push('You are reviewing whether a series of UI changes achieved the original design goal.');
+  lines.push('');
+  lines.push(`IMPORTANT: First, use the Read tool to view the screenshot at: ${screenshotPath}`);
+  lines.push('');
+  lines.push('## Original Goal');
+  lines.push(goal);
+  lines.push('');
+  lines.push('## Completed Tasks');
+  for (const task of completedTasks) {
+    lines.push(`- [${task.id}] ${task.instruction} → ${task.summary}`);
+  }
+  lines.push('');
+  lines.push('## Your Task');
+  lines.push('Look at the current screenshot and determine if the goal has been achieved.');
+  lines.push('Output your verdict inside a <review> tag:');
+  lines.push('<review>');
+  lines.push('{"verdict":"pass","summary":"The changes look good..."}');
+  lines.push('</review>');
+  lines.push('');
+  lines.push('Or if issues remain:');
+  lines.push('<review>');
+  lines.push('{"verdict":"fail","summary":"Some issues remain...","issues":["Issue 1","Issue 2"]}');
+  lines.push('</review>');
+  lines.push('');
+  lines.push('Do NOT modify any files. Output only a <review> block.');
+
+  return lines.join('\n');
+}
+
+/** Parse a <review> block from Claude's response text */
+export function parseReview(responseText: string): { verdict: 'pass' | 'fail'; summary: string; issues?: string[] } | null {
+  const match = responseText.match(/<review>\s*([\s\S]*?)\s*<\/review>/);
+  if (!match?.[1]) return null;
+
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    if (parsed.verdict !== 'pass' && parsed.verdict !== 'fail') return null;
+    if (typeof parsed.summary !== 'string') return null;
+    return {
+      verdict: parsed.verdict,
+      summary: parsed.summary,
+      issues: Array.isArray(parsed.issues) ? parsed.issues.filter((i: unknown) => typeof i === 'string') : undefined,
+    };
+  } catch {
+    return null;
   }
 }

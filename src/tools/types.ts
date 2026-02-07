@@ -62,6 +62,9 @@ export type Annotation = {
   elements?: ElementInfo[]; // DOM elements captured at creation time
   linkedSelector?: string; // CSS selector of linked DOM element (inspector pin)
   linkedAnchor?: 'top-left' | 'bottom-left'; // Which corner to anchor to
+  // Planner fields
+  planId?: string;
+  planTaskId?: string;
 };
 
 // Undo stack entry stores both annotations and style modifications
@@ -149,4 +152,14 @@ export type AnnotationAction =
   | { type: 'SET_ANNOTATION_STATUS'; payload: { ids: string[]; status: AnnotationLifecycleStatus } }
   | { type: 'SET_ANNOTATION_THREAD'; payload: { ids: string[]; threadId: string } }
   | { type: 'SET_ANNOTATION_QUESTION'; payload: { ids: string[]; question: string; threadId: string } }
-  | { type: 'APPLY_RESOLUTIONS'; payload: { resolutions: AnnotationResolution[] } };
+  | { type: 'APPLY_RESOLUTIONS'; payload: { resolutions: AnnotationResolution[]; threadId?: string } }
+  | { type: 'ADD_PLAN_ANNOTATION'; payload: {
+      groupId: string;
+      planId: string;
+      planTaskId: string;
+      instruction: string;
+      region: { x: number; y: number; width: number; height: number };
+      color: string;
+      linkedSelector?: string;
+      elements?: ElementInfo[];
+    } };

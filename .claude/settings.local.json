@@ -11,7 +11,9 @@
       "WebFetch(domain:upload.wikimedia.org)",
       "Bash(curl:*)",
       "mcp__popmelt__reference",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "mcp__popmelt__update",
+      "mcp__popmelt__create"
     ]
   },
   "disabledMcpjsonServers": [

@@ -25,6 +25,7 @@ type StreamEntry = {
   jobId: string;
   color: string;
   status: 'working' | 'queued' | 'done' | 'error';
+  doneLabel?: string;
 };
 
 const stackContainerStyle: CSSProperties = {
@@ -50,13 +51,6 @@ const rowStyle: CSSProperties = {
   color: '#1f2937',
   whiteSpace: 'nowrap' as const,
 };
-
-function stripInternalTags(text: string): string {
-  return text
-    .replace(/<resolution>[\s\S]*?<\/resolution>/g, '')
-    .replace(/<question>[\s\S]*?<\/question>/g, '')
-    .trim();
-}
 
 function formatStepText(events: BridgeConnectionState['events']): string {
   const toolEvents = events.filter((e) => e.type === 'tool_use');
@@ -85,22 +79,55 @@ function formatStepText(events: BridgeConnectionState['events']): string {
   }
 }
 
-/** Animated dot spinner: cycles through ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ */
+/** Derive a completion label from the bridge events for a given jobId */
+function deriveDoneLabel(events: BridgeConnectionState['events'], jobId: string): string {
+  // Check if the agent asked a question
+  const hasQuestion = events.some(
+    e => e.type === 'question' && e.data.jobId === jobId,
+  );
+  if (hasQuestion) return 'Has a question';
+
+  // Check if resolutions were applied
+  const doneEvent = events.find(
+    e => e.type === 'done' && e.data.jobId === jobId,
+  );
+  if (doneEvent) {
+    const resolutions = doneEvent.data.resolutions;
+    if (Array.isArray(resolutions) && resolutions.length > 0) return 'Applied changes';
+  }
+
+  return 'Replied';
+}
+
+/** Animated four-dot crosshair spinner — matches canvas thinking badge */
 function DotSpinner({ color }: { color: string }) {
-  const frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
   const [frame, setFrame] = useState(0);
 
   useEffect(() => {
     const id = setInterval(() => {
-      setFrame((f) => (f + 1) % frames.length);
-    }, 80);
+      setFrame((f) => (f + 1) % 2);
+    }, 250);
     return () => clearInterval(id);
   }, []);
 
   return (
-    <span style={{ color, fontWeight: 700, fontSize: 13, lineHeight: 1, width: 10, display: 'inline-block' }}>
-      {frames[frame]}
-    </span>
+    <svg width="11" height="11" viewBox="0 0 24 24" fill={color} style={{ verticalAlign: 'middle', flexShrink: 0 }}>
+      {frame === 1 ? (
+        <>
+          <circle cx="7" cy="7" r="2" />
+          <circle cx="17" cy="7" r="2" />
+          <circle cx="7" cy="17" r="2" />
+          <circle cx="17" cy="17" r="2" />
+        </>
+      ) : (
+        <>
+          <circle cx="12" cy="6" r="2" />
+          <circle cx="6" cy="12" r="2" />
+          <circle cx="18" cy="12" r="2" />
+          <circle cx="12" cy="18" r="2" />
+        </>
+      )}
+    </svg>
   );
 }
 
@@ -118,9 +145,9 @@ function ColorSquare({ color }: { color: string }) {
   );
 }
 
-function Checkmark() {
+function Checkmark({ color }: { color: string }) {
   return (
-    <span style={{ color: '#22c55e', fontSize: 12, lineHeight: 1, width: 10, display: 'inline-block' }}>✓</span>
+    <span style={{ color, fontSize: 12, lineHeight: 1, width: 10, display: 'inline-block' }}>✓</span>
   );
 }
 
@@ -138,18 +165,13 @@ function ErrorDot() {
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onReply }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
-  const [expandedResponse, setExpandedResponse] = useState(false);
-  const [replyText, setReplyText] = useState('');
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Clear on signal
   useEffect(() => {
     if (clearSignal > 0) {
       setEntries([]);
-      setExpandedResponse(false);
-      setReplyText('');
     }
   }, [clearSignal]);
 
@@ -167,19 +189,20 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     });
   }, [inFlightJobs]);
 
-  // Update active job status
+  // Update active job statuses (supports concurrent jobs)
   useEffect(() => {
-    if (!bridge.activeJobId) return;
+    if (bridge.activeJobIds.length === 0) return;
+    const activeSet = new Set(bridge.activeJobIds);
     setEntries((prev) =>
       prev.map((e) =>
-        e.jobId === bridge.activeJobId && e.status !== 'done' && e.status !== 'error'
+        activeSet.has(e.jobId) && e.status !== 'done' && e.status !== 'error'
           ? { ...e, status: 'working' }
           : e,
       ),
     );
-  }, [bridge.activeJobId]);
+  }, [bridge.activeJobIds]);
 
-  // Update completed job status
+  // Update completed job status with detailed label
   const prevCompletedRef = useRef<string | null>(null);
   useEffect(() => {
     const completedId = bridge.lastCompletedJobId;
@@ -190,41 +213,18 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       (e) => e.type === 'error' && (e.data.jobId === completedId || bridge.status === 'error'),
     );
 
+    const doneLabel = isError ? undefined : deriveDoneLabel(bridge.events, completedId);
+
     setEntries((prev) =>
-      prev.map((e) => (e.jobId === completedId ? { ...e, status: isError ? 'error' : 'done' } : e)),
+      prev.map((e) =>
+        e.jobId === completedId
+          ? { ...e, status: isError ? 'error' : 'done', doneLabel }
+          : e,
+      ),
     );
   }, [bridge.lastCompletedJobId, bridge.events, bridge.status]);
 
-  // Response text: show during streaming or after completion
-  const rawResponseText = bridge.status === 'streaming'
-    ? bridge.currentResponse
-    : bridge.lastResponseText;
-  const responseText = rawResponseText ? stripInternalTags(rawResponseText) : null;
-
-  // Auto-scroll when streaming
-  useEffect(() => {
-    if (scrollRef.current && expandedResponse) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [responseText, expandedResponse]);
-
-  const threadId = bridge.lastThreadId ?? null;
-  const isStreaming = bridge.status === 'streaming';
-
-  const handleReplySubmit = () => {
-    if (!replyText.trim() || !threadId || !onReply) return;
-    onReply(threadId, replyText.trim());
-    setReplyText('');
-  };
-
-  const handleReplyKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      handleReplySubmit();
-    }
-  };
-
-  if (!isVisible || (entries.length === 0 && !responseText)) return null;
+  if (!isVisible || entries.length === 0) return null;
 
   return (
     <div
@@ -236,104 +236,23 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       {entries.map((entry) => {
         const label =
           entry.status === 'working'
-            ? formatStepText(bridge.events)
+            ? formatStepText(bridge.events.filter(e => e.data.jobId === entry.jobId))
             : entry.status === 'queued'
               ? 'Queued'
               : entry.status === 'done'
-                ? 'Done'
+                ? (entry.doneLabel || 'Done')
                 : 'Error';
 
         return (
           <div key={entry.jobId} style={rowStyle}>
             {entry.status === 'working' && <DotSpinner color={entry.color} />}
             {entry.status === 'queued' && <ColorSquare color={entry.color} />}
-            {entry.status === 'done' && <Checkmark />}
+            {entry.status === 'done' && <Checkmark color={entry.color} />}
             {entry.status === 'error' && <ErrorDot />}
             <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
           </div>
         );
       })}
-
-      {responseText && (
-        <div
-          style={{
-            ...rowStyle,
-            flexDirection: 'column',
-            alignItems: 'flex-start',
-            cursor: 'pointer',
-            maxWidth: 360,
-          }}
-          onClick={() => setExpandedResponse((v) => !v)}
-        >
-          <span style={{ color: '#6b7280', fontSize: 10 }}>
-            {expandedResponse ? '\u25BC' : '\u25B6'} Response
-            {isStreaming && <>{' '}<DotSpinner color="#6b7280" /></>}
-          </span>
-          <div
-            ref={scrollRef}
-            style={{
-              fontSize: 10,
-              color: '#374151',
-              whiteSpace: expandedResponse ? 'pre-wrap' : 'nowrap',
-              overflow: 'hidden',
-              textOverflow: expandedResponse ? undefined : 'ellipsis',
-              maxHeight: expandedResponse ? 300 : 16,
-              overflowY: expandedResponse ? 'auto' : 'hidden',
-              width: '100%',
-              lineHeight: 1.4,
-              wordBreak: expandedResponse ? 'break-word' : undefined,
-            }}
-          >
-            {responseText}
-          </div>
-
-          {/* Reply input when expanded, done streaming, and thread available */}
-          {expandedResponse && threadId && onReply && !isStreaming && (
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{ width: '100%', marginTop: 6, borderTop: '1px solid rgba(0,0,0,0.06)', paddingTop: 6 }}
-            >
-              <textarea
-                value={replyText}
-                onChange={(e) => setReplyText(e.target.value)}
-                onKeyDown={handleReplyKeyDown}
-                placeholder="Reply… (Cmd+Enter to send)"
-                rows={2}
-                style={{
-                  width: '100%',
-                  padding: '4px 6px',
-                  fontSize: 10,
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
-                  color: '#1f2937',
-                  border: '1px solid rgba(0, 0, 0, 0.1)',
-                  borderRadius: 0,
-                  outline: 'none',
-                  resize: 'vertical',
-                  lineHeight: 1.4,
-                  boxSizing: 'border-box' as const,
-                }}
-              />
-              <button
-                onClick={handleReplySubmit}
-                disabled={!replyText.trim()}
-                style={{
-                  marginTop: 4,
-                  padding: '2px 8px',
-                  fontSize: 10,
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  backgroundColor: replyText.trim() ? '#1f2937' : 'rgba(0,0,0,0.06)',
-                  color: replyText.trim() ? '#ffffff' : '#9ca3af',
-                  border: 'none',
-                  cursor: replyText.trim() ? 'pointer' : 'default',
-                }}
-              >
-                Send
-              </button>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

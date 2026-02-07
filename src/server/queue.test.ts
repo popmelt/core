@@ -53,47 +53,52 @@ describe('JobQueue', () => {
     await d.promise;
   });
 
-  it('processes jobs serially', async () => {
-    const q = new JobQueue();
+  it('processes jobs concurrently up to maxConcurrency', async () => {
+    const q = new JobQueue(2);
     const order: string[] = [];
 
     const d1 = deferred();
     const d2 = deferred();
+    const d3 = deferred();
     let callCount = 0;
 
-    q.setProcessor(async (job) => {
+    q.setProcessor(async () => {
       callCount++;
-      if (callCount === 1) {
-        order.push('start-1');
-        await d1.promise;
-        order.push('end-1');
-      } else {
-        order.push('start-2');
-        await d2.promise;
-        order.push('end-2');
-      }
+      const n = callCount;
+      order.push(`start-${n}`);
+      if (n === 1) { await d1.promise; order.push('end-1'); }
+      else if (n === 2) { await d2.promise; order.push('end-2'); }
+      else { await d3.promise; order.push('end-3'); }
     });
 
     q.enqueue(makeJob({ id: 'j1' }));
     q.enqueue(makeJob({ id: 'j2' }));
+    q.enqueue(makeJob({ id: 'j3' }));
 
-    // Only first job should be running
+    // Both first two jobs should start concurrently
     expect(q.isRunning).toBe(true);
-    expect(order).toEqual(['start-1']);
+    expect(q.activeCount).toBe(2);
+    expect(order).toEqual(['start-1', 'start-2']);
 
+    // Third job is still queued
+    expect(q.depth).toBe(1);
+
+    // Finish first job — third should start
     d1.resolve();
     await d1.promise;
-    // Allow microtasks
     await new Promise(r => setTimeout(r, 10));
 
     expect(order).toContain('end-1');
-    expect(order).toContain('start-2');
+    expect(order).toContain('start-3');
+    expect(q.activeCount).toBe(2);
 
     d2.resolve();
-    await d2.promise;
+    d3.resolve();
+    await Promise.all([d2.promise, d3.promise]);
     await new Promise(r => setTimeout(r, 10));
 
-    expect(order).toEqual(['start-1', 'end-1', 'start-2', 'end-2']);
+    expect(order).toEqual(['start-1', 'start-2', 'end-1', 'start-3', 'end-2', 'end-3']);
+    expect(q.isRunning).toBe(false);
   });
 
   it('broadcasts job_started and queue_drained', async () => {
@@ -138,7 +143,7 @@ describe('JobQueue', () => {
     q.enqueue(makeJob({ id: 'j1' }));
 
     const mockProc = { kill: vi.fn() } as any;
-    q.setActiveProcess(mockProc);
+    q.setActiveProcess('j1', mockProc);
 
     const cancelled = q.cancelActive();
     expect(cancelled).toBe(true);
@@ -182,7 +187,7 @@ describe('JobQueue', () => {
     q.enqueue(makeJob());
 
     const mockProc = { kill: vi.fn() } as any;
-    q.setActiveProcess(mockProc);
+    q.setActiveProcess('j1', mockProc);
 
     q.destroy();
     expect(mockProc.kill).toHaveBeenCalledWith('SIGTERM');

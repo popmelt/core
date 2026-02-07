@@ -10,6 +10,8 @@ export type SpawnOptions = {
   maxBudgetUsd?: number;
   allowedTools?: string[];
   claudePath?: string;
+  resumeSessionId?: string;
+  model?: string;
   onEvent?: (event: SSEEvent, jobId: string) => void;
 };
 
@@ -31,16 +33,30 @@ export function spawnClaude(
     maxBudgetUsd = 1.0,
     allowedTools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'],
     claudePath = 'claude',
+    resumeSessionId,
+    model,
     onEvent,
   } = options;
 
-  const args = [
-    '-p', prompt,
+  const args: string[] = [];
+
+  if (resumeSessionId) {
+    // Resume existing session — context is already cached
+    args.push('--resume', resumeSessionId, '-p', prompt);
+  } else {
+    args.push('-p', prompt);
+  }
+
+  args.push(
     '--output-format', 'stream-json',
     '--verbose',
     '--max-turns', String(maxTurns),
     '--max-budget-usd', String(maxBudgetUsd),
-  ];
+  );
+
+  if (model) {
+    args.push('--model', model);
+  }
 
   for (const tool of allowedTools) {
     args.push('--allowedTools', tool);
@@ -79,58 +95,37 @@ export function spawnClaude(
           console.log(`[spawner:${jobId}] New event type: ${topType}`);
         }
 
-        // Capture text from top-level result message (Claude Code may emit final result this way)
-        if (parsed.type === 'result' && parsed.result) {
+        // Capture text from result message — only as fallback if no text came from assistant messages
+        if (parsed.type === 'result' && parsed.result && textChunks.length === 0) {
           const resultText = typeof parsed.result === 'string' ? parsed.result : '';
           if (resultText) {
             textChunks.push(resultText);
-            onEvent?.({ type: 'delta', text: resultText }, jobId);
-          }
-          // Also check for nested content blocks in result
-          const content = parsed.result?.content ?? parsed.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === 'text' && block.text) {
-                textChunks.push(block.text);
-                onEvent?.({ type: 'delta', text: block.text }, jobId);
-              }
-            }
+            onEvent?.({ type: 'delta', jobId, text: resultText }, jobId);
           }
         }
 
-        // Capture text from assistant message content blocks
-        // Stream-json format: {"type":"assistant","message":{"content":[...]}}
+        // Stream-json format emits complete messages, not streaming deltas.
+        // Each assistant message contains full content blocks: text, tool_use, thinking.
         if (parsed.type === 'assistant' && Array.isArray(parsed.message?.content)) {
           for (const block of parsed.message.content) {
             if (block.type === 'text' && block.text) {
               textChunks.push(block.text);
-              onEvent?.({ type: 'delta', text: block.text }, jobId);
+              onEvent?.({ type: 'delta', jobId, text: block.text }, jobId);
+            }
+            if (block.type === 'tool_use' && block.name) {
+              const file = block.input?.file_path || block.input?.path || undefined;
+              onEvent?.({ type: 'tool_use', jobId, tool: block.name, ...(file ? { file } : {}) }, jobId);
+            }
+            if (block.type === 'thinking' && block.thinking) {
+              onEvent?.({ type: 'thinking', jobId, text: block.thinking }, jobId);
             }
           }
         }
 
-        const event = parsed.event;
-        if (!event) return;
-
-        // Text delta
-        if (
-          event.type === 'content_block_delta' &&
-          event.delta?.type === 'text_delta' &&
-          event.delta.text
-        ) {
-          textChunks.push(event.delta.text);
-          onEvent?.({ type: 'delta', text: event.delta.text }, jobId);
-        }
-
-        // Tool use
-        if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
-          const toolName = event.content_block.name || 'unknown';
-          onEvent?.({ type: 'tool_use', tool: toolName }, jobId);
-        }
-
-        // Tool result with file path (for Edit/Write)
-        if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
-          // We could parse partial JSON for file paths but it's noisy; skip for now
+        // Also handle tool result messages — extract file path for display
+        if (parsed.type === 'user' && parsed.tool_use_result?.file?.filePath) {
+          // Emit a supplementary tool_use with file info (updates the last tool step label)
+          onEvent?.({ type: 'tool_use', jobId, tool: 'Read', file: parsed.tool_use_result.file.filePath }, jobId);
         }
       } catch {
         // Non-JSON line, ignore

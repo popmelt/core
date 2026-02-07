@@ -468,6 +468,52 @@ export async function stitchBlobs(blobs: Blob[]): Promise<Blob | null> {
   });
 }
 
+/** Capture the full page (top to bottom) as a single stitched image, no annotation overlay. */
+export async function captureFullPage(targetElement: HTMLElement): Promise<Blob | null> {
+  const dpr = window.devicePixelRatio || 1;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const pageHeight = Math.max(
+    document.body.scrollHeight,
+    document.documentElement.scrollHeight,
+  );
+
+  // Save current scroll position
+  const savedScrollX = window.scrollX;
+  const savedScrollY = window.scrollY;
+
+  const blobs: Blob[] = [];
+
+  try {
+    const steps = Math.ceil(pageHeight / viewportHeight);
+
+    for (let i = 0; i < steps; i++) {
+      const scrollY = i * viewportHeight;
+
+      // Scroll to position
+      window.scrollTo(savedScrollX, scrollY);
+
+      // Double rAF for paint settle
+      await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+
+      const blob = await captureSingleRegion(
+        targetElement,
+        [], // no annotations
+        scrollY,
+        viewportWidth,
+        Math.min(viewportHeight, pageHeight - scrollY),
+        dpr,
+      );
+      if (blob) blobs.push(blob);
+    }
+  } finally {
+    // Restore scroll position
+    window.scrollTo(savedScrollX, savedScrollY);
+  }
+
+  return stitchBlobs(blobs);
+}
+
 export async function copyToClipboard(
   blobs: Blob | Blob[],
   annotations?: Annotation[],

@@ -7,13 +7,13 @@ import { join } from 'node:path';
 import { spawnClaude } from './claude-spawner';
 import { spawnCodex } from './codex-spawner';
 import { parseMultipart } from './multipart';
-import { buildPrompt, buildReplyPrompt, formatFeedbackContext, parseQuestion, parseResolutions } from './prompt-builder';
+import { buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
-import type { BridgeServerHandle, BridgeServerOptions, FeedbackPayload, Job, Provider, SSEClient, SSEEvent } from './types';
+import type { BridgeServerHandle, BridgeServerOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
 
 const DEFAULT_PORT = 1111;
-const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'];
+const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
 const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_FILE_AGE_MS = 60 * 60 * 1000; // 1 hour
 
@@ -78,6 +78,7 @@ export async function createBridgeServer(
   const queue = new JobQueue();
   const sseClients: Set<SSEClient> = new Set();
   const threadStore = new ThreadFileStore(projectRoot);
+  const jobGroups = new Map<string, JobGroup>();
 
   // Wire up SSE broadcasting from queue
   queue.addListener((event: SSEEvent, _jobId: string) => {
@@ -92,28 +93,66 @@ export async function createBridgeServer(
     const replyPrompt = (job as Job & { _replyPrompt?: string })._replyPrompt;
     const provider = job.provider ?? defaultProvider;
 
-    // Load thread history if this job has a threadId (and no reply prompt)
-    const threadHistory = !replyPrompt && job.threadId
-      ? await threadStore.getThreadHistory(job.threadId)
-      : undefined;
+    // Look up the last session ID from the thread for resume mode
+    let resumeSessionId: string | undefined;
+    if (job.threadId) {
+      const thread = await threadStore.getThread(job.threadId);
+      if (thread) {
+        // Find the last assistant message with a sessionId
+        for (let i = thread.messages.length - 1; i >= 0; i--) {
+          if (thread.messages[i]!.sessionId) {
+            resumeSessionId = thread.messages[i]!.sessionId;
+            break;
+          }
+        }
+      }
+    }
 
-    const prompt = replyPrompt ?? buildPrompt(job.screenshotPath, job.feedback, {
-      threadHistory: threadHistory && threadHistory.length > 0 ? threadHistory : undefined,
-      provider,
-    });
+    // Build the prompt — use a lightweight prompt when resuming, full prompt otherwise
+    let prompt: string;
+    if (resumeSessionId && replyPrompt) {
+      // Resuming with a reply: just send the reply text, the session has full context
+      const lastReply = (await threadStore.getThread(job.threadId!))
+        ?.messages.filter(m => m.role === 'human').pop();
+      const replyText = lastReply?.replyToQuestion || lastReply?.feedbackSummary || '';
+      prompt = replyText
+        + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.';
+    } else if (resumeSessionId) {
+      // Resuming with new annotations: send the new feedback context
+      prompt = formatFeedbackContext(job.feedback)
+        + "\n\nFollow the developer's instructions. If they ask for changes, apply them to the source files."
+        + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.'
+        + (provider !== 'codex' ? `\n\nIMPORTANT: First, use the Read tool to view the updated screenshot at: ${job.screenshotPath}` : '');
+    } else {
+      // No session to resume — build full prompt with thread history
+      const threadHistory = !replyPrompt && job.threadId
+        ? await threadStore.getThreadHistory(job.threadId)
+        : undefined;
+
+      prompt = replyPrompt ?? buildPrompt(job.screenshotPath, job.feedback, {
+        threadHistory: threadHistory && threadHistory.length > 0 ? threadHistory : undefined,
+        provider,
+      });
+    }
+
     const tag = ansiColor(job.color, `[⊹ ${port}:${job.id}]`);
-    console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}`);
+    console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
     console.log(`${tag} Prompt includes question instruction: ${prompt.includes('## Questions')}`);
 
     const onEvent = (event: SSEEvent, jobId: string) => {
       queue.broadcast(event, jobId);
     };
 
+    // Use per-job tool overrides (e.g. planner gets Read-only)
+    const jobAllowedTools = (job as Job & { _allowedTools?: string[] })._allowedTools ?? allowedTools;
+
     const { process: proc, result } = provider === 'codex'
       ? spawnCodex(job.id, {
           prompt,
           projectRoot,
           screenshotPath: job.screenshotPath,
+          resumeSessionId,
+          model: job.model,
           onEvent,
         })
       : spawnClaude(job.id, {
@@ -121,12 +160,14 @@ export async function createBridgeServer(
           projectRoot,
           maxTurns,
           maxBudgetUsd,
-          allowedTools,
+          allowedTools: jobAllowedTools,
           claudePath,
+          resumeSessionId,
+          model: job.model,
           onEvent,
         });
 
-    queue.setActiveProcess(proc);
+    queue.setActiveProcess(job.id, proc);
 
     const spawnResult = await result;
     job.result = spawnResult.text;
@@ -173,6 +214,44 @@ export async function createBridgeServer(
           question: question ?? undefined,
           sessionId: spawnResult.sessionId,
         });
+      }
+
+      // Planner completion: parse plan and broadcast plan_ready
+      if (job.planId && !job.planTaskId) {
+        const group = jobGroups.get(job.planId);
+        if (group) {
+          const plan = parsePlan(spawnResult.text);
+          if (plan && plan.length > 0) {
+            group.plan = plan;
+            group.status = 'awaiting_approval';
+            group.plannerThreadId = job.threadId;
+            console.log(`${tag} Plan ready: ${plan.length} tasks for group ${job.planId}`);
+            queue.broadcast(
+              { type: 'plan_ready', jobId: job.id, planId: job.planId, tasks: plan, threadId: job.threadId },
+              job.id,
+            );
+          } else if (!question) {
+            // Plan parsing failed and no question — error
+            group.status = 'error';
+            console.error(`${tag} Failed to parse plan from planner response`);
+          }
+        }
+      }
+
+      // Review completion: parse review verdict
+      if (job.planId && (job as Job & { _isReview?: boolean })._isReview) {
+        const group = jobGroups.get(job.planId);
+        if (group) {
+          const review = parseReview(spawnResult.text);
+          if (review) {
+            group.status = review.verdict === 'pass' ? 'done' : 'executing';
+            console.log(`${tag} Review verdict: ${review.verdict} — ${review.summary}`);
+            queue.broadcast(
+              { type: 'plan_review', planId: job.planId, verdict: review.verdict, summary: review.summary, issues: review.issues },
+              job.id,
+            );
+          }
+        }
       }
 
       // Broadcast question event if Claude asked one
@@ -226,7 +305,18 @@ export async function createBridgeServer(
       } else if (req.method === 'POST' && path === '/reply') {
         await handleReply(req, res);
       } else if (req.method === 'POST' && path === '/cancel') {
-        handleCancel(res);
+        handleCancel(req, res);
+      } else if (req.method === 'POST' && path === '/plan') {
+        await handlePlan(req, res);
+      } else if (req.method === 'POST' && path === '/plan/approve') {
+        await handlePlanApprove(req, res);
+      } else if (req.method === 'POST' && path === '/plan/review') {
+        await handlePlanReview(req, res);
+      } else if (req.method === 'GET' && path.startsWith('/plan/')) {
+        handleGetPlan(path.slice('/plan/'.length), res);
+      } else if (req.method === 'GET' && path.startsWith('/thread/')) {
+        const threadId = path.slice('/thread/'.length);
+        await handleGetThread(threadId, res);
       } else {
         sendJson(res, 404, { error: 'Not found' });
       }
@@ -239,7 +329,7 @@ export async function createBridgeServer(
   });
 
   async function handleSend(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, color, provider: providerStr } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr } = await parseMultipart(req);
 
     let feedback: FeedbackPayload;
     try {
@@ -285,6 +375,7 @@ export async function createBridgeServer(
       threadId,
       annotationIds,
       provider: (providerStr === 'claude' || providerStr === 'codex') ? providerStr : undefined,
+      model: modelStr || undefined,
     };
 
     // Append human message to thread
@@ -318,7 +409,7 @@ export async function createBridgeServer(
     }
     const body = Buffer.concat(chunks).toString('utf-8');
 
-    let parsed: { threadId?: string; reply?: string; color?: string; provider?: string };
+    let parsed: { threadId?: string; reply?: string; color?: string; provider?: string; model?: string };
     try {
       parsed = JSON.parse(body);
     } catch {
@@ -326,7 +417,7 @@ export async function createBridgeServer(
       return;
     }
 
-    const { threadId, reply, color, provider: providerStr } = parsed;
+    const { threadId, reply, color, provider: providerStr, model: modelStr } = parsed;
     if (!threadId || !reply) {
       sendJson(res, 400, { error: 'Missing threadId or reply' });
       return;
@@ -395,6 +486,7 @@ export async function createBridgeServer(
       threadId,
       annotationIds: annotationIds.length > 0 ? annotationIds : undefined,
       provider: replyProvider,
+      model: modelStr || undefined,
     };
 
     // Override the job processor prompt for this job by storing it
@@ -423,18 +515,223 @@ export async function createBridgeServer(
   }
 
   function handleStatus(res: ServerResponse) {
+    const allActive = queue.allActive;
     sendJson(res, 200, {
       ok: true,
-      activeJob: queue.active
-        ? { id: queue.active.id, status: queue.active.status }
+      activeJob: allActive[0]
+        ? { id: allActive[0].id, status: allActive[0].status }
         : null,
+      activeJobs: allActive.map(j => ({ id: j.id, status: j.status })),
       queueDepth: queue.depth,
     });
   }
 
-  function handleCancel(res: ServerResponse) {
-    const cancelled = queue.cancelActive();
+  function handleCancel(req: IncomingMessage, res: ServerResponse) {
+    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${port}`);
+    const jobId = reqUrl.searchParams.get('jobId');
+    const cancelled = jobId ? queue.cancelJob(jobId) : queue.cancelActive();
     sendJson(res, 200, { cancelled });
+  }
+
+  async function handlePlan(req: IncomingMessage, res: ServerResponse) {
+    const { screenshot, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+
+    if (!screenshot || !goalStr) {
+      sendJson(res, 400, { error: 'Missing screenshot or goal' });
+      return;
+    }
+
+    const pageUrl = pageUrlStr || '';
+    let viewport = { width: 1440, height: 900 };
+    try {
+      if (viewportStr) viewport = JSON.parse(viewportStr);
+    } catch {}
+
+    const planId = randomUUID().slice(0, 8);
+    const jobId = randomUUID().slice(0, 8);
+    const screenshotPath = join(tempDir, `screenshot-plan-${planId}.png`);
+    await writeFile(screenshotPath, screenshot);
+
+    // Create thread for planner conversation
+    const thread = await threadStore.createThread(jobId, []);
+    const threadId = thread.id;
+
+    // Create job group
+    const group: JobGroup = {
+      id: planId,
+      goal: goalStr,
+      status: 'planning',
+      plannerJobId: jobId,
+      plannerThreadId: threadId,
+      workerJobIds: [],
+      screenshotPath,
+      pageUrl,
+      viewport,
+      createdAt: Date.now(),
+    };
+    jobGroups.set(planId, group);
+
+    // Build planner prompt
+    const prompt = buildPlannerPrompt(screenshotPath, goalStr, pageUrl, viewport);
+
+    // Append human message to thread
+    await threadStore.appendMessage(threadId, {
+      role: 'human',
+      timestamp: Date.now(),
+      jobId,
+      screenshotPath,
+      feedbackSummary: `Plan: ${goalStr}`,
+      feedbackContext: `Goal: ${goalStr}\nPage: ${pageUrl}`,
+    });
+
+    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
+    const job: Job = {
+      id: jobId,
+      status: 'queued',
+      screenshotPath,
+      feedback: {
+        timestamp: new Date().toISOString(),
+        url: pageUrl,
+        viewport,
+        scrollPosition: { x: 0, y: 0 },
+        annotations: [],
+        styleModifications: [],
+      },
+      createdAt: Date.now(),
+      threadId,
+      provider,
+      model: modelStr || undefined,
+      planId,
+    };
+
+    // Override prompt and tools for planner (vision-only, no code changes)
+    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
+    (job as Job & { _allowedTools?: string[] })._allowedTools = ['Read'];
+
+    const position = queue.enqueue(job);
+    sendJson(res, 200, { planId, jobId, position, threadId });
+  }
+
+  async function handlePlanApprove(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    const body = Buffer.concat(chunks).toString('utf-8');
+
+    let parsed: { planId?: string; approvedTaskIds?: string[] };
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+      return;
+    }
+
+    const { planId, approvedTaskIds } = parsed;
+    if (!planId) {
+      sendJson(res, 400, { error: 'Missing planId' });
+      return;
+    }
+
+    const group = jobGroups.get(planId);
+    if (!group) {
+      sendJson(res, 404, { error: 'Plan not found' });
+      return;
+    }
+
+    if (!group.plan) {
+      sendJson(res, 400, { error: 'Plan has no tasks' });
+      return;
+    }
+
+    // Filter tasks if specific IDs were approved
+    const tasks = approvedTaskIds
+      ? group.plan.filter(t => approvedTaskIds.includes(t.id))
+      : group.plan;
+
+    group.status = 'executing';
+
+    sendJson(res, 200, { planId, tasks, status: 'executing' });
+  }
+
+  async function handlePlanReview(req: IncomingMessage, res: ServerResponse) {
+    const { screenshot, planId: planIdStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+
+    if (!planIdStr) {
+      sendJson(res, 400, { error: 'Missing planId' });
+      return;
+    }
+
+    const group = jobGroups.get(planIdStr);
+    if (!group) {
+      sendJson(res, 404, { error: 'Plan not found' });
+      return;
+    }
+
+    group.status = 'reviewing';
+
+    const jobId = randomUUID().slice(0, 8);
+    let screenshotPath = group.screenshotPath;
+    if (screenshot) {
+      screenshotPath = join(tempDir, `screenshot-review-${planIdStr}.png`);
+      await writeFile(screenshotPath, screenshot);
+    }
+
+    // Build completed tasks summary from worker results
+    const completedTasks = (group.plan || []).map(t => ({
+      id: t.id,
+      instruction: t.instruction,
+      summary: 'completed', // Workers will have set resolution summaries
+    }));
+
+    const prompt = buildReviewerPrompt(screenshotPath, group.goal, completedTasks);
+
+    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
+    const job: Job = {
+      id: jobId,
+      status: 'queued',
+      screenshotPath,
+      feedback: {
+        timestamp: new Date().toISOString(),
+        url: group.pageUrl,
+        viewport: group.viewport,
+        scrollPosition: { x: 0, y: 0 },
+        annotations: [],
+        styleModifications: [],
+      },
+      createdAt: Date.now(),
+      threadId: group.plannerThreadId,
+      provider,
+      model: modelStr || undefined,
+      planId: planIdStr,
+    };
+
+    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
+    (job as Job & { _isReview?: boolean })._isReview = true;
+    (job as Job & { _allowedTools?: string[] })._allowedTools = ['Read'];
+
+    const position = queue.enqueue(job);
+    sendJson(res, 200, { jobId, planId: planIdStr, position });
+  }
+
+  function handleGetPlan(planId: string, res: ServerResponse) {
+    const group = jobGroups.get(planId);
+    if (!group) {
+      sendJson(res, 404, { error: 'Plan not found' });
+      return;
+    }
+    sendJson(res, 200, group);
+  }
+
+  async function handleGetThread(threadId: string, res: ServerResponse) {
+    const thread = await threadStore.getThread(threadId);
+    if (!thread) {
+      sendJson(res, 404, { error: 'Thread not found' });
+      return;
+    }
+    // Strip screenshotPath from messages (local filesystem path)
+    const messages = thread.messages.map(({ screenshotPath, ...rest }) => rest);
+    sendJson(res, 200, { id: thread.id, createdAt: thread.createdAt, messages });
   }
 
   // Periodic cleanup
