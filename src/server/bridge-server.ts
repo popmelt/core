@@ -150,7 +150,6 @@ export async function createPopmelt(
 
     const tag = ansiColor(job.color, `[⊹ ${port}:${job.id}]`);
     console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
-    console.log(`${tag} Prompt includes question instruction: ${prompt.includes('## Questions')}`);
 
     // Incremental resolution tracking for plan executor jobs
     const isPlanExecutor = !!(job as Job & { _isPlanExecutor?: boolean })._isPlanExecutor;
@@ -215,22 +214,12 @@ export async function createPopmelt(
       const question = parseQuestion(spawnResult.text);
       let resolutions = parseResolutions(spawnResult.text);
 
-      // Diagnostic logging for question detection
-      const hasQuestionTag = spawnResult.text.includes('<question>');
-      console.log(`${tag} Response analysis: hasQuestionTag=${hasQuestionTag}, parsedQuestion=${question ? `"${question.slice(0, 80)}"` : 'null'}, resolutions=${resolutions.length}, responseLength=${spawnResult.text.length}`);
-      if (!hasQuestionTag) {
-        // Log tail of response to see what Claude actually said
-        const tail = spawnResult.text.slice(-300).replace(/\n/g, '\\n');
-        console.log(`${tag} Response tail: ${tail}`);
-      }
-
       // Remap resolution annotationIds when Claude uses IDs that don't match actual annotations.
       // This happens when Claude invents IDs instead of using the ones from the prompt.
       if (resolutions.length > 0 && job.annotationIds && job.annotationIds.length > 0) {
         const realIdSet = new Set(job.annotationIds);
         const allMatch = resolutions.every(r => realIdSet.has(r.annotationId));
         if (!allMatch) {
-          console.log(`${tag} Remapping resolution IDs: Claude used [${resolutions.map(r => r.annotationId).join(', ')}] but real IDs are [${job.annotationIds.join(', ')}]`);
           resolutions = resolutions.map((r, i) => ({
             ...r,
             annotationId: job.annotationIds![i % job.annotationIds!.length]!,

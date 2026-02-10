@@ -42,8 +42,6 @@ export function spawnCodex(
     }
   }
 
-  console.log(`[codex-spawner:${jobId}] spawn args:`, JSON.stringify(args));
-
   const child = spawn('codex', args, {
     cwd: projectRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -66,10 +64,7 @@ export function spawnCodex(
         const parsed = JSON.parse(line);
         const eventType = parsed.type ?? 'unknown';
 
-        if (!seenEventTypes.has(eventType)) {
-          seenEventTypes.add(eventType);
-          console.log(`[codex-spawner:${jobId}] New event type: ${eventType}`);
-        }
+        seenEventTypes.add(eventType);
 
         // Capture thread_id from thread.started event
         if (eventType === 'thread.started' && parsed.thread_id && !capturedSessionId) {
@@ -90,7 +85,6 @@ export function spawnCodex(
         // Item started — detect tool use
         if (eventType === 'item/started' && parsed.item) {
           const itemType = parsed.item.type;
-          console.log(`[codex-spawner:${jobId}] item/started ${itemType}:`, JSON.stringify(parsed.item, null, 2));
           if (itemType === 'command_execution') {
             onEvent?.({ type: 'tool_use', jobId, tool: 'Bash' }, jobId);
           } else if (itemType === 'file_change') {
@@ -109,7 +103,6 @@ export function spawnCodex(
 
         // Item completed — accumulate full text from agent messages and reasoning
         if (eventType === 'item/completed' && parsed.item) {
-          console.log(`[codex-spawner:${jobId}] item/completed ${parsed.item.type}:`, JSON.stringify(parsed.item, null, 2));
           if (parsed.item.type === 'agent_message') {
             const itemText = parsed.item.text;
             if (typeof itemText === 'string' && itemText) {
@@ -141,8 +134,6 @@ export function spawnCodex(
 
     child.on('close', (code) => {
       rl.close();
-
-      console.log(`[codex-spawner:${jobId}] Process closed (code=${code}). Event types seen: ${[...seenEventTypes].join(', ')}. Text chunks: ${textChunks.length}, total chars: ${textChunks.join('').length}`);
 
       if (code !== 0 && code !== null) {
         hadError = true;

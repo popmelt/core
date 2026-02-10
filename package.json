@@ -1,9 +1,13 @@
 {
   "name": "@popmelt.com/core",
   "version": "0.1.0",
-  "description": "Visual collaboration layer for directing AI coding assistants",
+  "description": "The design collaboration layer for AI coding agents",
   "license": "PolyForm-Shield-1.0.0",
   "author": "Popmelt <hello@popmelt.com> (https://popmelt.com)",
+  "homepage": "https://github.com/popmelt/core",
+  "bugs": {
+    "url": "https://github.com/popmelt/core/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/popmelt/core.git"

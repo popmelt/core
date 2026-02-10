@@ -319,11 +319,9 @@ export async function captureScreenshot(
 
     // Group annotations into viewport-height regions
     const regions = groupAnnotationsIntoRegions(activeAnnotations, viewportHeight);
-    console.log('[Screenshot] Created', regions.length, 'regions');
 
     // If no regions (no annotations), capture current viewport
     if (regions.length === 0) {
-      console.log('[Screenshot] No regions, capturing current viewport');
       const blob = await captureSingleRegion(
         targetElement,
         [],
@@ -339,7 +337,6 @@ export async function captureScreenshot(
     const blobs: Blob[] = [];
     for (let i = 0; i < regions.length; i++) {
       const region = regions[i]!;
-      console.log(`[Screenshot] Capturing region ${i + 1}/${regions.length} at y=${region.top}`);
       const blob = await captureSingleRegion(
         targetElement,
         region.annotations,
@@ -350,13 +347,12 @@ export async function captureScreenshot(
       );
       if (blob) {
         blobs.push(blob);
-        console.log(`[Screenshot] Region ${i + 1} captured, blob size:`, blob.size);
       } else {
         console.warn(`[Screenshot] Region ${i + 1} failed to capture`);
       }
     }
 
-    console.log('[Screenshot] Total blobs captured:', blobs.length);
+    console.log('[Screenshot] Capture complete');
     return blobs;
   } catch (error) {
     console.error('[Screenshot] Capture failed:', error);
@@ -562,7 +558,6 @@ export async function copyToClipboard(
         const feedbackData = buildFeedbackData(activeAnnotations, styleModifications || []);
         const jsonBlob = new Blob([JSON.stringify(feedbackData, null, 2)], { type: 'text/plain' });
         clipboardItems['text/plain'] = jsonBlob;
-        console.log('[Screenshot] Structured feedback data:', feedbackData);
       }
     }
 

@@ -101,10 +101,7 @@ export function spawnClaude(
 
         // Log top-level keys we see (for debugging event structure)
         const topType = parsed.type ?? (parsed.event?.type ? `event.${parsed.event.type}` : 'unknown');
-        if (!seenEventTypes.has(topType)) {
-          seenEventTypes.add(topType);
-          console.log(`[spawner:${jobId}] New event type: ${topType}`);
-        }
+        seenEventTypes.add(topType);
 
         // Capture text from result message — only as fallback if no text came from assistant messages
         if (parsed.type === 'result' && parsed.result && textChunks.length === 0) {
@@ -166,8 +163,6 @@ export function spawnClaude(
 
     child.on('close', (code) => {
       rl.close();
-
-      console.log(`[spawner:${jobId}] Process closed (code=${code}). Event types seen: ${[...seenEventTypes].join(', ')}. Text chunks: ${textChunks.length}, total chars: ${textChunks.join('').length}`);
 
       if (code !== 0 && code !== null) {
         hadError = true;
