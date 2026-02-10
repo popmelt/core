@@ -2,27 +2,28 @@
   <img src="src/assets/bar - popmelt.png" alt="Comment and zhuzh, then hand off." width="360" style="border-radius: 12px;" />
 </p>
 
-#Popmelt
+# Popmelt
 
-## What
+## What is it?
 
-Popmelt is a design collaboration layer for AI models like Codex or Claude Code. It combines the best parts of collaborative design tools like Figma with the best way to design products today: in code, with AI.
+Popmelt is a design collaboration layer for AI models like Codex or Claude Code. It combines the best parts of collaborative design tools like Figma with the best way to design products today: in code, with AI, right in your browser. 
 
-Drop it into any React app and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, then give your AI the visual and technical context it needs to update your codebase in a keystroke.
+It's a good fit for anyone involved in UI Design and Engineering for the web: it doesn't require deep technical expertise to use, and it won't get in your way if you *do* have that knowledge and want to use it.
+
+Drop it into any React codebase and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, and give your AI the visual and technical context it needs to execute your vision in a keystroke.
 
 <p align="center">
   <img src="src/assets/annotations.jpg" alt="Popmelt annotations on a running app" width="720" style="border-radius: 6px;" />
 </p>
 
-**Popmelt is free to use and completely local**. It runs inside your codebase, with your existing AI CLI tools handling code changes behind the scenes. You don't need an account to use it and we never see your data
+**Popmelt is free to use and completely local**. It runs inside your codebase, with your existing AI CLI tools ([Claude Code](https://code.claude.com/docs/en/cli-reference), [Codex](https://developers.openai.com/codex/cli/)) handling code changes behind the scenes. You don't need an account to use it and we never see your data. 
 
-## Why
+## Why does it exist?
 
 We're experienced product engineers and early adopters of AI coding models. We know their strengths, we know their weaknesses, and we've learned how to squeeze the best performance out of each generation. Popmelt was built to streamline our way of working, and we're proud to make it available to the design and engineering community.
 
-\- Reb
 
-## Quick start
+## How do I set it up?
 
 If you're a human, we recommend asking your AI to handle installation for you. We cover the basics below, but your AI should be able to integrate it into whatever setup you throw at it as long as it supports Node and React.
 
@@ -69,7 +70,7 @@ For other frameworks, call `startPopmelt()` anywhere in your dev server startup.
 
 Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar. Draw, type, point at things, hit Cmd+Enter. Your AI sees your annotated screenshot and gets to work.
 
-## How to use it
+## How do I use it?
 
 ### Annotation tools
 
@@ -167,3 +168,9 @@ const { isEnabled } = usePopmelt();
 ## License
 
 [PolyForm Shield 1.0.0](./LICENSE)
+
+**tl;dr** you can use and extend this software freely for yourself and your team. You may not sell it, offer it as a managed service, or take our code and create a competing AI design collaboration product/service with it. The software is offered as-is, and you're responsible for its use in your projects.
+
+**If you need a custom license** for your use case, contact [reb@popmelt.com](mailto:reb@popmelt.com) with a brief outline of your desired terms.
+
+<img src="src/assets/popmelt-logo.svg" alt="Comment and zhuzh, then hand off." width="64" />
