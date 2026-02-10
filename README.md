@@ -31,7 +31,7 @@ If you're a human, we recommend asking your AI to handle installation for you. W
 npm install @popmelt.com/core
 ```
 
-Peer dependencies: `react >=18`, `react-dom >=18`. Optional: `lucide-react >=0.400` (toolbar icons).
+Peer dependencies: `react >=18`, `react-dom >=18`, `lucide-react >=0.400` (toolbar icons).
 
 
 ### Frontend
@@ -68,7 +68,7 @@ For other frameworks, call `startPopmelt()` anywhere in your dev server startup.
 
 ### That's it
 
-Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar. Draw, type, point at things, hit Cmd+Enter. Your AI sees your annotated screenshot and gets to work.
+Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar. Draw, type, point at things, hit Cmd+Enter. Your AI sees your annotated screenshot and code context and gets to work.
 
 ## How do I use it?
 
