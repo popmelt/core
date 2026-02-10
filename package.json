@@ -1,35 +1,79 @@
 {
-  "name": "@kit/popmelt",
-  "private": true,
+  "name": "@popmelt.com/core",
   "version": "0.1.0",
+  "description": "Visual collaboration layer for directing AI coding assistants",
+  "license": "PolyForm-Shield-1.0.0",
+  "author": "Popmelt <hello@popmelt.com> (https://popmelt.com)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/popmelt/core.git"
+  },
+  "keywords": [
+    "ai",
+    "annotations",
+    "collaboration",
+    "devtools",
+    "react",
+    "visual-feedback"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "clean": "git clean -xdf .turbo node_modules",
+    "build": "tsup",
+    "clean": "git clean -xdf .turbo node_modules dist",
     "format": "prettier --check \"**/*.{ts,tsx}\"",
     "lint": "eslint .",
+    "prepublishOnly": "pnpm run build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "exports": {
     ".": "./src/index.ts",
-    "./provider": "./src/components/DevToolsProvider.tsx",
+    "./provider": "./src/components/PopmeltProvider.tsx",
     "./server": "./src/server/index.ts"
   },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.mts",
+        "import": "./dist/index.mjs"
+      },
+      "./server": {
+        "types": "./dist/server.d.mts",
+        "import": "./dist/server.mjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src/assets",
+    "LICENSE",
+    "README.md"
+  ],
   "dependencies": {
     "modern-screenshot": "^4.4.39"
   },
   "peerDependencies": {
+    "lucide-react": ">=0.400.0",
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"
   },
+  "peerDependenciesMeta": {
+    "lucide-react": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@kit/eslint-config": "workspace:*",
-    "@kit/prettier-config": "workspace:*",
-    "@kit/tsconfig": "workspace:*",
     "@types/react": "19.1.0",
     "@types/react-dom": "19.1.2",
+    "eslint": "^9.24.0",
     "lucide-react": "^0.487.0",
+    "prettier": "^3.5.3",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.8.3",
     "vitest": "^4.0.18"
   }

@@ -7,7 +7,20 @@ export type AnnotationResolution = {
   filesModified?: string[];
 };
 
-export type ToolType = 'freehand' | 'line' | 'rectangle' | 'circle' | 'text' | 'inspector';
+export type ManifestEntry = {
+  tag: string;
+  text?: string;
+  rect: { x: number; y: number; w: number; h: number };
+  component?: string;
+  classes?: string;
+  styles?: Record<string, string>;
+  depth: number;
+  role?: string;
+  href?: string;
+  alt?: string;
+};
+
+export type ToolType = 'freehand' | 'line' | 'rectangle' | 'circle' | 'text' | 'inspector' | 'hand';
 
 export type Point = {
   x: number;
@@ -32,7 +45,8 @@ export type StyleChange = {
 };
 
 export type StyleModification = {
-  selector: string;              // CSS selector for the element
+  selector: string;              // CSS selector for the element (data-pm during session)
+  durableSelector?: string;      // Stable CSS path selector that survives page refresh
   element: ElementInfo;          // Context (tagName, reactComponent, etc.)
   changes: StyleChange[];
   captured?: boolean;            // Has been included in a screenshot (read-only)
@@ -135,6 +149,7 @@ export type AnnotationAction =
   | { type: 'MOVE_ANNOTATION'; payload: { id: string; delta: Point; saveUndo?: boolean } }
   | { type: 'RESIZE_ANNOTATION'; payload: { id: string; points: Point[]; saveUndo?: boolean } }
   | { type: 'PASTE_ANNOTATIONS'; payload: { annotations: Annotation[] } }
+  | { type: 'RESTORE_ANNOTATIONS'; payload: { annotations: Annotation[] } }
   | { type: 'SELECT_ANNOTATION'; payload: { id: string | null; addToSelection?: boolean } }
   | { type: 'UPDATE_ANNOTATION_COLOR'; payload: { id: string; color: string } }
   | { type: 'MARK_CAPTURED' }
@@ -144,6 +159,7 @@ export type AnnotationAction =
   // Inspector actions
   | { type: 'SELECT_ELEMENT'; payload: InspectedElement | null }
   | { type: 'MODIFY_STYLE'; payload: { selector: string; element: ElementInfo; property: string; original: string; modified: string } }
+  | { type: 'MODIFY_STYLES_BATCH'; payload: { selector: string; durableSelector?: string; element: ElementInfo; changes: { property: string; original: string; modified: string }[] } }
   | { type: 'CLEAR_STYLE'; payload: { selector: string; property: string } }
   | { type: 'CLEAR_ALL_STYLES' }
   | { type: 'RESTORE_STYLE_MODIFICATIONS'; payload: StyleModification[] }

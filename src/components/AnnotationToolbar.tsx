@@ -4,65 +4,23 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Circle,
-  MousePointer2,
+  Hand,
+  MessageCircle,
   Pen,
   Slash,
   Square,
-  TextCursor,
-  Undo2,
+  Trash2,
+  Type,
 } from 'lucide-react';
 
+import { useLocalStorageBatch } from '../hooks/useLocalStorageBatch';
+import type { StorageKeys } from '../hooks/useLocalStorageBatch';
+import { useSpinner } from '../hooks/useSpinner';
+import { POPMELT_BORDER } from '../styles/border';
 import type { Annotation, AnnotationAction, AnnotationState, ToolType } from '../tools/types';
+import { computeSupersededAnnotations } from '../utils/superseded';
 import { applyStyleModifications, extractElementInfo, findElementBySelector, revertAllStyles } from '../utils/dom';
 import { colors, ToolButton, ToolSeparator } from './ToolButton';
-
-const BROAD_GOAL_THRESHOLD = 0.5; // 50% of viewport area
-
-/**
- * Detect if pending annotations represent a single broad goal (one large annotation group
- * covering >50% of the viewport with a text instruction).
- * Returns the goal text if detected, null otherwise.
- */
-function detectBroadGoal(pendingAnnotations: Annotation[]): string | null {
-  // Collect unique groups
-  const groups = new Map<string, Annotation[]>();
-  const ungrouped: Annotation[] = [];
-  for (const a of pendingAnnotations) {
-    if (a.groupId) {
-      const group = groups.get(a.groupId) || [];
-      group.push(a);
-      groups.set(a.groupId, group);
-    } else {
-      ungrouped.push(a);
-    }
-  }
-
-  // Must be exactly one annotation group (plus its text), no ungrouped shapes
-  if (groups.size !== 1) return null;
-  if (ungrouped.some(a => a.type !== 'text')) return null;
-
-  const [group] = [...groups.values()];
-  if (!group) return null;
-
-  const shape = group.find(a => a.type !== 'text');
-  const text = group.find(a => a.type === 'text');
-  if (!shape || !text?.text) return null;
-
-  // Calculate area from annotation points
-  if (shape.points.length < 2) return null;
-  const xs = shape.points.map(p => p.x);
-  const ys = shape.points.map(p => p.y);
-  const annWidth = Math.max(...xs) - Math.min(...xs);
-  const annHeight = Math.max(...ys) - Math.min(...ys);
-  const annArea = annWidth * annHeight;
-
-  const viewportArea = window.innerWidth * window.innerHeight;
-  if (annArea / viewportArea < BROAD_GOAL_THRESHOLD) return null;
-
-  // Include any ungrouped text annotations as additional context
-  const allText = [text.text, ...ungrouped.filter(a => a.text).map(a => a.text!)];
-  return allText.join('. ');
-}
 
 type AnnotationToolbarProps = {
   state: AnnotationState;
@@ -76,6 +34,7 @@ type AnnotationToolbarProps = {
   onClear?: () => void;
   provider?: string;
   onProviderChange?: (provider: string) => void;
+  availableProviders?: string[];
   modelIndex?: number;
   modelCount?: number;
   modelLabel?: string;
@@ -89,7 +48,7 @@ type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: stri
 
 const shapeTools: ToolDef[] = [
   { type: 'rectangle', icon: Square, label: 'Rectangle', shortcut: 'R' },
-  { type: 'circle', icon: Circle, label: 'Circle', shortcut: 'O' },
+  { type: 'circle', icon: Circle, label: 'Oval', shortcut: 'O' },
   { type: 'line', icon: Slash, label: 'Line', shortcut: 'L' },
   { type: 'freehand', icon: Pen, label: 'Pen', shortcut: 'P' },
 ];
@@ -97,8 +56,161 @@ const shapeTools: ToolDef[] = [
 const shapeToolTypes = new Set(shapeTools.map(t => t.type));
 
 const standaloneTools: ToolDef[] = [
-  { type: 'text', icon: TextCursor, label: 'Text', shortcut: 'T' },
+  { type: 'text', icon: Type, label: 'Text', shortcut: 'T' },
 ];
+
+type GuidanceEntry = {
+  name: string;
+  desc: string;
+  usage: string[];
+  keys: { key: string; desc: string; accent?: boolean }[];
+};
+
+const TOOL_GUIDANCE: Record<string, GuidanceEntry> = {
+  inspector: {
+    name: 'Comment',
+    desc: 'Pin feedback to specific elements on the page.',
+    usage: [
+      'Click any element to attach a comment',
+      'Type your note, then hand off to your AI',
+      'Your AI may ask clarifying questions',
+      'Replies get threaded',
+    ],
+    keys: [
+      { key: 'C', desc: 'Select tool' },
+      { key: 'Click', desc: 'Pin comment to element' },
+      { key: 'Esc', desc: 'Deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  hand: {
+    name: 'Handle',
+    desc: 'Quickly finetune layout and typescale.',
+    usage: [
+      'Edges → padding',
+      'Between items → spacing',
+      'Corners → rounding',
+      'Right of text → font size',
+      'Below text → line height',
+      'Click a spacing handle to cycle distribution',
+    ],
+    keys: [
+      { key: 'H', desc: 'Select tool' },
+      { key: 'Shift', desc: 'Snap to scale' },
+      { key: '⌥ + swipe', desc: 'Cycle justify / flip direction' },
+      { key: '⇧ + swipe', desc: 'Cycle align-items' },
+      { key: 'Esc', desc: 'Deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  rectangle: {
+    name: 'Rectangle',
+    desc: 'Draw rectangular highlights to mark areas of interest.',
+    usage: [
+      'Click and drag to draw',
+      'Cycle between shapes with the dot selector',
+    ],
+    keys: [
+      { key: 'R', desc: 'Rectangle' },
+      { key: 'O', desc: 'Oval' },
+      { key: 'L', desc: 'Line' },
+      { key: 'P', desc: 'Pen' },
+      { key: 'Esc', desc: 'Cancel or deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  circle: {
+    name: 'Oval',
+    desc: 'Draw oval highlights to mark areas of interest.',
+    usage: [
+      'Click and drag to draw',
+      'Cycle between shapes with the dot selector',
+    ],
+    keys: [
+      { key: 'O', desc: 'Oval' },
+      { key: 'R', desc: 'Rectangle' },
+      { key: 'L', desc: 'Line' },
+      { key: 'P', desc: 'Pen' },
+      { key: 'Esc', desc: 'Cancel or deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  line: {
+    name: 'Line',
+    desc: 'Draw line annotations to point at or connect elements.',
+    usage: [
+      'Click and drag to draw',
+      'Cycle between shapes with the dot selector',
+    ],
+    keys: [
+      { key: 'L', desc: 'Line' },
+      { key: 'R', desc: 'Rectangle' },
+      { key: 'O', desc: 'Oval' },
+      { key: 'P', desc: 'Pen' },
+      { key: 'Esc', desc: 'Cancel or deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  freehand: {
+    name: 'Pen',
+    desc: 'Draw freehand paths to annotate freely.',
+    usage: [
+      'Click and drag to draw',
+      'Cycle between shapes with the dot selector',
+    ],
+    keys: [
+      { key: 'P', desc: 'Pen' },
+      { key: 'R', desc: 'Rectangle' },
+      { key: 'O', desc: 'Oval' },
+      { key: 'L', desc: 'Line' },
+      { key: 'Esc', desc: 'Cancel or deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  text: {
+    name: 'Text',
+    desc: 'Place text labels anywhere on the page.',
+    usage: [
+      'Click to place, then start typing',
+      'Click away or press Enter to finish',
+      'Scroll while hovering a label to resize it',
+    ],
+    keys: [
+      { key: 'T', desc: 'Select tool' },
+      { key: 'Esc', desc: 'Cancel text or deselect' },
+      { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
+    ],
+  },
+  counter: {
+    name: 'Annotations',
+    desc: 'Click to cycle, scroll to change color, long press to reset.',
+    usage: [],
+    keys: [
+      { key: 'Click', desc: 'Cycle annotations' },
+      { key: 'Scroll', desc: 'Change color' },
+      { key: 'Hold', desc: 'Reset to red' },
+    ],
+  },
+  clear: {
+    name: 'Clear',
+    desc: 'Remove all annotations and style changes.',
+    usage: [],
+    keys: [
+      { key: '⌘ ⌫', desc: 'Clear all' },
+      { key: '⌫', desc: 'Delete selected annotation' },
+      { key: '⌘ Z', desc: 'Undo' },
+      { key: '⌘ ⇧ Z', desc: 'Redo' },
+    ],
+  },
+  collapse: {
+    name: 'Popmelt',
+    desc: 'Comment and zhuzh, then hand off.\n\nYour AI gets the visual and technical context it needs to act.',
+    usage: [],
+    keys: [
+      { key: '⌘⌘', desc: 'Toggle toolbar' },
+    ],
+  },
+};
 
 const baseToolbarStyle: CSSProperties = {
   position: 'fixed',
@@ -107,12 +219,12 @@ const baseToolbarStyle: CSSProperties = {
   zIndex: 9999,
   display: 'flex',
   alignItems: 'center',
-  backgroundColor: 'rgba(255, 255, 255, 0.85)',
-  border: '1px solid rgba(0, 0, 0, 0.1)',
-  backdropFilter: 'blur(32px)',
-  fontFamily: 'system-ui, -apple-system, sans-serif',
+  backgroundColor: '#ffffff',
+  ...POPMELT_BORDER,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
   cursor: 'pointer',
   overflow: 'visible',
+  boxSizing: 'content-box',
   transition: 'all 0ms cubic-bezier(0.4, 0, 0.2, 1)',
 };
 
@@ -123,8 +235,16 @@ const TOOL_STORAGE_KEY = 'devtools-active-tool';
 const COLOR_STORAGE_KEY = 'devtools-active-color';
 const STROKE_STORAGE_KEY = 'devtools-stroke-width';
 const INSPECTED_STORAGE_KEY = 'devtools-inspected-element';
-const SPINNER_FRAME_COUNT = 3;
-const SPINNER_INTERVAL = 250;
+
+const STORAGE_KEYS: StorageKeys = {
+  expanded: STORAGE_KEY,
+  annotations: ANNOTATIONS_STORAGE_KEY,
+  styleMods: STYLE_MODS_STORAGE_KEY,
+  tool: TOOL_STORAGE_KEY,
+  color: COLOR_STORAGE_KEY,
+  stroke: STROKE_STORAGE_KEY,
+  inspected: INSPECTED_STORAGE_KEY,
+};
 
 function ClaudeIcon() {
   return (
@@ -154,6 +274,7 @@ export function AnnotationToolbar({
   onClear,
   provider = 'claude',
   onProviderChange,
+  availableProviders,
   modelIndex = 0,
   modelCount = 2,
   modelLabel = 'Opus 4.6',
@@ -172,95 +293,108 @@ export function AnnotationToolbar({
   const prevIsAnnotatingRef = useRef(state.isAnnotating);
   const hasRestoredAnnotations = useRef(false);
 
+  // Capture localStorage values at initialization time, before any effects can clobber them.
+  // This protects against React strict mode re-mount writing stale values to localStorage
+  // (persist effects see hasRestoredAnnotations=true from the first mount but state is still initial).
+  const savedToolAtInit = useRef<ToolType | null>(
+    typeof window !== 'undefined' ? localStorage.getItem(TOOL_STORAGE_KEY) as ToolType | null : null
+  );
+  const savedColorAtInit = useRef<string | null>(
+    typeof window !== 'undefined' ? localStorage.getItem(COLOR_STORAGE_KEY) : null
+  );
+  const savedStrokeAtInit = useRef<string | null>(
+    typeof window !== 'undefined' ? localStorage.getItem(STROKE_STORAGE_KEY) : null
+  );
+
   // Spinner animation for crosshair when jobs are active
-  const [spinnerCharIndex, setSpinnerCharIndex] = useState(0);
+  const { charIndex: spinnerCharIndex } = useSpinner(!!hasActiveJobs);
 
-  useEffect(() => {
-    if (!hasActiveJobs) return;
-    const timer = setInterval(() => {
-      setSpinnerCharIndex(i => (i + 1) % SPINNER_FRAME_COUNT);
-    }, SPINNER_INTERVAL);
-    return () => clearInterval(timer);
-  }, [hasActiveJobs]);
+  // Tool guidance hover state
+  const [guidanceTool, setGuidanceTool] = useState<string | null>(null);
+  const guidanceVisibleRef = useRef(false);
+  const guidanceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const guidanceHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Persist expanded state to localStorage
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, String(isExpanded));
-  }, [isExpanded]);
-
-  // Persist annotations to localStorage when they change (only when expanded).
-  // Guard: don't persist a smaller list while jobs are in-flight — HMR from Claude's
-  // edits can trigger orphan cleanup that temporarily removes annotations.
-  const lastPersistedCount = useRef(0);
-  useEffect(() => {
-    if (!isExpanded || !hasRestoredAnnotations.current) return;
-
-    // Allow saving when: count grew/unchanged, count is 0 (explicit clear), or no active jobs
-    const count = state.annotations.length;
-    if (count >= lastPersistedCount.current || count === 0 || !hasActiveJobs) {
-      localStorage.setItem(ANNOTATIONS_STORAGE_KEY, JSON.stringify(state.annotations));
-      lastPersistedCount.current = count;
+  const handleToolHoverStart = useCallback((tool: string) => {
+    if (guidanceHideTimerRef.current) {
+      clearTimeout(guidanceHideTimerRef.current);
+      guidanceHideTimerRef.current = null;
     }
-  }, [state.annotations, isExpanded, hasActiveJobs]);
-
-  // Persist style modifications to localStorage when they change
-  useEffect(() => {
-    if (isExpanded && hasRestoredAnnotations.current) {
-      localStorage.setItem(STYLE_MODS_STORAGE_KEY, JSON.stringify(state.styleModifications));
-    }
-  }, [state.styleModifications, isExpanded]);
-
-  // Persist active tool, color, and stroke width
-  useEffect(() => {
-    if (isExpanded && hasRestoredAnnotations.current) {
-      localStorage.setItem(TOOL_STORAGE_KEY, state.activeTool);
-    }
-  }, [state.activeTool, isExpanded]);
-
-  useEffect(() => {
-    if (isExpanded && hasRestoredAnnotations.current) {
-      localStorage.setItem(COLOR_STORAGE_KEY, state.activeColor);
-    }
-  }, [state.activeColor, isExpanded]);
-
-  useEffect(() => {
-    if (isExpanded && hasRestoredAnnotations.current) {
-      localStorage.setItem(STROKE_STORAGE_KEY, String(state.strokeWidth));
-    }
-  }, [state.strokeWidth, isExpanded]);
-
-  // Persist inspected element selector (for style panel visibility)
-  useEffect(() => {
-    if (isExpanded && hasRestoredAnnotations.current) {
-      if (state.inspectedElement) {
-        localStorage.setItem(INSPECTED_STORAGE_KEY, JSON.stringify({
-          selector: state.inspectedElement.info.selector,
-          info: state.inspectedElement.info,
-        }));
-      } else {
-        localStorage.removeItem(INSPECTED_STORAGE_KEY);
+    if (guidanceVisibleRef.current) {
+      // Already showing — immediately flip to new tool
+      setGuidanceTool(tool);
+      if (guidanceTimerRef.current) {
+        clearTimeout(guidanceTimerRef.current);
+        guidanceTimerRef.current = null;
       }
+    } else {
+      // Start 1s delay
+      if (guidanceTimerRef.current) clearTimeout(guidanceTimerRef.current);
+      guidanceTimerRef.current = setTimeout(() => {
+        guidanceVisibleRef.current = true;
+        setGuidanceTool(tool);
+        guidanceTimerRef.current = null;
+      }, 500);
     }
-  }, [state.inspectedElement, isExpanded]);
+  }, []);
 
-  // Initialize annotation mode and restore annotations if restored as expanded
+  const handleToolHoverEnd = useCallback(() => {
+    if (guidanceTimerRef.current) {
+      clearTimeout(guidanceTimerRef.current);
+      guidanceTimerRef.current = null;
+    }
+    guidanceHideTimerRef.current = setTimeout(() => {
+      guidanceVisibleRef.current = false;
+      setGuidanceTool(null);
+    }, 150);
+  }, []);
+
+  // Dynamic provider guidance (computed from availableProviders instead of static TOOL_GUIDANCE)
+  const providerGuidance = useMemo((): GuidanceEntry => {
+    const providerNames = (availableProviders ?? []).map(p =>
+      p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p
+    );
+    return {
+      name: 'AI Model',
+      desc: providerNames.length > 1
+        ? `${providerNames.join(' and ')} are available.`
+        : providerNames.length === 1
+          ? `Connected to ${providerNames[0]}.`
+          : 'No AI providers detected.',
+      usage: providerNames.length > 1
+        ? [
+            'Click the logo to switch between providers',
+            'Click the model name to switch tiers',
+          ]
+        : [
+            'Click the model name to switch tiers',
+          ],
+      keys: providerNames.length > 1
+        ? [{ key: 'Click', desc: 'Switch' }, { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true }]
+        : [{ key: '⌘ Enter', desc: 'Hand off to your AI', accent: true }],
+    };
+  }, [availableProviders]);
+
+  // Batch-persist all toolbar state to localStorage in a single effect
+  useLocalStorageBatch(isExpanded, state, hasRestoredAnnotations, !!hasActiveJobs, STORAGE_KEYS);
+
+  // Initialize annotation mode and restore annotations if restored as expanded.
+  // Uses refs captured at init time (savedToolAtInit, etc.) to avoid reading from
+  // localStorage after persist effects may have clobbered it (React strict mode).
   useEffect(() => {
-    if (isExpanded && !state.isAnnotating) {
-      // Restore active tool (default to rectangle if not stored)
-      const savedTool = localStorage.getItem(TOOL_STORAGE_KEY) as ToolType | null;
-      dispatch({ type: 'SET_TOOL', payload: savedTool || 'inspector' });
+    const wasExpanded = localStorage.getItem(STORAGE_KEY) === 'true';
+    if (wasExpanded && !state.isAnnotating) {
+      if (!isExpanded) setIsExpanded(true);
+      // Use init-captured ref — immune to strict mode persist effect clobbering
+      dispatch({ type: 'SET_TOOL', payload: savedToolAtInit.current || 'inspector' });
       dispatch({ type: 'SET_ANNOTATING', payload: true });
 
-      // Restore active color
-      const savedColor = localStorage.getItem(COLOR_STORAGE_KEY);
-      if (savedColor) {
-        dispatch({ type: 'SET_COLOR', payload: savedColor });
+      if (savedColorAtInit.current) {
+        dispatch({ type: 'SET_COLOR', payload: savedColorAtInit.current });
       }
 
-      // Restore stroke width
-      const savedStroke = localStorage.getItem(STROKE_STORAGE_KEY);
-      if (savedStroke) {
-        const width = parseFloat(savedStroke);
+      if (savedStrokeAtInit.current) {
+        const width = parseFloat(savedStrokeAtInit.current);
         if (!isNaN(width)) {
           dispatch({ type: 'SET_STROKE_WIDTH', payload: width });
         }
@@ -272,7 +406,7 @@ export function AnnotationToolbar({
         try {
           const annotations = JSON.parse(stored);
           if (Array.isArray(annotations) && annotations.length > 0) {
-            dispatch({ type: 'PASTE_ANNOTATIONS', payload: { annotations } });
+            dispatch({ type: 'RESTORE_ANNOTATIONS', payload: { annotations } });
           }
         } catch {
           // Invalid JSON, ignore
@@ -312,6 +446,9 @@ export function AnnotationToolbar({
       }
     }
     hasRestoredAnnotations.current = true;
+    // Cleanup: reset flag so strict mode re-mount doesn't let persist effects
+    // write stale initial state (e.g. 'inspector') to localStorage
+    return () => { hasRestoredAnnotations.current = false; };
   }, []); // Only on mount
 
   // Track previous styleModifications for undo/redo DOM sync
@@ -405,11 +542,12 @@ export function AnnotationToolbar({
     if (!state.isAnnotating) {
       dispatch({ type: 'SET_ANNOTATING', payload: true });
     }
+    // Dismiss guidance on tool select
+    guidanceVisibleRef.current = false;
+    setGuidanceTool(null);
+    if (guidanceTimerRef.current) { clearTimeout(guidanceTimerRef.current); guidanceTimerRef.current = null; }
+    if (guidanceHideTimerRef.current) { clearTimeout(guidanceHideTimerRef.current); guidanceHideTimerRef.current = null; }
   }, [dispatch, state.isAnnotating]);
-
-  const handleUndo = useCallback(() => {
-    dispatch({ type: 'UNDO' });
-  }, [dispatch]);
 
   const handleScreenshot = useCallback(async () => {
     window.focus();
@@ -422,23 +560,17 @@ export function AnnotationToolbar({
     const hasShapes = pendingAnnotations.some(a => a.type !== 'text');
 
     if (onPlanGoal) {
-      // Path A: text-only annotations (no shapes, no style mods) = plan goal
-      if (!hasShapes && pendingStyleMods.length === 0) {
-        const textAnnotations = pendingAnnotations.filter(a => a.type === 'text' && a.text);
-        if (textAnnotations.length > 0) {
-          const goal = textAnnotations.map(a => a.text).join('. ');
-          await onPlanGoal(goal);
-          return;
-        }
-      }
-
-      // Path B: single large annotation covering >50% of viewport = broad goal
-      if (hasShapes && pendingStyleMods.length === 0) {
-        const broadGoal = detectBroadGoal(pendingAnnotations);
-        if (broadGoal) {
-          await onPlanGoal(broadGoal);
-          return;
-        }
+      // Only trigger plan mode with explicit /plan prefix
+      const textAnnotations = pendingAnnotations.filter(a => a.type === 'text' && a.text);
+      const planPrefixed = textAnnotations.find(a => a.text!.toLowerCase().startsWith('/plan '));
+      if (planPrefixed) {
+        const goalFromPrefix = planPrefixed.text!.replace(/^\/plan\s+/i, '');
+        const otherText = textAnnotations
+          .filter(a => a !== planPrefixed && a.text)
+          .map(a => a.text!);
+        const goal = [goalFromPrefix, ...otherText].join('. ');
+        await onPlanGoal(goal);
+        return;
       }
     }
 
@@ -552,31 +684,11 @@ export function AnnotationToolbar({
     };
   }, []);
 
-  // Compute superseded annotation IDs (older rounds on the same element)
-  const supersededIds = useMemo(() => {
-    const ids = new Set<string>();
-    const bySelector = new Map<string, typeof state.annotations>();
-    for (const a of state.annotations) {
-      if (!a.linkedSelector) continue;
-      const group = bySelector.get(a.linkedSelector) || [];
-      group.push(a);
-      bySelector.set(a.linkedSelector, group);
-    }
-    for (const group of bySelector.values()) {
-      if (group.length <= 1) continue;
-      group.sort((a, b) => b.timestamp - a.timestamp);
-      for (let i = 1; i < group.length; i++) {
-        const old = group[i]!;
-        ids.add(old.id);
-        if (old.groupId) {
-          for (const mate of state.annotations) {
-            if (mate.groupId === old.groupId) ids.add(mate.id);
-          }
-        }
-      }
-    }
-    return ids;
-  }, [state.annotations]);
+  // Compute superseded annotations (older rounds on the same element)
+  const supersededAnnotations = useMemo(
+    () => computeSupersededAnnotations(state.annotations),
+    [state.annotations],
+  );
 
   // Group annotations by groupId (linked annotations count as one), excluding superseded
   const annotationGroups = useMemo(() => {
@@ -584,11 +696,11 @@ export function AnnotationToolbar({
     const seenGroupIds = new Set<string>();
 
     for (const annotation of state.annotations) {
-      if (supersededIds.has(annotation.id)) continue;
+      if (supersededAnnotations.has(annotation)) continue;
       if (annotation.groupId) {
         if (!seenGroupIds.has(annotation.groupId)) {
           seenGroupIds.add(annotation.groupId);
-          const groupAnnotations = state.annotations.filter(a => a.groupId === annotation.groupId && !supersededIds.has(a.id));
+          const groupAnnotations = state.annotations.filter(a => a.groupId === annotation.groupId && !supersededAnnotations.has(a));
           const primary = groupAnnotations.find(a => a.type !== 'text') || groupAnnotations[0]!;
           groups.push({ id: primary.id, annotations: groupAnnotations });
         }
@@ -597,7 +709,7 @@ export function AnnotationToolbar({
       }
     }
     return groups;
-  }, [state.annotations, supersededIds]);
+  }, [state.annotations, supersededAnnotations]);
 
   // Track focused item index (null = showing total, 0+ = focused on that item)
   // Items are: annotation groups first, then style modifications
@@ -786,7 +898,8 @@ export function AnnotationToolbar({
         r: 'rectangle',
         o: 'circle',
         t: 'text',
-        i: 'inspector',
+        c: 'inspector',
+        h: 'hand',
       };
 
       const tool = toolMap[e.key.toLowerCase()];
@@ -805,7 +918,7 @@ export function AnnotationToolbar({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, onPlanGoal, handleClear, state.annotations.length, state.styleModifications.length]);
 
-  const canUndo = state.undoStack.length > 0;
+
 
   // Dynamic styles based on expanded state
   const toolbarStyle: CSSProperties = {
@@ -816,15 +929,6 @@ export function AnnotationToolbar({
     height: 48,
     gap: 0,
     justifyContent: isExpanded ? 'flex-start' : 'center',
-  };
-
-  // Corner dot style
-  const cornerDotStyle: CSSProperties = {
-    position: 'absolute',
-    width: 2,
-    height: 2,
-    backgroundColor: 'rgba(0, 0, 0, 0.25)',
-    pointerEvents: 'none',
   };
 
   // Crosshair icon color based on job state
@@ -839,11 +943,6 @@ export function AnnotationToolbar({
           id="devtools-toolbar"
           style={{ ...toolbarStyle, overflow: 'visible' }}
         >
-          {/* Corner dots */}
-          <div style={{ ...cornerDotStyle, top: -1, left: -1 }} />
-          <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
-          <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
-          <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
           <button
             type="button"
             style={{
@@ -915,43 +1014,135 @@ export function AnnotationToolbar({
           pointerEvents: 'none',
         }}
       />
+      {/* Tool guidance panel */}
+      {guidanceTool && (guidanceTool === 'provider' || TOOL_GUIDANCE[guidanceTool]) && (() => {
+        const g = guidanceTool === 'provider' ? providerGuidance : TOOL_GUIDANCE[guidanceTool]!;
+        return (
+          <div style={{
+            position: 'fixed',
+            bottom: 80,
+            right: 16,
+            width: 300,
+            backgroundColor: '#ffffff',
+            ...POPMELT_BORDER,
+            boxSizing: 'content-box',
+            zIndex: 10001,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            fontSize: 12,
+            color: '#1f2937',
+            padding: 12,
+            pointerEvents: 'none',
+          }}>
+            {guidanceTool === 'collapse' && (
+              <div style={{ marginBottom: 10 }}>
+                <svg width="48" height="48" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M11.1406 31.2559C11.2407 31.3875 11.351 31.5132 11.4697 31.6338L3.10449 40H2.39746L11.1406 31.2559ZM8.05371 40H7.34668L14.5498 32.7959C14.8554 32.7706 15.1541 32.7063 15.4414 32.6113L8.05371 40ZM18.2197 34.0762C18.3788 34.1569 18.5445 34.2272 18.7168 34.2861L13.0039 40H12.2969L18.2197 34.0762ZM17.9531 40H17.2461L26.1338 31.1113C26.438 31.0829 26.7427 31.0148 27.0439 30.9082L17.9531 40ZM40 22.9023L22.9033 40H22.1963L40 22.1953V22.9023ZM40 27.8525L27.8525 40H27.1455L40 27.1455V27.8525ZM40 32.8027L32.8027 40H32.0957L40 32.0957V32.8027ZM40 37.752L37.752 40H37.0449L40 37.0449V37.752ZM9.06543 28.3809C9.25255 28.4332 9.45183 28.4715 9.66504 28.4883L0 38.1543V37.4473L9.06543 28.3809ZM6.59375 25.9023C6.65822 26.0626 6.73171 26.2263 6.81445 26.3896L0 33.2041V32.4971L6.59375 25.9023ZM20.25 8.00293H20.249C21.5098 8.0286 22.7219 8.25094 23.8584 8.63672L23.8604 8.63574C23.8961 8.64787 23.9312 8.66145 23.9668 8.67383C24.0611 8.70686 24.1548 8.74106 24.248 8.77637C24.2915 8.79273 24.3357 8.80727 24.3789 8.82422L24.376 8.82617C27.6145 10.0955 30.1646 12.7301 31.3213 16.0234L31.3232 16.0225C31.3327 16.0493 31.3404 16.0766 31.3496 16.1035C31.7691 17.3256 32 18.6356 32 20C32 20.8726 31.9366 21.6706 31.7598 22.4902L31.7197 22.6328C31.6412 23.0066 31.5136 23.6108 31.3408 24.2217L31.3398 24.2246C31.2967 24.377 31.251 24.5299 31.2021 24.6797C30.9215 25.5403 30.5473 26.2998 30.0879 26.2998C29.7613 26.2996 29.5995 25.9674 29.4316 25.6221C29.2501 25.2487 29.0614 24.8605 28.6484 24.8604C27.8532 24.8604 27.2081 25.5046 27.208 26.2998V27.0771C27.2079 27.6079 26.9661 28.112 26.5205 28.4004C25.9146 28.7925 25.2357 28.6462 24.7959 28.2061L24.7949 28.208C24.7897 28.2028 24.7854 28.1967 24.7803 28.1914C24.7654 28.1761 24.7507 28.1606 24.7363 28.1445C24.7105 28.1156 24.6858 28.0857 24.6621 28.0547C24.6461 28.0339 24.6302 28.013 24.6152 27.9912C24.5931 27.9591 24.5726 27.9257 24.5527 27.8916C24.5392 27.8685 24.5261 27.8452 24.5137 27.8213C24.5093 27.8128 24.5043 27.8045 24.5 27.7959L24.501 27.7939C24.3932 27.5763 24.3282 27.3276 24.3281 27.0576V26.2998C24.328 25.5993 23.8278 25.0158 23.165 24.8867V24.8877C23.0752 24.8702 22.9826 24.8604 22.8877 24.8604C22.8446 24.8604 22.8019 24.8624 22.7598 24.8662C22.0247 24.9312 21.4483 25.5479 21.4482 26.2998C21.4482 26.9127 21.4608 27.5305 21.4736 28.1494L21.4951 29.3135C21.5 29.7013 21.5015 30.089 21.4971 30.4756C21.4874 31.3103 20.8426 32 20.0078 32C19.1732 31.9998 18.5292 31.3102 18.5195 30.4756C18.5159 30.1613 18.5176 29.8464 18.5205 29.5312V29.5322C18.5212 29.4593 18.5206 29.3864 18.5215 29.3135L18.5303 28.8154V28.8145C18.5343 28.5927 18.5384 28.371 18.543 28.1494C18.5558 27.5305 18.5684 28.1129 18.5684 27.5C18.5684 26.7047 17.9232 26.0596 17.1279 26.0596C16.907 26.0596 16.6978 26.1103 16.5107 26.1992C16.2161 26.3393 15.9767 26.5769 15.834 26.8701C15.8269 26.8846 15.8201 26.8993 15.8135 26.9141C15.7821 26.9845 15.7562 27.0579 15.7363 27.1338C15.7243 27.1798 15.7155 27.2267 15.708 27.2744C15.7012 27.3175 15.6953 27.361 15.6924 27.4053C15.6903 27.4366 15.6885 27.4681 15.6885 27.5V28.7383C15.6883 29.9234 14.4911 30.7248 13.4961 30.0811C13.0505 29.7926 12.8086 29.2886 12.8086 28.7578V26.2998C12.8086 25.9737 12.6984 25.674 12.5156 25.4326C12.4437 25.3381 12.3612 25.2521 12.2686 25.1777V25.1768C12.0219 24.9788 11.709 24.8604 11.3682 24.8604C10.9892 24.8604 10.8622 24.8872 10.7295 25.2295C10.5837 25.6055 10.4302 26 9.92773 26C9.33081 25.9996 8.95963 25.2403 8.71484 24.3799C8.5591 23.8325 8.45907 23.571 8.3623 23.0107C8.3501 22.9401 8.33284 22.8403 8.31738 22.7529C8.12812 21.9466 8.02043 21.1089 8.00293 20.249V20.25L8 20C8 19.8617 8.00317 19.724 8.00781 19.5869C8.00837 19.5703 8.00816 19.5537 8.00879 19.5371L8.00977 19.5352C8.0998 17.1716 8.87444 14.9844 10.1396 13.1631C10.1488 13.1499 10.1587 13.1372 10.168 13.124C12.255 10.1453 15.6582 8.15745 19.5352 8.00977L19.5371 8.00879C19.5537 8.00816 19.5703 8.00837 19.5869 8.00781C19.724 8.00317 19.8617 8 20 8L20.25 8.00293ZM5.72266 22.5303L0 28.2539V27.5469L5.62793 21.918C5.6553 22.1234 5.6868 22.3275 5.72266 22.5303ZM16.2637 26.8398L16.2617 26.8408C16.2784 26.8013 16.2954 26.7627 16.3135 26.7256C16.3203 26.7116 16.3275 26.6982 16.334 26.6855C16.3125 26.7277 16.289 26.7808 16.2637 26.8398ZM40 17.9531L33.9854 23.9668C34.051 23.6832 34.1043 23.4321 34.1445 23.2412L34.1641 23.1748L34.1865 23.0967L34.1963 23.0488L40 17.2461V17.9531ZM5.87012 16.7266C5.80321 17.0165 5.74649 17.3101 5.69727 17.6064L0 23.3047V22.5977L5.87012 16.7266ZM40 13.0039L34.4297 18.5732C34.409 18.3615 34.3832 18.1513 34.3535 17.9424L40 12.2969V13.0039ZM0 18.3555V17.6484L17.6484 0H18.3555L0 18.3555ZM40 8.05371L33.458 14.5947C33.3909 14.4277 33.3202 14.2625 33.2471 14.0986L40 7.34668V8.05371ZM0 13.4053V12.6982L12.6992 0H13.4062L0 13.4053ZM40 3.10352L31.6865 11.416C31.5868 11.2805 31.4851 11.1465 31.3809 11.0146L40 2.39648V3.10352ZM29.2881 8.86523C29.1595 8.75783 29.0288 8.65278 28.8965 8.5498L37.4473 0H38.1543L29.2881 8.86523ZM0 8.45508V7.74805L7.74805 0H8.45508L0 8.45508ZM26.2783 6.92578C26.1183 6.84878 25.9562 6.77534 25.793 6.7041L32.498 0H33.2051L26.2783 6.92578ZM17.6064 5.69727C17.3101 5.74649 17.0165 5.80321 16.7266 5.87012L22.5977 0H23.3047L17.6064 5.69727ZM22.5322 5.7207C22.3295 5.685 22.1254 5.65316 21.9199 5.62598L27.5469 0H28.2539L22.5322 5.7207ZM0 3.50586V2.79883L2.79883 0H3.50586L0 3.50586Z" fill="currentColor"/>
+                </svg>
+              </div>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+              <span>{g.name}</span>
+              {g.keys[0] && (
+                <code style={{
+                  fontSize: 10,
+                  fontWeight: 500,
+                  backgroundColor: 'rgba(0,0,0,0.06)',
+                  padding: '1px 4px',
+                  color: '#6b7280',
+                }}>{g.keys[0].key}</code>
+              )}
+            </div>
+            <div style={{ color: '#6b7280', lineHeight: 1.5, marginBottom: guidanceTool === 'collapse' ? 0 : 10 }}>
+              {g.desc.split('\n\n').map((p, i) => <p key={i} style={{ margin: 0, marginTop: i > 0 ? 8 : 0 }}>{p}</p>)}
+            </div>
+            {g.usage.map((line, i) => (
+              <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 3, lineHeight: 1.4 }}>
+                <span style={{ color: '#9ca3af', flexShrink: 0 }}>–</span>
+                <span>{line}</span>
+              </div>
+            ))}
+            {g.keys.length > 1 && (
+              <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {g.keys.slice(1).map((k, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: k.accent ? '#fff' : '#6b7280' }}>
+                    <code style={{
+                      fontSize: 10,
+                      backgroundColor: k.accent ? state.activeColor : 'rgba(0,0,0,0.06)',
+                      color: k.accent ? '#fff' : undefined,
+                      padding: '1px 4px',
+                      whiteSpace: 'nowrap',
+                    }}>{k.key}</code>
+                    <span style={{ color: k.accent ? state.activeColor : undefined, fontWeight: k.accent ? 600 : undefined }}>{k.desc}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
       <div
         id="devtools-toolbar"
         style={toolbarStyle}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.borderColor = 'rgba(0, 0, 0, 0.2)';
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.borderColor = 'rgba(0, 0, 0, 0.1)';
-        }}
       >
-        {/* Corner dots */}
-        <div style={{ ...cornerDotStyle, top: -1, left: -1 }} />
-        <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
-        <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
-        <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
-        <div style={{ display: 'flex', flexDirection: 'row', gap: 4 }}>
-          <ToolButton
-            onClick={handleUndo}
-            title="Undo (⌘Z)"
-            disabled={!canUndo}
-          >
-            <Undo2 size={17} strokeWidth={1.5} />
-          </ToolButton>
-        </div>
-
-        <ToolSeparator />
+        {(state.annotations.length > 0 || state.styleModifications.length > 0) && (
+          <>
+            <span onMouseEnter={() => handleToolHoverStart('clear')} onMouseLeave={handleToolHoverEnd}>
+              <ToolButton
+                onClick={handleClear}
+                title="Clear all (⌘⌫)"
+              >
+                <Trash2 size={17} strokeWidth={1.5} />
+              </ToolButton>
+            </span>
+            <ToolSeparator />
+          </>
+        )}
 
         <div style={{ display: 'flex', flexDirection: 'row', gap: 4, alignItems: 'center' }}>
-          {/* Inspector tool (first position) */}
-          <ToolButton
-            active={state.isAnnotating && state.activeTool === 'inspector'}
-            siblingActive={state.isAnnotating}
-            onClick={() => handleToolSelect('inspector')}
-            title="Inspector (I)"
-          >
-            <MousePointer2 size={20} strokeWidth={1.5} />
-          </ToolButton>
+          {/* Comment tool (first position) */}
+          <span onMouseEnter={() => handleToolHoverStart('inspector')} onMouseLeave={handleToolHoverEnd}>
+            <ToolButton
+              active={state.isAnnotating && state.activeTool === 'inspector'}
+              siblingActive={state.isAnnotating}
+              onClick={() => handleToolSelect('inspector')}
+            >
+              <MessageCircle size={20} strokeWidth={1.5} />
+            </ToolButton>
+          </span>
+
+          {/* Hand tool (padding handles) */}
+          <span onMouseEnter={() => handleToolHoverStart('hand')} onMouseLeave={handleToolHoverEnd}>
+            <ToolButton
+              active={state.isAnnotating && state.activeTool === 'hand'}
+              siblingActive={state.isAnnotating}
+              onClick={() => handleToolSelect('hand')}
+            >
+              <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Hand size={20} strokeWidth={1.5} />
+                {state.styleModifications.filter(m => !m.captured).length > 0 && (
+                  <div style={{
+                    position: 'absolute',
+                    top: -7,
+                    right: -9,
+                    minWidth: 14,
+                    height: 14,
+                    borderRadius: 0,
+                    backgroundColor: state.activeColor,
+                    color: '#fff',
+                    fontSize: 9,
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '0 2px',
+                    lineHeight: 1,
+                  }}>
+                    {state.styleModifications.filter(m => !m.captured).length}
+                  </div>
+                )}
+              </div>
+            </ToolButton>
+          </span>
 
           {/* Shape tool combo: icon button + dot cycle in a tight wrapper */}
           {(() => {
@@ -959,67 +1150,68 @@ export function AnnotationToolbar({
             const ShapeIcon = currentShape.icon;
             const isShapeActive = state.isAnnotating && shapeToolTypes.has(state.activeTool);
             return (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
-                <ToolButton
-                  active={isShapeActive}
-                  siblingActive={state.isAnnotating}
-                  onClick={() => handleToolSelect(currentShape.type)}
-                  title={`${currentShape.label} (${currentShape.shortcut})`}
-                >
-                  <ShapeIcon size={20} strokeWidth={1.5} />
-                </ToolButton>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const nextIndex = (activeShapeIndex + 1) % shapeTools.length;
-                    setActiveShapeIndex(nextIndex);
-                    handleToolSelect(shapeTools[nextIndex]!.type);
-                  }}
-                  title="Cycle shape tool"
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 2,
-                    width: 12,
-                    height: 32,
-                    border: 'none',
-                    background: 'none',
-                    cursor: 'pointer',
-                    padding: '0 2px',
-                    opacity: state.isAnnotating && !isShapeActive ? 0.5 : 1,
-                    transition: 'opacity 150ms ease',
-                  }}
-                >
-                  {shapeTools.map((_, i) => (
-                    <div
-                      key={i}
-                      style={{
-                        width: 3,
-                        height: 3,
-                        borderRadius: '50%',
-                        backgroundColor: i === activeShapeIndex ? colors.iconDefault : 'rgba(0,0,0,0.2)',
-                        transition: 'background-color 150ms ease',
-                      }}
-                    />
-                  ))}
-                </button>
-              </div>
+              <span onMouseEnter={() => handleToolHoverStart(currentShape.type)} onMouseLeave={handleToolHoverEnd}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+                  <ToolButton
+                    active={isShapeActive}
+                    siblingActive={state.isAnnotating}
+                    onClick={() => handleToolSelect(currentShape.type)}
+                  >
+                    <ShapeIcon size={20} strokeWidth={1.5} />
+                  </ToolButton>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextIndex = (activeShapeIndex + 1) % shapeTools.length;
+                      setActiveShapeIndex(nextIndex);
+                      handleToolSelect(shapeTools[nextIndex]!.type);
+                    }}
+                    title="Cycle shape tool"
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 2,
+                      width: 12,
+                      height: 32,
+                      border: 'none',
+                      background: 'none',
+                      cursor: 'pointer',
+                      padding: '0 2px',
+                      opacity: state.isAnnotating && !isShapeActive ? 0.5 : 1,
+                      transition: 'opacity 150ms ease',
+                    }}
+                  >
+                    {shapeTools.map((_, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          width: 3,
+                          height: 3,
+                          borderRadius: '50%',
+                          backgroundColor: i === activeShapeIndex ? colors.iconDefault : 'rgba(0,0,0,0.2)',
+                          transition: 'background-color 150ms ease',
+                        }}
+                      />
+                    ))}
+                  </button>
+                </div>
+              </span>
             );
           })()}
 
           {/* Standalone tools (Text) */}
           {standaloneTools.map(({ type, icon: Icon, label, shortcut }) => (
-            <ToolButton
-              key={type}
-              active={state.isAnnotating && state.activeTool === type}
-              siblingActive={state.isAnnotating}
-              onClick={() => handleToolSelect(type)}
-              title={`${label} (${shortcut})`}
-            >
-              <Icon size={20} strokeWidth={1.5} />
-            </ToolButton>
+            <span key={type} onMouseEnter={() => handleToolHoverStart(type)} onMouseLeave={handleToolHoverEnd}>
+              <ToolButton
+                active={state.isAnnotating && state.activeTool === type}
+                siblingActive={state.isAnnotating}
+                onClick={() => handleToolSelect(type)}
+              >
+                <Icon size={20} strokeWidth={1.5} />
+              </ToolButton>
+            </span>
           ))}
         </div>
 
@@ -1031,14 +1223,15 @@ export function AnnotationToolbar({
             const focusedGroup = focusedGroupIndex !== null && focusedGroupIndex < annotationGroups.length
               ? annotationGroups[focusedGroupIndex]
               : null;
-            const allCaptured = state.annotations.every(a => a.status !== 'pending');
+            const allCaptured = state.annotations.length > 0 && state.annotations.every(a => a.status && a.status !== 'pending');
             // Style modifications are never "captured", only annotations
             const isCaptured = focusedGroupIndex !== null
-              ? focusedGroup?.annotations.some(a => a.status !== 'pending') ?? false
+              ? focusedGroup?.annotations.some(a => a.status && a.status !== 'pending') ?? false
               : allCaptured;
             const activeColor = `oklch(0.628 0.258 ${hue})`;
 
             return (
+              <span onMouseEnter={() => handleToolHoverStart('counter')} onMouseLeave={handleToolHoverEnd}>
               <button
                 ref={counterRef}
                 type="button"
@@ -1066,7 +1259,7 @@ export function AnnotationToolbar({
                   borderRadius: 0,
                   background: isCaptured ? '#999999' : activeColor,
                   cursor: 'pointer',
-                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
                   fontSize: 11,
                   fontWeight: 600,
                   color: '#ffffff',
@@ -1075,13 +1268,14 @@ export function AnnotationToolbar({
               >
                 {focusedGroupIndex !== null ? focusedGroupIndex + 1 : annotationGroups.length + state.styleModifications.length}
               </button>
+              </span>
             );
           })()}
           {onProviderChange && (
+            <span onMouseEnter={() => handleToolHoverStart('provider')} onMouseLeave={handleToolHoverEnd} style={{ display: 'contents' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
               <ToolButton
                 onClick={() => onProviderChange(provider === 'claude' ? 'codex' : 'claude')}
-                title={`Provider: ${provider === 'claude' ? 'Claude' : 'Codex'} (click to switch)`}
               >
                 {provider === 'claude' ? <ClaudeIcon /> : <CodexIcon />}
               </ToolButton>
@@ -1091,7 +1285,6 @@ export function AnnotationToolbar({
                   const nextIndex = (modelIndex + 1) % modelCount;
                   onModelChange?.(nextIndex);
                 }}
-                title={`Model: ${modelLabel} (click to cycle)`}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -1101,7 +1294,7 @@ export function AnnotationToolbar({
                   background: 'none',
                   cursor: 'pointer',
                   padding: '0 4px 0 0',
-                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
                   fontSize: 10,
                   fontWeight: 500,
                   color: colors.iconDefault,
@@ -1129,11 +1322,12 @@ export function AnnotationToolbar({
                 </span>
               </button>
             </div>
+            </span>
           )}
           <div
-            onMouseEnter={() => onCrosshairHover?.(true)}
-            onMouseLeave={() => onCrosshairHover?.(false)}
-            style={{ display: 'inline-flex' }}
+            onMouseEnter={(e) => { onCrosshairHover?.(true); e.currentTarget.style.opacity = '1'; handleToolHoverStart('collapse'); }}
+            onMouseLeave={(e) => { onCrosshairHover?.(false); e.currentTarget.style.opacity = hasActiveJobs ? '1' : '0.3'; handleToolHoverEnd(); }}
+            style={{ display: 'inline-flex', opacity: hasActiveJobs ? 1 : 0.3, transition: 'opacity 150ms ease' }}
           >
             <ToolButton onClick={handleCollapse} title="Collapse (⌘⌘)">
               {hasActiveJobs ? (
@@ -1155,7 +1349,7 @@ export function AnnotationToolbar({
                   )}
                 </svg>
               ) : (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={crosshairColor} strokeWidth="1.5" strokeLinecap="round">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={crosshairColor} strokeWidth="1.5" strokeLinecap="round" style={{ transform: 'rotate(45deg)' }}>
                   <line x1="12" y1="3" x2="12" y2="9" />
                   <line x1="12" y1="15" x2="12" y2="21" />
                   <line x1="3" y1="12" x2="9" y2="12" />

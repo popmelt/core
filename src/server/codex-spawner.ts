@@ -27,18 +27,22 @@ export function spawnCodex(
     // Resume existing session
     args.push('exec', 'resume', resumeSessionId);
     if (model) args.push('-m', model);
+    // Prompt must come before --image (variadic flag would consume it)
+    args.push('--json', '--full-auto', prompt);
     if (screenshotPath) {
       args.push('--image', screenshotPath);
     }
-    args.push('--json', '--full-auto', prompt);
   } else {
     args.push('exec', '--json', '--full-auto');
     if (model) args.push('-m', model);
+    // Prompt must come before --image (variadic flag would consume it)
+    args.push(prompt);
     if (screenshotPath) {
       args.push('--image', screenshotPath);
     }
-    args.push(prompt);
   }
+
+  console.log(`[codex-spawner:${jobId}] spawn args:`, JSON.stringify(args));
 
   const child = spawn('codex', args, {
     cwd: projectRoot,
@@ -86,6 +90,7 @@ export function spawnCodex(
         // Item started — detect tool use
         if (eventType === 'item/started' && parsed.item) {
           const itemType = parsed.item.type;
+          console.log(`[codex-spawner:${jobId}] item/started ${itemType}:`, JSON.stringify(parsed.item, null, 2));
           if (itemType === 'command_execution') {
             onEvent?.({ type: 'tool_use', jobId, tool: 'Bash' }, jobId);
           } else if (itemType === 'file_change') {
@@ -104,6 +109,7 @@ export function spawnCodex(
 
         // Item completed — accumulate full text from agent messages and reasoning
         if (eventType === 'item/completed' && parsed.item) {
+          console.log(`[codex-spawner:${jobId}] item/completed ${parsed.item.type}:`, JSON.stringify(parsed.item, null, 2));
           if (parsed.item.type === 'agent_message') {
             const itemText = parsed.item.text;
             if (typeof itemText === 'string' && itemText) {

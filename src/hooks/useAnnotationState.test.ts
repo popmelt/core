@@ -64,7 +64,8 @@ describe('Path lifecycle', () => {
   });
 
   it('FINISH_PATH creates annotation from path', () => {
-    let s = dispatch(initialState, { type: 'START_PATH', payload: { x: 0, y: 0 } });
+    let s = dispatch(initialState, { type: 'SET_TOOL', payload: 'freehand' });
+    s = dispatch(s, { type: 'START_PATH', payload: { x: 0, y: 0 } });
     s = dispatch(s, { type: 'CONTINUE_PATH', payload: { x: 10, y: 10 } });
     s = dispatch(s, { type: 'FINISH_PATH' });
     expect(s.annotations).toHaveLength(1);
@@ -101,6 +102,14 @@ describe('Path lifecycle', () => {
     expect(s.annotations[0]!.groupId).toBe('g1');
     expect(s.annotations[0]!.elements).toEqual(elements);
   });
+
+  it('FINISH_PATH creates annotation with status pending', () => {
+    let s = dispatch(initialState, { type: 'SET_TOOL', payload: 'freehand' });
+    s = dispatch(s, { type: 'START_PATH', payload: { x: 0, y: 0 } });
+    s = dispatch(s, { type: 'CONTINUE_PATH', payload: { x: 10, y: 10 } });
+    s = dispatch(s, { type: 'FINISH_PATH' });
+    expect(s.annotations[0]!.status).toBe('pending');
+  });
 });
 
 // ---- Text ----
@@ -113,6 +122,14 @@ describe('Text actions', () => {
     expect(s.annotations).toHaveLength(1);
     expect(s.annotations[0]!.type).toBe('text');
     expect(s.annotations[0]!.text).toBe('hello');
+  });
+
+  it('ADD_TEXT creates annotation with status pending', () => {
+    const s = dispatch(initialState, {
+      type: 'ADD_TEXT',
+      payload: { point: { x: 10, y: 10 }, text: 'hello' },
+    });
+    expect(s.annotations[0]!.status).toBe('pending');
   });
 
   it('ADD_TEXT with groupId skips undo push', () => {
@@ -595,6 +612,70 @@ describe('Cleanup', () => {
     expect(s.undoStack).toEqual([]);
     expect(s.redoStack).toEqual([]);
     expect(s.selectedAnnotationIds).toEqual([]);
+  });
+});
+
+// ---- RESTORE_ANNOTATIONS ----
+describe('RESTORE_ANNOTATIONS', () => {
+  it('replaces state annotations (not appends)', () => {
+    const existing = makeAnnotation({ id: 'a' });
+    const restored = makeAnnotation({ id: 'b' });
+    const base: AnnotationState = { ...initialState, annotations: [existing] };
+    const s = dispatch(base, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [restored] },
+    });
+    expect(s.annotations).toHaveLength(1);
+    expect(s.annotations[0]!.id).toBe('b');
+  });
+
+  it('deduplicates by ID (keeps first occurrence)', () => {
+    const a1 = makeAnnotation({ id: 'dup', text: 'first' });
+    const a2 = makeAnnotation({ id: 'dup', text: 'second' });
+    const s = dispatch(initialState, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [a1, a2] },
+    });
+    expect(s.annotations).toHaveLength(1);
+    expect(s.annotations[0]!.text).toBe('first');
+  });
+
+  it('does not push to undo stack', () => {
+    const ann = makeAnnotation();
+    const s = dispatch(initialState, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [ann] },
+    });
+    expect(s.undoStack).toHaveLength(0);
+  });
+
+  it('migrates legacy captured → status', () => {
+    const legacyAnn = makeAnnotation({ captured: true }) as Annotation;
+    delete (legacyAnn as Partial<Annotation>).status;
+    const s = dispatch(initialState, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [legacyAnn] },
+    });
+    expect(s.annotations[0]!.status).toBe('in_flight');
+  });
+
+  it('preserves existing status over captured', () => {
+    const ann = makeAnnotation({ status: 'resolved', captured: true });
+    const s = dispatch(initialState, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [ann] },
+    });
+    expect(s.annotations[0]!.status).toBe('resolved');
+  });
+
+  it('empty payload → empty annotations', () => {
+    const existing = makeAnnotation();
+    const base: AnnotationState = { ...initialState, annotations: [existing] };
+    const s = dispatch(base, {
+      type: 'RESTORE_ANNOTATIONS',
+      payload: { annotations: [] },
+    });
+    expect(s.annotations).toHaveLength(0);
   });
 });
 

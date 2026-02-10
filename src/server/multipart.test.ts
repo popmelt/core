@@ -83,12 +83,13 @@ describe('parseMultipart', () => {
     await expect(parseMultipart(req)).rejects.toThrow('Missing screenshot field');
   });
 
-  it('throws on missing feedback', async () => {
+  it('defaults feedback to empty string when missing', async () => {
     const body = buildMultipartBody(boundary, [
       { name: 'screenshot', filename: 'screenshot.png', value: Buffer.from('img') },
     ]);
     const req = createMockRequest(body, `multipart/form-data; boundary=${boundary}`);
-    await expect(parseMultipart(req)).rejects.toThrow('Missing feedback field');
+    const result = await parseMultipart(req);
+    expect(result.feedback).toBe('');
   });
 
   it('handles quoted boundary in content-type', async () => {

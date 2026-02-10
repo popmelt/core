@@ -4,18 +4,40 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useCanvasDrawing } from '../hooks/useCanvasDrawing';
-import { FONT_FAMILY, LINE_HEIGHT, PADDING } from '../tools/text';
+import { useModifierKeys } from '../hooks/useModifierKeys';
+import { useWheelZoom } from '../hooks/useWheelZoom';
+import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING } from '../tools/text';
 import type { Annotation, AnnotationAction, AnnotationLifecycleStatus, AnnotationState, ElementInfo, Point } from '../tools/types';
+import type { BorderRadiusCorner } from '../utils/dom';
+import { computeSupersededAnnotations } from '../utils/superseded';
 import {
+  applyInlineStyle,
   captureElementsAtPoints,
+  computeGapZones,
   extractElementInfo,
   findElementBySelector,
+  isAutoGap,
+  getComputedBorderRadius,
+  getComputedGap,
+  getComputedPadding,
+  getComputedTextProperties,
+  getTextBoundingRect,
   getTopmostElementAtPoint,
   getUniqueSelector,
+  isFlexOrGrid,
+  isTextElement,
 } from '../utils/dom';
+import { BorderRadiusHandles } from './BorderRadiusHandles';
 import { ElementHighlight } from './ElementHighlight';
+import { GapHandles } from './GapHandles';
 import { ModifiedElementBadges } from './ModifiedElementBadges';
+import { ModifiedElementBorders } from './ModifiedElementBorders';
+import type { PaddingSide } from './PaddingHandles';
+import { PaddingHandles } from './PaddingHandles';
 import { StylePanel } from './StylePanel';
+import { SwipeHints } from './SwipeHints';
+import type { TextHandleProperty } from './TextHandles';
+import { TextHandles } from './TextHandles';
 
 type AnnotationCanvasProps = {
   state: AnnotationState;
@@ -27,6 +49,7 @@ type AnnotationCanvasProps = {
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
   isThreadPanelOpen?: boolean;
+  activePlan?: { planId: string; status: string; threadId?: string; tasks?: { id: string; instruction: string }[] } | null;
 };
 
 type ActiveTextInput = {
@@ -48,6 +71,7 @@ type LineHandle = 'start' | 'end';
 type HandleType = HandleCorner | HandleCardinal | LineHandle;
 
 const HANDLE_SIZE = 8;
+const PADDING_SNAP_STEPS = [0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32] as const;
 
 const BADGE_HEIGHT = 22; // Matches ElementHighlight tooltip height
 const ACTIVE_TEXT_STORAGE_KEY = 'devtools-active-text';
@@ -66,7 +90,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onReply, onViewThread, isThreadPanelOpen }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onReply, onViewThread, isThreadPanelOpen, activePlan }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeText, setActiveText] = useState<ActiveTextInput | null>(() => {
@@ -97,6 +121,91 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   // Inspector mode state
   const [hoveredElement, setHoveredElement] = useState<Element | null>(null);
   const [hoveredElementInfo, setHoveredElementInfo] = useState<ElementInfo | null>(null);
+
+  // Hand tool state
+  const handDragRef = useRef<{
+    isDragging: boolean;
+    side: PaddingSide | null;
+    startX: number;
+    startY: number;
+    original: { top: number; right: number; bottom: number; left: number };
+    element: Element | null;
+    elementInfo: ElementInfo | null;
+    selector: string | null;
+    durableSelector: string | null;
+  }>({ isDragging: false, side: null, startX: 0, startY: 0, original: { top: 0, right: 0, bottom: 0, left: 0 }, element: null, elementInfo: null, selector: null, durableSelector: null });
+
+  const [handHoveredElement, setHandHoveredElement] = useState<Element | null>(null);
+  const [handHoveredSide, setHandHoveredSide] = useState<PaddingSide | null>(null);
+  const [handDragging, setHandDragging] = useState<{ side: PaddingSide; padding: { top: number; right: number; bottom: number; left: number } } | null>(null);
+  const handCursorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [handCursorPos, setHandCursorPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Gap handle state
+  const gapDragRef = useRef<{
+    isDragging: boolean;
+    hasMoved: boolean;
+    axis: 'row' | 'column' | null;
+    startX: number;
+    startY: number;
+    originalRow: number;
+    originalColumn: number;
+    element: Element | null;
+    elementInfo: ElementInfo | null;
+    selector: string | null;
+    durableSelector: string | null;
+    isAuto: boolean;
+    originalJustifyContent: string;
+    visualGap: number;
+  }>({ isDragging: false, hasMoved: false, axis: null, startX: 0, startY: 0, originalRow: 0, originalColumn: 0, element: null, elementInfo: null, selector: null, durableSelector: null, isAuto: false, originalJustifyContent: '', visualGap: 0 });
+
+  const [gapHoveredElement, setGapHoveredElement] = useState<Element | null>(null);
+  const [gapHoveredAxis, setGapHoveredAxis] = useState<'row' | 'column' | null>(null);
+  const [gapDragging, setGapDragging] = useState<{ axis: 'row' | 'column'; row: number; column: number } | null>(null);
+  const [gapIsAuto, setGapIsAuto] = useState(false);
+  const [gapRefreshKey, setGapRefreshKey] = useState(0);
+
+  // Swipe hint state
+  const [swipeHint, setSwipeHint] = useState<{ modifier: 'shift' | 'alt'; target: HTMLElement } | null>(null);
+
+  // Border radius handle state
+  const radiusDragRef = useRef<{
+    isDragging: boolean;
+    corner: BorderRadiusCorner | null;
+    startY: number;
+    original: Record<BorderRadiusCorner, number>;
+    maxRadius: number;
+    element: Element | null;
+    elementInfo: ElementInfo | null;
+    selector: string | null;
+    durableSelector: string | null;
+  }>({ isDragging: false, corner: null, startY: 0, original: { 'top-left': 0, 'top-right': 0, 'bottom-right': 0, 'bottom-left': 0 }, maxRadius: 0, element: null, elementInfo: null, selector: null, durableSelector: null });
+
+  const [radiusHoveredElement, setRadiusHoveredElement] = useState<Element | null>(null);
+  const [radiusHoveredCorner, setRadiusHoveredCorner] = useState<BorderRadiusCorner | null>(null);
+  const [radiusDragging, setRadiusDragging] = useState<{ corner: BorderRadiusCorner; radius: Record<BorderRadiusCorner, number> } | null>(null);
+
+  // Text handle state
+  const textDragRef = useRef<{
+    isDragging: boolean;
+    property: TextHandleProperty | null;
+    startX: number;
+    startY: number;
+    originalFontSize: number;
+    originalLineHeight: number;
+    originalRatio: number;
+    element: Element | null;
+    elementInfo: ElementInfo | null;
+    selector: string | null;
+    durableSelector: string | null;
+  }>({ isDragging: false, property: null, startX: 0, startY: 0, originalFontSize: 0, originalLineHeight: 0, originalRatio: 1.2, element: null, elementInfo: null, selector: null, durableSelector: null });
+
+  const [textHoveredElement, setTextHoveredElement] = useState<Element | null>(null);
+  const [textHoveredProperty, setTextHoveredProperty] = useState<TextHandleProperty | null>(null);
+  const [textDragging, setTextDragging] = useState<{ property: TextHandleProperty; fontSize: number; lineHeight: number } | null>(null);
+
+  // Track modifier keys via keydown/keyup (more reliable than reading from mouse events)
+  const modifiersRef = useModifierKeys();
 
   // Ref for in-flight selector check (avoids dependency cascading in handlers)
   const inFlightSelectorColorsRef = useRef(inFlightSelectorColors);
@@ -180,41 +289,254 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
   // Global wheel handler for text resize (works even when canvas has pointerEvents: none)
   // Also handles edit mode to ensure scroll is blocked
+  useWheelZoom(activeText, setActiveText, hoveredTextId, state.annotations, dispatch);
+
+  // Option + horizontal swipe over flex containers: cycle justify-content start ↔ center ↔ end
+  // Finds nearest flex container at cursor position — works anywhere on the element, not just gap zones
+  const gapHoveredElementRef = useRef<Element | null>(null);
+  const gapHoveredAxisRef = useRef<'row' | 'column' | null>(null);
+  gapHoveredElementRef.current = gapHoveredElement;
+  gapHoveredAxisRef.current = gapHoveredAxis;
+
   useEffect(() => {
-    const wheelHandler = (e: WheelEvent) => {
-      // Handle edit mode scaling (activeText is set, but not linked annotations)
-      if (activeText) {
-        if (activeText.linkedSelector) return; // Linked annotations have fixed size
-        e.preventDefault();
-        e.stopPropagation();
-        const delta = e.deltaY > 0 ? -2 : 2;
-        setActiveText(prev => prev ? {
-          ...prev,
-          fontSize: Math.max(12, Math.min(72, prev.fontSize + delta)),
-        } : null);
+    const JUSTIFY_STEPS = ['flex-start', 'center', 'flex-end'] as const;
+    const ALIGN_STEPS = ['flex-start', 'center', 'flex-end'] as const;
+    const COOLDOWN_MS = 300;
+
+    // Shared state
+    let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+    let inCooldown = false;
+    let lockedX: number | null = null;
+    let lockedY: number | null = null;
+
+    const findFlexContainer = (x: number, y: number): HTMLElement | null => {
+      const el = getTopmostElementAtPoint(x, y);
+      let current: Element | null = el;
+      while (current && current !== document.documentElement) {
+        const d = window.getComputedStyle(current).display;
+        if (d === 'flex' || d === 'inline-flex') return current as HTMLElement;
+        current = current.parentElement;
+      }
+      return null;
+    };
+
+    const getMainAxis = (flexEl: HTMLElement): 'horizontal' | 'vertical' => {
+      const fd = window.getComputedStyle(flexEl).flexDirection;
+      return (fd === 'column' || fd === 'column-reverse') ? 'vertical' : 'horizontal';
+    };
+
+    const tagElement = (el: HTMLElement): { selector: string; durableSelector: string } => {
+      let pmId = el.getAttribute('data-pm');
+      if (!pmId) { pmId = Math.random().toString(36).substring(2, 8); el.setAttribute('data-pm', pmId); }
+      return { selector: `[data-pm="${pmId}"]`, durableSelector: getUniqueSelector(el) };
+    };
+
+    const enterCooldown = () => {
+      inCooldown = true;
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+      cooldownTimer = setTimeout(() => { inCooldown = false; cooldownTimer = null; }, COOLDOWN_MS);
+    };
+
+    const commitSwipeAction = (flexEl: HTMLElement, swipeAxis: 'horizontal' | 'vertical', direction: 1 | -1) => {
+      const mainAxis = getMainAxis(flexEl);
+
+      if (swipeAxis === mainAxis) {
+        // Swipe along main axis → cycle justify-content
+        const cs = window.getComputedStyle(flexEl);
+        const currentJc = cs.justifyContent;
+        const normalized = currentJc === 'normal' || currentJc === 'flex-start' || currentJc === 'start'
+          ? 'flex-start'
+          : currentJc === 'flex-end' || currentJc === 'end'
+            ? 'flex-end'
+            : currentJc === 'center'
+              ? 'center'
+              : null;
+
+        if (!normalized) return;
+
+        const currentIndex = JUSTIFY_STEPS.indexOf(normalized);
+        const nextIndex = currentIndex + direction;
+        if (nextIndex < 0 || nextIndex >= JUSTIFY_STEPS.length) return;
+
+        const newJc = JUSTIFY_STEPS[nextIndex]!;
+        const { selector, durableSelector } = tagElement(flexEl);
+
+        applyInlineStyle(flexEl, 'justify-content', newJc);
+        dispatch({
+          type: 'MODIFY_STYLES_BATCH',
+          payload: {
+            selector, durableSelector,
+            element: extractElementInfo(flexEl),
+            changes: [{ property: 'justify-content', original: currentJc, modified: newJc }],
+          },
+        });
+      } else {
+        // Swipe along cross axis → flip flex-direction
+        const cs = window.getComputedStyle(flexEl);
+        const currentFd = cs.flexDirection;
+        const newFd = mainAxis === 'horizontal' ? 'column' : 'row';
+        const { selector, durableSelector } = tagElement(flexEl);
+
+        applyInlineStyle(flexEl, 'flex-direction', newFd);
+        dispatch({
+          type: 'MODIFY_STYLES_BATCH',
+          payload: {
+            selector, durableSelector,
+            element: extractElementInfo(flexEl),
+            changes: [{ property: 'flex-direction', original: currentFd, modified: newFd }],
+          },
+        });
+      }
+
+      // Force GapHandles to recalculate bounds/zones after layout change
+      setGapRefreshKey(k => k + 1);
+    };
+
+    const commitAlignAction = (flexEl: HTMLElement, swipeAxis: 'horizontal' | 'vertical', direction: 1 | -1) => {
+      const mainAxis = getMainAxis(flexEl);
+      const crossAxis: 'horizontal' | 'vertical' = mainAxis === 'horizontal' ? 'vertical' : 'horizontal';
+
+      // Only respond to cross-axis swipes (the axis align-items controls)
+      if (swipeAxis !== crossAxis) return;
+
+      const cs = window.getComputedStyle(flexEl);
+      const currentAi = cs.alignItems;
+      const normalized = currentAi === 'normal' || currentAi === 'stretch' || currentAi === 'flex-start' || currentAi === 'start'
+        ? 'flex-start'
+        : currentAi === 'flex-end' || currentAi === 'end'
+          ? 'flex-end'
+          : currentAi === 'center'
+            ? 'center'
+            : null;
+
+      if (!normalized) return;
+
+      const currentIndex = ALIGN_STEPS.indexOf(normalized);
+      const nextIndex = currentIndex + direction;
+      if (nextIndex < 0 || nextIndex >= ALIGN_STEPS.length) return;
+
+      const newAi = ALIGN_STEPS[nextIndex]!;
+      const { selector, durableSelector } = tagElement(flexEl);
+
+      applyInlineStyle(flexEl, 'align-items', newAi);
+      dispatch({
+        type: 'MODIFY_STYLES_BATCH',
+        payload: {
+          selector, durableSelector,
+          element: extractElementInfo(flexEl),
+          changes: [{ property: 'align-items', original: currentAi, modified: newAi }],
+        },
+      });
+
+      setGapRefreshKey(k => k + 1);
+    };
+
+    // --- Mousemove handler (Shift/Alt + distance-based swipe) ---
+    const SWIPE_DISTANCE = 20; // px from anchor to trigger
+    let anchorX: number | null = null;
+    let anchorY: number | null = null;
+    let dispSign: 1 | -1 | 0 = 0; // established displacement direction from anchor
+
+    const updateSwipeHint = (modifier: 'shift' | 'alt', x: number, y: number) => {
+      const flexEl = findFlexContainer(x, y);
+      if (flexEl) {
+        setSwipeHint({ modifier, target: flexEl });
+      } else {
+        setSwipeHint(null);
+      }
+    };
+
+    const keydownHandler = (e: KeyboardEvent) => {
+      if (state.activeTool !== 'hand' || !state.isAnnotating) return;
+      if (e.key === 'Shift' && !e.altKey) {
+        const pos = handCursorRef.current;
+        updateSwipeHint('shift', pos.x, pos.y);
+      } else if (e.key === 'Alt' && !e.shiftKey) {
+        const pos = handCursorRef.current;
+        updateSwipeHint('alt', pos.x, pos.y);
+      }
+    };
+
+    const moveHandler = (e: MouseEvent) => {
+      if (state.activeTool !== 'hand' || !state.isAnnotating) return;
+      const isShift = e.shiftKey && !e.altKey;
+      const isAlt = e.altKey && !e.shiftKey;
+      if ((!isShift && !isAlt) || e.buttons !== 0) {
+        anchorX = null; anchorY = null; dispSign = 0; lockedX = null; lockedY = null;
+        setSwipeHint(null);
         return;
       }
 
-      // Handle hover scaling (hoveredTextId is set)
-      if (!hoveredTextId) return;
+      if (lockedX === null) {
+        lockedX = e.clientX; lockedY = e.clientY;
+        updateSwipeHint(isShift ? 'shift' : 'alt', e.clientX, e.clientY);
+      }
 
-      e.preventDefault();
-      const annotation = state.annotations.find((a) => a.id === hoveredTextId);
-      if (annotation && annotation.type === 'text' && !annotation.linkedSelector) {
-        const currentSize = annotation.fontSize || 12;
-        const delta = e.deltaY > 0 ? -2 : 2;
-        dispatch({
-          type: 'UPDATE_TEXT_SIZE',
-          payload: { id: hoveredTextId, fontSize: currentSize + delta },
-        });
+      if (inCooldown) return;
+
+      // Set anchor on first move after cooldown expires (or first move with modifier)
+      if (anchorX === null) { anchorX = e.clientX; anchorY = e.clientY; dispSign = 0; }
+
+      const dx = e.clientX - anchorX;
+      const dy = e.clientY - anchorY!;
+
+      // Track primary displacement direction; if cursor reverses through anchor, reset
+      const primaryDelta = Math.abs(dx) >= Math.abs(dy) ? dx : dy;
+      if (Math.abs(primaryDelta) > 3) {
+        const curSign: 1 | -1 = primaryDelta > 0 ? 1 : -1;
+        if (dispSign !== 0 && curSign !== dispSign) {
+          // Direction reversed — restart from here
+          anchorX = e.clientX; anchorY = e.clientY; dispSign = 0;
+          return;
+        }
+        dispSign = curSign;
+      }
+
+      // Need at least one axis above distance threshold
+      if (Math.abs(dx) < SWIPE_DISTANCE && Math.abs(dy) < SWIPE_DISTANCE) return;
+
+      const flexEl = findFlexContainer(lockedX, lockedY!);
+      if (!flexEl) return;
+
+      const swipeAxis: 'horizontal' | 'vertical' = Math.abs(dx) >= Math.abs(dy) ? 'horizontal' : 'vertical';
+      const delta = swipeAxis === 'horizontal' ? dx : dy;
+      const direction: 1 | -1 = delta > 0 ? 1 : -1;
+
+      // Reset anchor for next swipe
+      anchorX = null; anchorY = null; dispSign = 0;
+      if (isShift) {
+        commitSwipeAction(flexEl, swipeAxis, direction);
+      } else {
+        commitAlignAction(flexEl, swipeAxis, direction);
+      }
+      enterCooldown();
+    };
+
+    const keyupHandler = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' || e.key === 'Alt') {
+        lockedX = null; lockedY = null;
+        anchorX = null; anchorY = null; dispSign = 0;
+        setSwipeHint(null);
       }
     };
 
-    window.addEventListener('wheel', wheelHandler, { passive: false });
-    return () => {
-      window.removeEventListener('wheel', wheelHandler);
+    const mousedownHandler = () => {
+      setSwipeHint(null);
+      anchorX = null; anchorY = null; dispSign = 0;
     };
-  }, [hoveredTextId, activeText, state.annotations, dispatch]);
+
+    window.addEventListener('keydown', keydownHandler);
+    window.addEventListener('mousemove', moveHandler);
+    window.addEventListener('mousedown', mousedownHandler);
+    window.addEventListener('keyup', keyupHandler);
+    return () => {
+      window.removeEventListener('keydown', keydownHandler);
+      window.removeEventListener('mousemove', moveHandler);
+      window.removeEventListener('mousedown', mousedownHandler);
+      window.removeEventListener('keyup', keyupHandler);
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+    };
+  }, [state.activeTool, state.isAnnotating, dispatch]);
 
   // Delete selected annotations with Delete/Backspace key
   // Escape clears selection or collapses toolbar
@@ -290,36 +612,13 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [dispatch, clearSelection, selectAnnotation]); // All other values read from refs
 
-  // Compute superseded annotation IDs: when multiple annotation rounds target
-  // the same linkedSelector, only the newest round is visible
-  const supersededIds = useMemo(() => {
-    const ids = new Set<string>();
-    // Group annotations by linkedSelector
-    const bySelector = new Map<string, Annotation[]>();
-    for (const a of state.annotations) {
-      if (!a.linkedSelector) continue;
-      const group = bySelector.get(a.linkedSelector) || [];
-      group.push(a);
-      bySelector.set(a.linkedSelector, group);
-    }
-    for (const group of bySelector.values()) {
-      if (group.length <= 1) continue;
-      // Sort by timestamp descending — newest first
-      group.sort((a, b) => b.timestamp - a.timestamp);
-      // All but the newest are superseded (plus their group mates)
-      for (let i = 1; i < group.length; i++) {
-        const old = group[i]!;
-        ids.add(old.id);
-        // Also hide group mates (e.g. the text label linked to this shape)
-        if (old.groupId) {
-          for (const mate of state.annotations) {
-            if (mate.groupId === old.groupId) ids.add(mate.id);
-          }
-        }
-      }
-    }
-    return ids;
-  }, [state.annotations]);
+  // Compute superseded annotations: when multiple annotation rounds target
+  // the same linkedSelector, only the newest round is visible.
+  // Returns Set<Annotation> (object refs) to avoid duplicate-ID collisions.
+  const supersededAnnotations = useMemo(
+    () => computeSupersededAnnotations(state.annotations),
+    [state.annotations],
+  );
 
   // Calculate annotation group map (for numbering text annotations)
   const annotationGroupMap = useMemo(() => {
@@ -328,7 +627,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     let groupIndex = 1;
 
     for (const annotation of state.annotations) {
-      if (supersededIds.has(annotation.id)) continue;
+      if (supersededAnnotations.has(annotation)) continue;
       if (annotation.groupId) {
         if (!seenGroupIds.has(annotation.groupId)) {
           seenGroupIds.add(annotation.groupId);
@@ -345,7 +644,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       }
     }
     return map;
-  }, [state.annotations, supersededIds]);
+  }, [state.annotations, supersededAnnotations]);
 
   // Derive focused selector colors from selected annotations (for dotted outlines on inspector-created elements)
   const focusedSelectorColors = useMemo(() => {
@@ -372,7 +671,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   useEffect(() => {
     // Filter out the annotation being edited and superseded annotations
     const visibleAnnotations = state.annotations.filter(a => {
-      if (supersededIds.has(a.id)) return false;
+      if (supersededAnnotations.has(a)) return false;
       if (activeText && !activeText.isNew && a.id === activeText.id) return false;
       return true;
     });
@@ -389,7 +688,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       scroll.y,
       annotationGroupMap
     );
-  }, [state.annotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededIds]);
+  }, [state.annotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededAnnotations]);
 
   // Auto-create text annotation after drawing a rectangle
   useEffect(() => {
@@ -539,7 +838,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     for (let i = state.annotations.length - 1; i >= 0; i--) {
       const annotation = state.annotations[i];
       if (!annotation) continue;
-      if (supersededIds.has(annotation.id)) continue;
+      if (supersededAnnotations.has(annotation)) continue;
 
       const hitThreshold = (annotation.strokeWidth || 3) + SAFE_AREA;
 
@@ -639,7 +938,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       }
     }
     return null;
-  }, [state.annotations, canvasRef, isPointNearLine, supersededIds]);
+  }, [state.annotations, canvasRef, isPointNearLine, supersededAnnotations]);
 
   // Find text annotation at a given point (for hover/resize)
   const findTextAtPoint = useCallback((point: Point): Annotation | null => {
@@ -794,6 +1093,45 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     setActiveText(null);
   }, [activeText, dispatch]);
 
+  // --- Hand tool helpers ---
+
+  const snapPadding = useCallback((value: number): number => {
+    // Fixed steps up to 32
+    for (let i = 0; i < PADDING_SNAP_STEPS.length - 1; i++) {
+      const lo = PADDING_SNAP_STEPS[i]!;
+      const hi = PADDING_SNAP_STEPS[i + 1]!;
+      if (value <= (lo + hi) / 2) return lo;
+      if (value < hi) return hi;
+    }
+    // Beyond 32: snap to nearest multiple of 8
+    return Math.round(value / 8) * 8;
+  }, []);
+
+  const detectPaddingSide = useCallback((vx: number, vy: number, rect: DOMRect, padding: { top: number; right: number; bottom: number; left: number }): PaddingSide | null => {
+    const contentTop = rect.top + Math.max(padding.top, 4);
+    const contentBottom = rect.bottom - Math.max(padding.bottom, 4);
+    const contentLeft = rect.left + Math.max(padding.left, 4);
+    const contentRight = rect.right - Math.max(padding.right, 4);
+
+    if (vx < rect.left || vx > rect.right || vy < rect.top || vy > rect.bottom) return null;
+
+    const inTop = vy < contentTop;
+    const inBottom = vy > contentBottom;
+    const inLeft = vx < contentLeft;
+    const inRight = vx > contentRight;
+
+    if (inTop && inLeft) return padding.top >= padding.left ? 'top' : 'left';
+    if (inTop && inRight) return padding.top >= padding.right ? 'top' : 'right';
+    if (inBottom && inLeft) return padding.bottom >= padding.left ? 'bottom' : 'left';
+    if (inBottom && inRight) return padding.bottom >= padding.right ? 'bottom' : 'right';
+
+    if (inTop) return 'top';
+    if (inBottom) return 'bottom';
+    if (inLeft) return 'left';
+    if (inRight) return 'right';
+    return null;
+  }, []);
+
   const handlePointerDown = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
       if (!state.isAnnotating) return;
@@ -841,6 +1179,132 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             elements: [{ ...info, selector: structuralSelector }],
           });
         }
+        return;
+      }
+
+      // Hand tool: start gap drag
+      if (state.activeTool === 'hand' && gapHoveredElement && gapHoveredAxis) {
+        const el = gapHoveredElement;
+        let pmId = el.getAttribute('data-pm');
+        if (!pmId) { pmId = Math.random().toString(36).substring(2, 8); el.setAttribute('data-pm', pmId); }
+        const gapDurableSelector = getUniqueSelector(el);
+        const selector = `[data-pm="${pmId}"]`;
+        const info = extractElementInfo(el);
+        const gapValues = getComputedGap(el);
+        const viewportX = point.x - window.scrollX;
+        const viewportY = point.y - window.scrollY;
+        const auto = gapIsAuto;
+        const jc = window.getComputedStyle(el).justifyContent;
+
+        // For auto gaps, use the visual gap from zone dimensions
+        let visualGap = 0;
+        if (auto) {
+          const zones = computeGapZones(el);
+          const hit = zones.find(z => z.axis === gapHoveredAxis);
+          visualGap = hit ? (gapHoveredAxis === 'column' ? hit.w : hit.h) : 0;
+        }
+
+        applyInlineStyle(el, 'transition', 'none');
+
+        gapDragRef.current = {
+          isDragging: true,
+          hasMoved: false,
+          axis: gapHoveredAxis,
+          startX: viewportX,
+          startY: viewportY,
+          originalRow: auto ? visualGap : gapValues.row,
+          originalColumn: auto ? visualGap : gapValues.column,
+          element: el,
+          elementInfo: { ...info, selector },
+          selector,
+          durableSelector: gapDurableSelector,
+          isAuto: auto,
+          originalJustifyContent: jc,
+          visualGap,
+        };
+        setGapDragging({ axis: gapHoveredAxis, row: auto ? visualGap : gapValues.row, column: auto ? visualGap : gapValues.column });
+        return;
+      }
+
+      // Hand tool: start text handle drag
+      if (state.activeTool === 'hand' && textHoveredElement && textHoveredProperty) {
+        const el = textHoveredElement;
+        let pmId = el.getAttribute('data-pm');
+        if (!pmId) { pmId = Math.random().toString(36).substring(2, 8); el.setAttribute('data-pm', pmId); }
+        const selector = `[data-pm="${pmId}"]`;
+        const info = extractElementInfo(el);
+        const { fontSize, lineHeight } = getComputedTextProperties(el);
+        const ratio = fontSize > 0 ? lineHeight / fontSize : 1.2;
+        const viewportX = point.x - window.scrollX;
+        const viewportY = point.y - window.scrollY;
+
+        applyInlineStyle(el, 'transition', 'none');
+
+        const durableSelector = getUniqueSelector(el);
+        textDragRef.current = {
+          isDragging: true, property: textHoveredProperty,
+          startX: viewportX, startY: viewportY,
+          originalFontSize: fontSize, originalLineHeight: lineHeight, originalRatio: ratio,
+          element: el, elementInfo: { ...info, selector }, selector, durableSelector,
+        };
+        setTextDragging({ property: textHoveredProperty, fontSize, lineHeight });
+        return;
+      }
+
+      // Hand tool: start border radius drag
+      if (state.activeTool === 'hand' && radiusHoveredElement && radiusHoveredCorner) {
+        const el = radiusHoveredElement;
+        let pmId = el.getAttribute('data-pm');
+        if (!pmId) { pmId = Math.random().toString(36).substring(2, 8); el.setAttribute('data-pm', pmId); }
+        const selector = `[data-pm="${pmId}"]`;
+        const durableSelector = getUniqueSelector(el);
+        const info = extractElementInfo(el);
+        const original = getComputedBorderRadius(el);
+        const rect = el.getBoundingClientRect();
+        const maxRadius = Math.floor(rect.height / 2);
+        const viewportY = point.y - window.scrollY;
+
+        applyInlineStyle(el, 'transition', 'none');
+
+        radiusDragRef.current = {
+          isDragging: true, corner: radiusHoveredCorner, startY: viewportY,
+          original, maxRadius, element: el, elementInfo: { ...info, selector }, selector, durableSelector,
+        };
+        setRadiusDragging({ corner: radiusHoveredCorner, radius: { ...original } });
+        return;
+      }
+
+      // Hand tool: start padding drag
+      if (state.activeTool === 'hand' && handHoveredElement && handHoveredSide) {
+        const el = handHoveredElement;
+        // Tag element with data-pm if needed
+        let pmId = el.getAttribute('data-pm');
+        if (!pmId) {
+          pmId = Math.random().toString(36).substring(2, 8);
+          el.setAttribute('data-pm', pmId);
+        }
+        const selector = `[data-pm="${pmId}"]`;
+        const handDurableSelector = getUniqueSelector(el);
+        const info = extractElementInfo(el);
+        const original = getComputedPadding(el);
+        const viewportX = point.x - window.scrollX;
+        const viewportY = point.y - window.scrollY;
+
+        // Freeze transitions so padding changes apply instantly
+        applyInlineStyle(el, 'transition', 'none');
+
+        handDragRef.current = {
+          isDragging: true,
+          side: handHoveredSide,
+          startX: viewportX,
+          startY: viewportY,
+          original,
+          element: el,
+          elementInfo: { ...info, selector },
+          selector,
+          durableSelector: handDurableSelector,
+        };
+        setHandDragging({ side: handHoveredSide, padding: { ...original } });
         return;
       }
 
@@ -915,7 +1379,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       setIsDrawing(true);
       dispatch({ type: 'START_PATH', payload: point });
     },
-    [state.isAnnotating, state.activeTool, state.annotations, activeText, selectedAnnotationIds, hoveredElement, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
+    [state.isAnnotating, state.activeTool, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
   );
 
   const handlePointerMove = useCallback(
@@ -932,6 +1396,355 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         if (el !== hoveredElement) {
           setHoveredElement(el);
           setHoveredElementInfo(el ? extractElementInfo(el) : null);
+        }
+        return;
+      }
+
+      // Hand tool: hover detection and drag
+      if (state.activeTool === 'hand' && state.isAnnotating) {
+        const viewportX = point.x - window.scrollX;
+        const viewportY = point.y - window.scrollY;
+
+        handCursorRef.current = { x: viewportX, y: viewportY };
+        setHandCursorPos({ x: viewportX, y: viewportY });
+
+        const isCmdHeld = modifiersRef.current.cmd;
+        const isShiftHeld = modifiersRef.current.shift;
+
+        // Gap drag handling
+        if (gapDragRef.current.isDragging) {
+          const drag = gapDragRef.current;
+          const el = drag.element;
+          if (!el) return;
+
+          // Detect first meaningful move
+          if (!drag.hasMoved) {
+            const dx = Math.abs(viewportX - drag.startX);
+            const dy = Math.abs(viewportY - drag.startY);
+            if (dx <= 2 && dy <= 2) return; // No meaningful movement yet
+            drag.hasMoved = true;
+
+            // Auto→fixed conversion on first move: remove justify distribution, set explicit gaps
+            if (drag.isAuto) {
+              applyInlineStyle(el, 'justify-content', 'normal');
+              applyInlineStyle(el, 'row-gap', `${drag.visualGap}px`);
+              applyInlineStyle(el, 'column-gap', `${drag.visualGap}px`);
+              setGapIsAuto(false);
+            }
+          }
+
+          const axis = drag.axis!;
+          let newRow = drag.originalRow;
+          let newColumn = drag.originalColumn;
+
+          if (axis === 'column') {
+            const delta = viewportX - drag.startX;
+            newColumn = drag.originalColumn + delta;
+            if (!isCmdHeld) newRow = drag.originalRow + delta;
+          } else {
+            const delta = viewportY - drag.startY;
+            newRow = drag.originalRow + delta;
+            if (!isCmdHeld) newColumn = drag.originalColumn + delta;
+          }
+
+          newRow = Math.max(0, newRow);
+          newColumn = Math.max(0, newColumn);
+          if (isShiftHeld) { newRow = snapPadding(newRow); newColumn = snapPadding(newColumn); }
+          newRow = Math.round(newRow);
+          newColumn = Math.round(newColumn);
+
+          applyInlineStyle(el, 'row-gap', `${newRow}px`);
+          applyInlineStyle(el, 'column-gap', `${newColumn}px`);
+          setGapDragging({ axis, row: newRow, column: newColumn });
+          return;
+        }
+
+        if (radiusDragRef.current.isDragging) {
+          const drag = radiusDragRef.current;
+          const el = drag.element;
+          if (!el) return;
+
+          const delta = viewportY - drag.startY;
+          const corner = drag.corner!;
+          const orig = drag.original;
+
+          let newRadius = { ...orig };
+          if (isCmdHeld) {
+            let val = orig[corner] + delta;
+            val = Math.max(0, Math.min(drag.maxRadius, val));
+            if (isShiftHeld) val = snapPadding(val);
+            val = Math.round(val);
+            newRadius[corner] = val;
+          } else {
+            let val = orig[corner] + delta;
+            val = Math.max(0, Math.min(drag.maxRadius, val));
+            if (isShiftHeld) val = snapPadding(val);
+            val = Math.round(val);
+            newRadius = { 'top-left': val, 'top-right': val, 'bottom-right': val, 'bottom-left': val };
+          }
+
+          applyInlineStyle(el, 'border-top-left-radius', `${newRadius['top-left']}px`);
+          applyInlineStyle(el, 'border-top-right-radius', `${newRadius['top-right']}px`);
+          applyInlineStyle(el, 'border-bottom-right-radius', `${newRadius['bottom-right']}px`);
+          applyInlineStyle(el, 'border-bottom-left-radius', `${newRadius['bottom-left']}px`);
+          setRadiusDragging({ corner, radius: newRadius });
+          return;
+        }
+
+        if (textDragRef.current.isDragging) {
+          const drag = textDragRef.current;
+          const el = drag.element;
+          if (!el) return;
+
+          const property = drag.property!;
+          let newFontSize = drag.originalFontSize;
+          let newLineHeight = drag.originalLineHeight;
+
+          const TYPE_SCALE = [8, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 96];
+
+          if (property === 'font-size') {
+            const delta = viewportX - drag.startX;
+            newFontSize = drag.originalFontSize + delta;
+            newFontSize = Math.max(1, newFontSize);
+          } else {
+            // Line-height drag: only changes line-height, font-size stays fixed
+            const delta = viewportY - drag.startY;
+            newLineHeight = drag.originalLineHeight + delta;
+            newLineHeight = Math.max(newFontSize, newLineHeight);
+          }
+
+          if (isShiftHeld) {
+            if (property === 'font-size') {
+              // Snap font-size to type scale
+              let closest = TYPE_SCALE[0]!;
+              let closestDist = Math.abs(newFontSize - closest);
+              for (const s of TYPE_SCALE) {
+                const d = Math.abs(newFontSize - s);
+                if (d < closestDist) { closest = s; closestDist = d; }
+              }
+              newFontSize = closest;
+            } else {
+              // Snap line-height ratio to 0.5 increments
+              const ratio = newFontSize > 0 ? newLineHeight / newFontSize : 1.2;
+              const snappedRatio = Math.round(ratio * 2) / 2;
+              newLineHeight = newFontSize * Math.max(1, snappedRatio);
+            }
+          }
+
+          newFontSize = Math.round(newFontSize);
+          newLineHeight = Math.round(newLineHeight * 10) / 10;
+
+          applyInlineStyle(el, 'font-size', `${newFontSize}px`);
+          const lhRatio = newFontSize > 0 ? Math.round((newLineHeight / newFontSize) * 1000) / 1000 : 1.2;
+          applyInlineStyle(el, 'line-height', `${lhRatio}`);
+          setTextDragging({ property, fontSize: newFontSize, lineHeight: newLineHeight });
+          return;
+        }
+
+        if (handDragRef.current.isDragging) {
+          const drag = handDragRef.current;
+          const el = drag.element;
+          if (!el) return;
+
+          const side = drag.side!;
+          const orig = drag.original;
+
+          let newTop = orig.top;
+          let newRight = orig.right;
+          let newBottom = orig.bottom;
+          let newLeft = orig.left;
+
+          // Calculate delta for the dragged side
+          if (side === 'top') {
+            const delta = drag.startY - viewportY;
+            newTop = orig.top + delta;
+            if (!isCmdHeld) newBottom = orig.bottom + delta;
+          } else if (side === 'bottom') {
+            const delta = viewportY - drag.startY;
+            newBottom = orig.bottom + delta;
+            if (!isCmdHeld) newTop = orig.top + delta;
+          } else if (side === 'left') {
+            const delta = drag.startX - viewportX;
+            newLeft = orig.left + delta;
+            if (!isCmdHeld) newRight = orig.right + delta;
+          } else if (side === 'right') {
+            const delta = viewportX - drag.startX;
+            newRight = orig.right + delta;
+            if (!isCmdHeld) newLeft = orig.left + delta;
+          }
+
+          // Clamp >= 0
+          newTop = Math.max(0, newTop);
+          newRight = Math.max(0, newRight);
+          newBottom = Math.max(0, newBottom);
+          newLeft = Math.max(0, newLeft);
+
+          // Snap if shift held
+          if (isShiftHeld) {
+            newTop = snapPadding(newTop);
+            newRight = snapPadding(newRight);
+            newBottom = snapPadding(newBottom);
+            newLeft = snapPadding(newLeft);
+          }
+
+          // Round to whole pixels
+          newTop = Math.round(newTop);
+          newRight = Math.round(newRight);
+          newBottom = Math.round(newBottom);
+          newLeft = Math.round(newLeft);
+
+          // Apply inline style for live preview
+          applyInlineStyle(el, 'padding', `${newTop}px ${newRight}px ${newBottom}px ${newLeft}px`);
+          setHandDragging({ side, padding: { top: newTop, right: newRight, bottom: newBottom, left: newLeft } });
+          return;
+        }
+
+        // Hover: detect element, check corners first (highest priority), then gap, then text, then padding
+        // Skip <a> elements — links are invisible to the hand tool (style the wrapped element instead)
+        let el = getTopmostElementAtPoint(viewportX, viewportY);
+        while (el && el.tagName === 'A') el = el.parentElement;
+
+        // Border radius corner detection — highest priority
+        // Check both the topmost element and the previously-hovered element (sticky)
+        // so moving slightly outside a child into parent padding/gap doesn't lose the corner
+        {
+          const HIT_RADIUS = 16;
+          const candidates: Element[] = [];
+          if (el) candidates.push(el);
+          if (radiusHoveredElement && radiusHoveredElement !== el) candidates.push(radiusHoveredElement);
+
+          let bestCorner: BorderRadiusCorner | null = null;
+          let bestDist = HIT_RADIUS;
+          let bestEl: Element | null = null;
+
+          for (const candidate of candidates) {
+            const rect = candidate.getBoundingClientRect();
+            const br = getComputedBorderRadius(candidate);
+            const corners: [BorderRadiusCorner, number, number][] = [
+              ['top-left', rect.left, rect.top + br['top-left']],
+              ['top-right', rect.right, rect.top + br['top-right']],
+              ['bottom-right', rect.right, rect.bottom - br['bottom-right']],
+              ['bottom-left', rect.left, rect.bottom - br['bottom-left']],
+            ];
+            for (const [corner, cx, cy] of corners) {
+              const dist = Math.hypot(viewportX - cx, viewportY - cy);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestCorner = corner;
+                bestEl = candidate;
+              }
+            }
+          }
+
+          if (bestCorner && bestEl) {
+            setRadiusHoveredElement(bestEl);
+            setRadiusHoveredCorner(bestCorner);
+            if (handHoveredElement) setHandHoveredElement(null);
+            if (handHoveredSide) setHandHoveredSide(null);
+            if (gapHoveredElement) setGapHoveredElement(null);
+            if (gapHoveredAxis) setGapHoveredAxis(null);
+            setGapIsAuto(false);
+            if (textHoveredElement) setTextHoveredElement(null);
+            if (textHoveredProperty) setTextHoveredProperty(null);
+            return;
+          }
+        }
+        if (radiusHoveredElement) setRadiusHoveredElement(null);
+        if (radiusHoveredCorner) setRadiusHoveredCorner(null);
+
+        // Gap detection: check element and ancestors for flex/grid gap zones
+        // Ancestor walk is needed for zero-gap layouts where the cursor lands on a deeply-nested child
+        {
+          const gapCandidates: Element[] = [];
+          if (el && isFlexOrGrid(el)) gapCandidates.push(el);
+          let ancestor: Element | null = el?.parentElement ?? null;
+          while (ancestor && ancestor !== document.body && gapCandidates.length < 3) {
+            if (isFlexOrGrid(ancestor)) gapCandidates.push(ancestor);
+            ancestor = ancestor.parentElement;
+          }
+
+          for (const candidate of gapCandidates) {
+            const zones = computeGapZones(candidate);
+            const hit = zones.find(z =>
+              viewportX >= z.x && viewportX <= z.x + z.w &&
+              viewportY >= z.y && viewportY <= z.y + z.h
+            );
+            if (hit) {
+              setGapHoveredElement(candidate);
+              setGapHoveredAxis(hit.axis);
+              setGapIsAuto(isAutoGap(candidate, hit.axis));
+              // Clear padding and text hover
+              if (handHoveredElement) setHandHoveredElement(null);
+              if (handHoveredSide) setHandHoveredSide(null);
+              if (textHoveredElement) setTextHoveredElement(null);
+              if (textHoveredProperty) setTextHoveredProperty(null);
+              return;
+            }
+          }
+        }
+
+        // Clear gap hover if not in gap zone
+        if (gapHoveredElement) setGapHoveredElement(null);
+        if (gapHoveredAxis) setGapHoveredAxis(null);
+        setGapIsAuto(false);
+
+        // Text handle detection — uses text bounding rect (not element rect)
+        // so text handles and padding handles can coexist on the same element.
+        // Handles appear when cursor is anywhere inside the text rect (closest handle wins)
+        // or within HIT_RADIUS of a handle point when outside (sticky near edges).
+        {
+          const TEXT_HIT_RADIUS = 12;
+          const textCandidates: Element[] = [];
+          if (el) textCandidates.push(el);
+          if (textHoveredElement && textHoveredElement !== el) textCandidates.push(textHoveredElement);
+
+          let bestTextProp: TextHandleProperty | null = null;
+          let bestTextDist = Infinity;
+          let bestTextEl: Element | null = null;
+
+          for (const candidate of textCandidates) {
+            if (!isTextElement(candidate)) continue;
+            const textRect = getTextBoundingRect(candidate);
+            if (!textRect) continue;
+
+            const inside = viewportX >= textRect.left && viewportX <= textRect.right &&
+              viewportY >= textRect.top && viewportY <= textRect.bottom;
+
+            const handlePoints: [TextHandleProperty, number, number][] = [
+              ['font-size', textRect.right, textRect.top + textRect.height / 2],
+              ['line-height', textRect.left + textRect.width / 2, textRect.bottom],
+            ];
+            for (const [prop, px, py] of handlePoints) {
+              const dist = Math.hypot(viewportX - px, viewportY - py);
+              // Inside text rect: any distance is fine (closest wins). Outside: must be within hit radius.
+              if ((inside || dist < TEXT_HIT_RADIUS) && dist < bestTextDist) {
+                bestTextDist = dist;
+                bestTextProp = prop;
+                bestTextEl = candidate;
+              }
+            }
+          }
+
+          if (bestTextProp && bestTextEl) {
+            setTextHoveredElement(bestTextEl);
+            setTextHoveredProperty(bestTextProp);
+          } else {
+            if (textHoveredElement) setTextHoveredElement(null);
+            if (textHoveredProperty) setTextHoveredProperty(null);
+          }
+        }
+
+        // Padding hover detection — runs independently of text handles
+        if (el !== handHoveredElement) {
+          setHandHoveredElement(el);
+        }
+        if (el) {
+          const padding = getComputedPadding(el);
+          const rect = el.getBoundingClientRect();
+          const side = detectPaddingSide(viewportX, viewportY, rect, padding);
+          setHandHoveredSide(side);
+        } else {
+          setHandHoveredSide(null);
         }
         return;
       }
@@ -1247,11 +2060,234 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       if (!isDrawing || !state.isAnnotating) return;
       dispatch({ type: 'CONTINUE_PATH', payload: point });
     },
-    [isDrawing, state.isAnnotating, state.activeTool, dragState, resizeState, hoveredElement, getPoint, dispatch]
+    [isDrawing, state.isAnnotating, state.activeTool, dragState, resizeState, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, textHoveredElement, textHoveredProperty, getPoint, dispatch, snapPadding, detectPaddingSide]
   );
 
   const handlePointerUp = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
+      // Handle end of text handle drag
+      if (textDragRef.current.isDragging) {
+        const drag = textDragRef.current;
+        const el = drag.element;
+
+        if (el && drag.selector && drag.elementInfo && textDragging) {
+          if (el instanceof HTMLElement) {
+            el.style.removeProperty('font-size');
+            el.style.removeProperty('line-height');
+            el.style.removeProperty('transition');
+          }
+
+          const changes: { property: string; original: string; modified: string }[] = [];
+          if (drag.originalFontSize !== textDragging.fontSize) {
+            applyInlineStyle(el, 'font-size', `${textDragging.fontSize}px`);
+            changes.push({ property: 'font-size', original: `${drag.originalFontSize}px`, modified: `${textDragging.fontSize}px` });
+          }
+          if (drag.originalLineHeight !== textDragging.lineHeight) {
+            const origRatio = drag.originalFontSize > 0 ? Math.round((drag.originalLineHeight / drag.originalFontSize) * 1000) / 1000 : 1.2;
+            const modRatio = textDragging.fontSize > 0 ? Math.round((textDragging.lineHeight / textDragging.fontSize) * 1000) / 1000 : 1.2;
+            applyInlineStyle(el, 'line-height', `${modRatio}`);
+            changes.push({ property: 'line-height', original: `${origRatio}`, modified: `${modRatio}` });
+          }
+
+          if (changes.length > 0) {
+            dispatch({ type: 'MODIFY_STYLES_BATCH', payload: { selector: drag.selector, durableSelector: drag.durableSelector ?? undefined, element: drag.elementInfo, changes } });
+          }
+        }
+
+        textDragRef.current = { isDragging: false, property: null, startX: 0, startY: 0, originalFontSize: 0, originalLineHeight: 0, originalRatio: 1.2, element: null, elementInfo: null, selector: null, durableSelector: null };
+        setTextDragging(null);
+        return;
+      }
+
+      // Handle end of gap drag
+      if (gapDragRef.current.isDragging) {
+        const drag = gapDragRef.current;
+        const el = drag.element;
+
+        if (!drag.hasMoved && el && drag.selector && drag.elementInfo) {
+          // CLICK — cycle justify-content: between → around → stretch → normal (fixed)
+          if (el instanceof HTMLElement) {
+            el.style.removeProperty('transition');
+          }
+
+          const JC_CYCLE = ['space-between', 'space-around', 'stretch', 'normal'] as const;
+          const currentJc = drag.originalJustifyContent || 'normal';
+          const currentIdx = JC_CYCLE.indexOf(currentJc as typeof JC_CYCLE[number]);
+          const newJc = JC_CYCLE[(currentIdx + 1) % JC_CYCLE.length]!;
+
+          const changes: { property: string; original: string; modified: string }[] = [];
+
+          if (newJc === 'normal') {
+            // Cycling into fixed mode: remove justify distribution, keep gaps as-is
+            applyInlineStyle(el, 'justify-content', 'normal');
+            changes.push({ property: 'justify-content', original: drag.originalJustifyContent, modified: 'normal' });
+          } else if (newJc === 'stretch') {
+            // Cycling into stretch: set justify-content + default 8px gaps
+            applyInlineStyle(el, 'justify-content', newJc);
+            applyInlineStyle(el, 'row-gap', '8px');
+            applyInlineStyle(el, 'column-gap', '8px');
+            changes.push({ property: 'justify-content', original: drag.originalJustifyContent || 'normal', modified: newJc });
+            if (drag.originalRow !== 8) {
+              changes.push({ property: 'row-gap', original: `${drag.originalRow}px`, modified: '8px' });
+            }
+            if (drag.originalColumn !== 8) {
+              changes.push({ property: 'column-gap', original: `${drag.originalColumn}px`, modified: '8px' });
+            }
+          } else {
+            // Cycling into space-between/space-around: set justify-content, remove explicit gaps
+            if (el instanceof HTMLElement) {
+              el.style.removeProperty('row-gap');
+              el.style.removeProperty('column-gap');
+            }
+            applyInlineStyle(el, 'justify-content', newJc);
+            changes.push({ property: 'justify-content', original: drag.originalJustifyContent || 'normal', modified: newJc });
+            if (drag.originalRow > 0) {
+              changes.push({ property: 'row-gap', original: `${drag.originalRow}px`, modified: '0px' });
+            }
+            if (drag.originalColumn > 0) {
+              changes.push({ property: 'column-gap', original: `${drag.originalColumn}px`, modified: '0px' });
+            }
+          }
+
+          if (changes.length > 0) {
+            dispatch({
+              type: 'MODIFY_STYLES_BATCH',
+              payload: { selector: drag.selector, durableSelector: drag.durableSelector ?? undefined, element: drag.elementInfo, changes },
+            });
+          }
+        } else if (drag.hasMoved && el && drag.selector && drag.elementInfo && gapDragging) {
+          // DRAG — commit gap changes (justify-content stays as-is)
+          if (el instanceof HTMLElement) {
+            el.style.removeProperty('row-gap');
+            el.style.removeProperty('column-gap');
+            el.style.removeProperty('transition');
+          }
+
+          const changes: { property: string; original: string; modified: string }[] = [];
+
+          if (drag.isAuto) {
+            // Auto→fixed: reset justify-content and always re-apply both gaps
+            if (el instanceof HTMLElement) {
+              el.style.removeProperty('justify-content');
+            }
+            applyInlineStyle(el, 'justify-content', 'normal');
+            applyInlineStyle(el, 'row-gap', `${gapDragging.row}px`);
+            applyInlineStyle(el, 'column-gap', `${gapDragging.column}px`);
+            changes.push({ property: 'justify-content', original: drag.originalJustifyContent, modified: 'normal' });
+            changes.push({ property: 'row-gap', original: '0px', modified: `${gapDragging.row}px` });
+            changes.push({ property: 'column-gap', original: '0px', modified: `${gapDragging.column}px` });
+          } else {
+            if (drag.originalRow !== gapDragging.row) {
+              applyInlineStyle(el, 'row-gap', `${gapDragging.row}px`);
+              changes.push({ property: 'row-gap', original: `${drag.originalRow}px`, modified: `${gapDragging.row}px` });
+            }
+            if (drag.originalColumn !== gapDragging.column) {
+              applyInlineStyle(el, 'column-gap', `${gapDragging.column}px`);
+              changes.push({ property: 'column-gap', original: `${drag.originalColumn}px`, modified: `${gapDragging.column}px` });
+            }
+          }
+
+          if (changes.length > 0) {
+            dispatch({
+              type: 'MODIFY_STYLES_BATCH',
+              payload: { selector: drag.selector, durableSelector: drag.durableSelector ?? undefined, element: drag.elementInfo, changes },
+            });
+          }
+        }
+
+        gapDragRef.current = { isDragging: false, hasMoved: false, axis: null, startX: 0, startY: 0, originalRow: 0, originalColumn: 0, element: null, elementInfo: null, selector: null, durableSelector: null, isAuto: false, originalJustifyContent: '', visualGap: 0 };
+        setGapDragging(null);
+        return;
+      }
+
+      // Handle end of border radius drag
+      if (radiusDragRef.current.isDragging) {
+        const drag = radiusDragRef.current;
+        const el = drag.element;
+
+        if (el && drag.selector && drag.elementInfo && radiusDragging) {
+          if (el instanceof HTMLElement) {
+            el.style.removeProperty('border-top-left-radius');
+            el.style.removeProperty('border-top-right-radius');
+            el.style.removeProperty('border-bottom-right-radius');
+            el.style.removeProperty('border-bottom-left-radius');
+            el.style.removeProperty('transition');
+          }
+
+          const CORNERS: BorderRadiusCorner[] = ['top-left', 'top-right', 'bottom-right', 'bottom-left'];
+          const PROPS: Record<BorderRadiusCorner, string> = {
+            'top-left': 'border-top-left-radius',
+            'top-right': 'border-top-right-radius',
+            'bottom-right': 'border-bottom-right-radius',
+            'bottom-left': 'border-bottom-left-radius',
+          };
+
+          const changes: { property: string; original: string; modified: string }[] = [];
+          for (const c of CORNERS) {
+            if (drag.original[c] !== radiusDragging.radius[c]) {
+              applyInlineStyle(el, PROPS[c], `${radiusDragging.radius[c]}px`);
+              changes.push({ property: PROPS[c], original: `${drag.original[c]}px`, modified: `${radiusDragging.radius[c]}px` });
+            }
+          }
+
+          if (changes.length > 0) {
+            dispatch({ type: 'MODIFY_STYLES_BATCH', payload: { selector: drag.selector, durableSelector: drag.durableSelector ?? undefined, element: drag.elementInfo, changes } });
+          }
+        }
+
+        radiusDragRef.current = { isDragging: false, corner: null, startY: 0, original: { 'top-left': 0, 'top-right': 0, 'bottom-right': 0, 'bottom-left': 0 }, maxRadius: 0, element: null, elementInfo: null, selector: null, durableSelector: null };
+        setRadiusDragging(null);
+        return;
+      }
+
+      // Handle end of hand tool drag
+      if (handDragRef.current.isDragging) {
+        const drag = handDragRef.current;
+        const el = drag.element;
+        const selector = drag.selector;
+        const info = drag.elementInfo;
+
+        if (el && selector && info && handDragging) {
+          const orig = drag.original;
+          const curr = handDragging.padding;
+
+          // Replace the shorthand with individual properties to avoid flash
+          if (el instanceof HTMLElement) {
+            el.style.removeProperty('padding');
+            el.style.removeProperty('transition');
+          }
+
+          // Build batch of changed sides and apply inline styles immediately
+          const changes: { property: string; original: string; modified: string }[] = [];
+          const sides: Array<{ prop: string; origVal: number; newVal: number }> = [
+            { prop: 'padding-top', origVal: orig.top, newVal: curr.top },
+            { prop: 'padding-right', origVal: orig.right, newVal: curr.right },
+            { prop: 'padding-bottom', origVal: orig.bottom, newVal: curr.bottom },
+            { prop: 'padding-left', origVal: orig.left, newVal: curr.left },
+          ];
+
+          for (const { prop, origVal, newVal } of sides) {
+            if (origVal !== newVal) {
+              applyInlineStyle(el, prop, `${newVal}px`);
+              changes.push({ property: prop, original: `${origVal}px`, modified: `${newVal}px` });
+            }
+          }
+
+          // Single dispatch — one undo entry for all changed sides
+          if (changes.length > 0) {
+            dispatch({
+              type: 'MODIFY_STYLES_BATCH',
+              payload: { selector, durableSelector: drag.durableSelector ?? undefined, element: info, changes },
+            });
+          }
+        }
+
+        // Clear drag state
+        handDragRef.current = { isDragging: false, side: null, startX: 0, startY: 0, original: { top: 0, right: 0, bottom: 0, left: 0 }, element: null, elementInfo: null, selector: null, durableSelector: null };
+        setHandDragging(null);
+        return;
+      }
+
       // Handle end of resize
       if (resizeState) {
         setResizeState(null);
@@ -1334,7 +2370,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       setIsDrawing(false);
       dispatch({ type: 'FINISH_PATH', payload: { elements } });
     },
-    [isDrawing, dragState, resizeState, getPoint, dispatch, state.activeTool, state.currentPath, state.strokeWidth]
+    [isDrawing, dragState, resizeState, handDragging, radiusDragging, gapDragging, textDragging, getPoint, dispatch, state.activeTool, state.currentPath, state.strokeWidth]
   );
 
 
@@ -1382,7 +2418,11 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
         // Fallback: if data-pm selector fails (e.g. after reload), try structural selector from elements
         if (!el && ann.elements?.[0]?.selector && ann.linkedSelector!.startsWith('[data-pm=')) {
-          el = document.querySelector(ann.elements[0].selector);
+          try {
+            el = document.querySelector(ann.elements[0].selector);
+          } catch {
+            // Selector may contain invalid characters (e.g. Tailwind's gap-1.5)
+          }
           if (el) {
             // Re-apply the data-pm attribute so future lookups use the fast path
             const pmId = ann.linkedSelector!.match(/data-pm="([^"]+)"/)?.[1];
@@ -1466,6 +2506,23 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       return 'nesw-resize';
     }
     if (state.activeTool === 'text') return 'text';
+    if (state.activeTool === 'hand') {
+      // Gap cursor takes priority
+      const gapAxis = gapDragging?.axis ?? gapHoveredAxis;
+      if (gapAxis === 'row') return 'ns-resize';
+      if (gapAxis === 'column') return 'ew-resize';
+      // Border radius cursor
+      if (radiusDragging || radiusHoveredCorner) return 'ns-resize';
+      // Text handle cursor
+      const textProp = textDragging?.property ?? textHoveredProperty;
+      if (textProp === 'font-size') return 'ew-resize';
+      if (textProp === 'line-height') return 'ns-resize';
+      // Padding cursor
+      const activeSide = handDragging?.side ?? handHoveredSide;
+      if (activeSide === 'top' || activeSide === 'bottom') return 'ns-resize';
+      if (activeSide === 'left' || activeSide === 'right') return 'ew-resize';
+      return 'default';
+    }
     return 'crosshair';
   };
 
@@ -1563,8 +2620,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         </>
       )}
 
-      {/* Badges for modified elements (shown when toolbar expanded, hidden during inspection) */}
-      {state.isAnnotating && state.styleModifications.length > 0 && (
+      {/* Badges for modified elements (shown when toolbar expanded, hidden during inspection and hand mode) */}
+      {state.isAnnotating && state.activeTool !== 'hand' && state.styleModifications.length > 0 && (
         <ModifiedElementBadges
           styleModifications={state.styleModifications}
           isInspecting={!!state.inspectedElement}
@@ -1572,6 +2629,14 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           annotationGroupCount={new Set(state.annotations.map(a => a.groupId || a.id)).size}
           dispatch={dispatch}
           inFlightSelectors={inFlightStyleSelectors}
+        />
+      )}
+
+      {/* Hand mode: soft border overlays on modified elements */}
+      {state.activeTool === 'hand' && state.isAnnotating && state.styleModifications.length > 0 && (
+        <ModifiedElementBorders
+          styleModifications={state.styleModifications}
+          accentColor={state.activeColor}
         />
       )}
 
@@ -1583,6 +2648,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           scrollX={scroll.x}
           scrollY={scroll.y}
           annotationGroupMap={annotationGroupMap}
+          onViewThread={onViewThread}
+          onSelectAnnotation={selectAnnotation}
         />
       )}
 
@@ -1590,7 +2657,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {state.isAnnotating && (
         <ResolutionBadges
           annotations={state.annotations}
-          supersededIds={supersededIds}
+          supersededAnnotations={supersededAnnotations}
           scrollX={scroll.x}
           scrollY={scroll.y}
           annotationGroupMap={annotationGroupMap}
@@ -1601,11 +2668,27 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         />
       )}
 
+      {/* Plan badges for annotations with an active plan (planning or awaiting approval) */}
+      {state.isAnnotating && (activePlan?.status === 'awaiting_approval' || activePlan?.status === 'planning') && activePlan.threadId && onViewThread && (
+        <PlanWaitingBadges
+          annotations={state.annotations}
+          supersededAnnotations={supersededAnnotations}
+          scrollX={scroll.x}
+          scrollY={scroll.y}
+          annotationGroupMap={annotationGroupMap}
+          planThreadId={activePlan.threadId}
+          taskCount={activePlan.tasks?.length ?? 0}
+          planStatus={activePlan.status}
+          onViewThread={onViewThread}
+          onSelectAnnotation={selectAnnotation}
+        />
+      )}
+
       {/* Question badges for waiting_input annotations */}
       {state.isAnnotating && onReply && (
         <QuestionBadges
           annotations={state.annotations}
-          supersededIds={supersededIds}
+          supersededAnnotations={supersededAnnotations}
           scrollX={scroll.x}
           scrollY={scroll.y}
           onReply={onReply}
@@ -1621,6 +2704,70 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {/* Dotted outlines for focused (selected) inspector-created elements */}
       {state.isAnnotating && focusedSelectorColors && (
         <MarchingAntsBorders inFlightSelectorColors={focusedSelectorColors} animated={false} />
+      )}
+
+      {/* Hand tool: Gap handles overlay */}
+      {state.activeTool === 'hand' && state.isAnnotating && (gapDragging ? gapDragRef.current.element : gapHoveredElement) && (
+        <GapHandles
+          element={(gapDragging ? gapDragRef.current.element : gapHoveredElement)!}
+          gap={gapDragging ? { row: gapDragging.row, column: gapDragging.column } : getComputedGap(gapHoveredElement!)}
+          accentColor={state.activeColor}
+          hoveredAxis={gapHoveredAxis}
+          draggingAxis={gapDragging?.axis ?? null}
+          cursorViewport={handCursorPos}
+          isAutoGap={gapIsAuto}
+          refreshKey={gapRefreshKey}
+        />
+      )}
+
+      {/* Hand tool: Swipe direction hints */}
+      {state.activeTool === 'hand' && state.isAnnotating && swipeHint && (
+        <SwipeHints
+          element={swipeHint.target}
+          modifier={swipeHint.modifier}
+          accentColor={state.activeColor}
+          refreshKey={gapRefreshKey}
+        />
+      )}
+
+      {/* Hand tool: Border radius handles */}
+      {state.activeTool === 'hand' && state.isAnnotating && !swipeHint &&
+        (radiusDragging ? radiusDragRef.current.element : radiusHoveredElement) && (
+          <BorderRadiusHandles
+            element={(radiusDragging ? radiusDragRef.current.element : radiusHoveredElement)!}
+            radius={radiusDragging?.radius ?? getComputedBorderRadius(radiusHoveredElement!)}
+            accentColor={state.activeColor}
+            hoveredCorner={radiusHoveredCorner}
+            draggingCorner={radiusDragging?.corner ?? null}
+            cursorViewport={handCursorPos}
+          />
+      )}
+
+      {/* Hand tool: Text handles (font-size / line-height) */}
+      {state.activeTool === 'hand' && state.isAnnotating && !swipeHint &&
+        (textDragging ? textDragRef.current.element : textHoveredElement) && (
+        <TextHandles
+          element={(textDragging ? textDragRef.current.element : textHoveredElement)!}
+          fontSize={textDragging?.fontSize ?? getComputedTextProperties(textHoveredElement!).fontSize}
+          lineHeight={textDragging?.lineHeight ?? getComputedTextProperties(textHoveredElement!).lineHeight}
+          accentColor={state.activeColor}
+          hoveredProperty={textHoveredProperty}
+          draggingProperty={textDragging?.property ?? null}
+          cursorViewport={handCursorPos}
+        />
+      )}
+
+      {/* Hand tool: Padding handles overlay (hidden when swipe hints active) */}
+      {state.activeTool === 'hand' && state.isAnnotating && !swipeHint && (handDragging ? handDragRef.current.element : handHoveredElement) && (
+        <PaddingHandles
+          element={(handDragging ? handDragRef.current.element : handHoveredElement)!}
+          padding={handDragging?.padding ?? getComputedPadding(handHoveredElement!)}
+          accentColor={state.activeColor}
+          hoveredSide={handHoveredSide}
+          draggingSide={handDragging?.side ?? null}
+          cursorViewport={handCursorPos}
+          refreshKey={textDragging ? textDragging.fontSize + textDragging.lineHeight * 1000 : 0}
+        />
       )}
 
       {/* Inspector mode: Element highlight */}
@@ -1711,12 +2858,16 @@ function ThinkingSpinners({
   scrollX,
   scrollY,
   annotationGroupMap,
+  onViewThread,
+  onSelectAnnotation,
 }: {
   annotations: Annotation[];
   inFlightIds: Set<string>;
   scrollX: number;
   scrollY: number;
   annotationGroupMap: Map<string, number>;
+  onViewThread?: (threadId: string) => void;
+  onSelectAnnotation?: (id: string) => void;
 }) {
   const [charIndex, setCharIndex] = useState(0);
   const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * THINKING_WORDS.length));
@@ -1735,7 +2886,7 @@ function ThinkingSpinners({
   }, []);
 
   // Find text annotations that are in-flight (or whose group mate is in-flight)
-  const spinnerPositions: { x: number; y: number; size: number; color: string }[] = [];
+  const spinnerPositions: { id: string; threadId?: string; x: number; y: number; size: number; color: string }[] = [];
 
   for (const annotation of annotations) {
     if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
@@ -1765,13 +2916,21 @@ function ThinkingSpinners({
     if (!ctx) continue;
 
     ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-    const maxWidth = Math.max(...displayLines.map((line) => ctx.measureText(line).width));
+    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
     const totalHeight = displayLines.length * lineHeightPx;
 
     // Square spinner flush with right edge of text bg, full annotation height
     const annotationHeight = totalHeight + PADDING * 2;
 
+    // Resolve threadId from this annotation or a group mate
+    const groupAnns = annotation.groupId
+      ? annotations.filter(a => a.groupId === annotation.groupId)
+      : [annotation];
+    const threadId = annotation.threadId || groupAnns.find(a => a.threadId)?.threadId;
+
     spinnerPositions.push({
+      id: annotation.id,
+      threadId,
       x: point.x + maxWidth + PADDING, // right edge of text bg
       y: point.y - PADDING,            // top of text bg
       size: annotationHeight,
@@ -1781,12 +2940,18 @@ function ThinkingSpinners({
 
   if (spinnerPositions.length === 0) return null;
 
+  const clickable = !!(onViewThread);
+
   return (
     <>
       {spinnerPositions.map((pos, i) => (
         <div
           key={i}
           data-devtools
+          onClick={clickable && pos.threadId ? () => {
+            onSelectAnnotation?.(pos.id);
+            onViewThread!(pos.threadId!);
+          } : undefined}
           style={{
             position: 'fixed',
             left: pos.x - scrollX,
@@ -1794,7 +2959,8 @@ function ThinkingSpinners({
             height: pos.size,
             display: 'flex',
             alignItems: 'center',
-            pointerEvents: 'none',
+            pointerEvents: clickable ? 'auto' : 'none',
+            cursor: clickable ? 'pointer' : undefined,
             zIndex: 9999,
             backgroundColor: pos.color,
             fontFamily: FONT_FAMILY,
@@ -1834,7 +3000,7 @@ function ThinkingSpinners({
 // Positioned flush with right edge of text annotation (like ThinkingSpinners)
 function ResolutionBadges({
   annotations,
-  supersededIds,
+  supersededAnnotations,
   scrollX,
   scrollY,
   annotationGroupMap,
@@ -1844,7 +3010,7 @@ function ResolutionBadges({
   onSelectAnnotation,
 }: {
   annotations: Annotation[];
-  supersededIds: Set<string>;
+  supersededAnnotations: Set<Annotation>;
   scrollX: number;
   scrollY: number;
   annotationGroupMap: Map<string, number>;
@@ -1858,18 +3024,23 @@ function ResolutionBadges({
 
   for (const annotation of annotations) {
     if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
-    if (supersededIds.has(annotation.id)) continue;
+    if (supersededAnnotations.has(annotation)) continue;
 
-    // Check if this text annotation or its group mate is resolved
+    // Check if this text annotation or its group mate is resolved, needs_review,
+    // or has a threadId (captured annotation that's been through a conversation)
     const status: AnnotationLifecycleStatus = annotation.status ?? 'pending';
-    const groupMateResolved = annotation.groupId && annotations.some(
-      a => a.groupId === annotation.groupId && (a.status === 'resolved' || a.status === 'needs_review')
+    const groupAnns = annotation.groupId
+      ? annotations.filter(a => a.groupId === annotation.groupId)
+      : [annotation];
+    const groupMateResolved = groupAnns.some(
+      a => a.status === 'resolved' || a.status === 'needs_review'
     );
+    const hasThread = groupAnns.some(a => a.threadId);
 
-    if (status !== 'resolved' && status !== 'needs_review' && !groupMateResolved) continue;
+    if (status !== 'resolved' && status !== 'needs_review' && !groupMateResolved && !hasThread) continue;
 
     const isNeedsReview = status === 'needs_review' ||
-      (annotation.groupId && annotations.some(a => a.groupId === annotation.groupId && a.status === 'needs_review'));
+      groupAnns.some(a => a.status === 'needs_review');
 
     const point = annotation.points[0];
     const fontSize = annotation.fontSize || 12;
@@ -1886,7 +3057,7 @@ function ResolutionBadges({
     if (!ctx) continue;
 
     ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-    const maxWidth = Math.max(...displayLines.map((line) => ctx.measureText(line).width));
+    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
     const totalHeight = displayLines.length * lineHeightPx;
     const annotationHeight = totalHeight + PADDING * 2;
 
@@ -2171,6 +3342,208 @@ function ResolutionBadge({
   );
 }
 
+// "Plan waiting" badge for annotations whose plan is planning or awaiting approval
+function PlanWaitingBadges({
+  annotations,
+  supersededAnnotations,
+  scrollX,
+  scrollY,
+  annotationGroupMap,
+  planThreadId,
+  taskCount,
+  planStatus,
+  onViewThread,
+  onSelectAnnotation,
+}: {
+  annotations: Annotation[];
+  supersededAnnotations: Set<Annotation>;
+  scrollX: number;
+  scrollY: number;
+  annotationGroupMap: Map<string, number>;
+  planThreadId: string;
+  taskCount: number;
+  planStatus: 'planning' | 'awaiting_approval';
+  onViewThread: (threadId: string) => void;
+  onSelectAnnotation?: (id: string) => void;
+}) {
+  // Find text annotations linked to the plan thread, or pending text annotations
+  // that haven't been resolved yet (they triggered the plan)
+  const badgePositions: { annotation: Annotation; x: number; y: number; size: number; groupNumber?: number }[] = [];
+
+  for (const annotation of annotations) {
+    if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
+    if (supersededAnnotations.has(annotation)) continue;
+
+    const status = annotation.status ?? 'pending';
+    const groupAnns = annotation.groupId
+      ? annotations.filter(a => a.groupId === annotation.groupId)
+      : [annotation];
+    const hasThread = groupAnns.some(a => a.threadId === planThreadId);
+    // Fallback: captured/in_flight text annotations with no planId are likely the plan trigger
+    const isPlanTrigger = !hasThread && !annotation.planId &&
+      (status === 'in_flight' || status === 'pending' || annotation.captured) &&
+      !groupAnns.some(a => a.status === 'resolved' || a.status === 'needs_review');
+
+    if (!hasThread && !isPlanTrigger) continue;
+    // Skip annotations that already have resolution badges
+    if (status === 'resolved' || status === 'needs_review') continue;
+
+    const point = annotation.points[0];
+    const fontSize = annotation.fontSize || 12;
+    const lineHeightPx = fontSize * LINE_HEIGHT;
+    const lines = annotation.text.split('\n');
+
+    const groupNumber = annotationGroupMap.get(annotation.id);
+    const displayLines = groupNumber !== undefined
+      ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
+      : lines;
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+
+    ctx.font = `${fontSize}px ${FONT_FAMILY}`;
+    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
+    const totalHeight = displayLines.length * lineHeightPx;
+    const annotationHeight = totalHeight + PADDING * 2;
+
+    badgePositions.push({
+      annotation,
+      x: point.x + maxWidth + PADDING,
+      y: point.y - PADDING,
+      size: annotationHeight,
+      groupNumber,
+    });
+  }
+
+  if (badgePositions.length === 0) return null;
+
+  const isPlanning = planStatus === 'planning';
+
+  return (
+    <>
+      {badgePositions.map(({ annotation, x, y, size }) => (
+        isPlanning
+          ? <PlanningSpinner
+              key={`plan-thinking-${annotation.id}`}
+              x={x - scrollX}
+              y={y - scrollY}
+              size={size}
+              color={annotation.color}
+              onClick={() => {
+                onSelectAnnotation?.(annotation.id);
+                onViewThread(planThreadId);
+              }}
+            />
+          : <div
+              key={`plan-waiting-${annotation.id}`}
+              data-devtools="plan-waiting-badge"
+              onClick={() => {
+                onSelectAnnotation?.(annotation.id);
+                onViewThread(planThreadId);
+              }}
+              style={{
+                position: 'fixed',
+                left: x - scrollX,
+                top: y - scrollY,
+                height: size,
+                display: 'flex',
+                alignItems: 'center',
+                cursor: 'pointer',
+                backgroundColor: annotation.color,
+                fontFamily: FONT_FAMILY,
+                fontSize: 12,
+                color: '#ffffff',
+                userSelect: 'none',
+                padding: `0 ${PADDING}px`,
+                gap: 4,
+                whiteSpace: 'nowrap',
+                zIndex: 9999,
+                pointerEvents: 'auto',
+              }}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
+                <line x1="12" y1="17" x2="12.01" y2="17" />
+              </svg>
+              <span style={{ opacity: 0.7 }}>
+                {taskCount} task{taskCount !== 1 ? 's' : ''} — approve?
+              </span>
+            </div>
+      ))}
+    </>
+  );
+}
+
+function PlanningSpinner({ x, y, size, color, onClick }: { x: number; y: number; size: number; color: string; onClick?: () => void }) {
+  const [charIndex, setCharIndex] = useState(0);
+  const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * PLANNING_WORDS.length));
+
+  useEffect(() => {
+    const charTimer = setInterval(() => {
+      setCharIndex((i) => (i + 1) % SPINNER_FRAME_COUNT);
+    }, SPINNER_INTERVAL);
+    const wordTimer = setInterval(() => {
+      setWordIndex((i) => (i + 1) % PLANNING_WORDS.length);
+    }, WORD_INTERVAL);
+    return () => {
+      clearInterval(charTimer);
+      clearInterval(wordTimer);
+    };
+  }, []);
+
+  return (
+    <div
+      data-devtools="plan-thinking-badge"
+      onClick={onClick}
+      style={{
+        position: 'fixed',
+        left: x,
+        top: y,
+        height: size,
+        display: 'flex',
+        alignItems: 'center',
+        pointerEvents: onClick ? 'auto' : 'none',
+        cursor: onClick ? 'pointer' : undefined,
+        zIndex: 9999,
+        backgroundColor: color,
+        fontFamily: FONT_FAMILY,
+        fontSize: 12,
+        color: '#ffffff',
+        userSelect: 'none',
+        padding: `0 ${PADDING}px`,
+        gap: 4,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
+        {charIndex === 1 ? (
+          <>
+            <circle cx="7" cy="7" r="2" />
+            <circle cx="17" cy="7" r="2" />
+            <circle cx="7" cy="17" r="2" />
+            <circle cx="17" cy="17" r="2" />
+          </>
+        ) : (
+          <>
+            <circle cx="12" cy="6" r="2" />
+            <circle cx="6" cy="12" r="2" />
+            <circle cx="18" cy="12" r="2" />
+            <circle cx="12" cy="18" r="2" />
+          </>
+        )}
+      </svg>
+      <span style={{ opacity: 0.7 }}>{PLANNING_WORDS[wordIndex]}</span>
+    </div>
+  );
+}
+
+const PLANNING_WORDS = [
+  'planning', 'strategizing', 'scheming', 'mapping',
+  'scoping', 'drafting', 'outlining', 'architecting',
+];
+
 // Marching ants border for in-flight style modifications
 function MarchingAntsBorders({
   inFlightSelectorColors,
@@ -2291,21 +3664,21 @@ function MarchingAntsBorders({
 // Question badge for waiting_input annotations — crosshair icon, click to expand reply form
 function QuestionBadges({
   annotations,
-  supersededIds,
+  supersededAnnotations,
   scrollX,
   scrollY,
   onReply,
   annotationGroupMap,
 }: {
   annotations: Annotation[];
-  supersededIds: Set<string>;
+  supersededAnnotations: Set<Annotation>;
   scrollX: number;
   scrollY: number;
   onReply: (threadId: string, reply: string) => void;
   annotationGroupMap: Map<string, number>;
 }) {
   const waitingAnnotations = annotations.filter(a => {
-    if (supersededIds.has(a.id)) return false;
+    if (supersededAnnotations.has(a)) return false;
     return a.status === 'waiting_input' && a.question && a.threadId;
   });
 
@@ -2339,7 +3712,7 @@ function QuestionBadges({
       if (!ctx) continue;
 
       ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-      const maxWidth = Math.max(...displayLines.map((line) => ctx.measureText(line).width));
+      const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
       const totalHeight = displayLines.length * lineHeightPx;
       const annotationHeight = totalHeight + PADDING * 2;
 

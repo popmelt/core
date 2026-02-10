@@ -37,6 +37,18 @@ export function formatFeedbackContext(feedback: FeedbackPayload): string {
     }
   }
 
+  if (feedback.inspectedElement) {
+    const el = feedback.inspectedElement;
+    lines.push('');
+    lines.push('## Inspected Element');
+    lines.push('The developer has this element selected in the inspector:');
+    const parts = [el.selector];
+    if (el.reactComponent) parts.push(`(${el.reactComponent})`);
+    if (el.context) parts.push(`in ${el.context}`);
+    if (el.textContent) parts.push(`"${el.textContent.slice(0, 80)}"`);
+    lines.push(`- ${parts.join(' ')}`);
+  }
+
   return lines.join('\n');
 }
 
@@ -225,7 +237,17 @@ export function buildReplyPrompt(
   return lines.join('\n');
 }
 
-/** Parse resolution blocks from Claude's response text */
+function isValidResolution(r: unknown): r is AnnotationResolution {
+  return (
+    typeof r === 'object' &&
+    r !== null &&
+    typeof (r as Record<string, unknown>).annotationId === 'string' &&
+    ((r as Record<string, unknown>).status === 'resolved' || (r as Record<string, unknown>).status === 'needs_review') &&
+    typeof (r as Record<string, unknown>).summary === 'string'
+  );
+}
+
+/** Parse the first resolution block from Claude's response text */
 export function parseResolutions(responseText: string): AnnotationResolution[] {
   const match = responseText.match(/<resolution>\s*([\s\S]*?)\s*<\/resolution>/);
   if (!match || !match[1]) return [];
@@ -233,19 +255,31 @@ export function parseResolutions(responseText: string): AnnotationResolution[] {
   try {
     const parsed = JSON.parse(match[1]);
     if (!Array.isArray(parsed)) return [];
-
-    // Validate shape
-    return parsed.filter(
-      (r: unknown): r is AnnotationResolution =>
-        typeof r === 'object' &&
-        r !== null &&
-        typeof (r as Record<string, unknown>).annotationId === 'string' &&
-        ((r as Record<string, unknown>).status === 'resolved' || (r as Record<string, unknown>).status === 'needs_review') &&
-        typeof (r as Record<string, unknown>).summary === 'string',
-    );
+    return parsed.filter(isValidResolution);
   } catch {
     return [];
   }
+}
+
+/** Parse ALL resolution blocks from response text (for plan executor with incremental output) */
+export function parseAllResolutions(responseText: string): AnnotationResolution[] {
+  const results: AnnotationResolution[] = [];
+  const regex = /<resolution>\s*([\s\S]*?)\s*<\/resolution>/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(responseText)) !== null) {
+    if (!match[1]) continue;
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (Array.isArray(parsed)) {
+        results.push(...parsed.filter(isValidResolution));
+      }
+    } catch {
+      // Incomplete or invalid JSON — skip this block
+    }
+  }
+
+  return results;
 }
 
 // ============================
@@ -257,6 +291,8 @@ export function buildPlannerPrompt(
   goal: string,
   pageUrl: string,
   viewport: { width: number; height: number },
+  manifestJson?: string,
+  feedbackContext?: string,
 ): string {
   const lines: string[] = [];
 
@@ -266,6 +302,26 @@ export function buildPlannerPrompt(
   lines.push('');
   lines.push(`Page: ${pageUrl}`);
   lines.push(`Viewport: ${viewport.width}x${viewport.height}`);
+
+  if (manifestJson) {
+    lines.push('');
+    lines.push('## Page Elements (ground truth)');
+    lines.push('Below is a structured inventory of actual DOM elements on this page. Cross-reference');
+    lines.push('against this list — do NOT reference elements that aren\'t listed here.');
+    lines.push('');
+    lines.push('<manifest>');
+    lines.push(manifestJson);
+    lines.push('</manifest>');
+  }
+
+  // Include developer's annotations and style modifications as additional context
+  if (feedbackContext) {
+    lines.push('');
+    lines.push('## Developer Context');
+    lines.push('The developer has the following annotations and style changes on their canvas. Factor these into your plan:');
+    lines.push(feedbackContext);
+  }
+
   lines.push('');
   lines.push('## Goal');
   lines.push(goal);
@@ -289,6 +345,7 @@ export function buildPlannerPrompt(
   lines.push('</plan>');
   lines.push('');
   lines.push('Guidelines:');
+  lines.push('- CRITICAL: Cross-check all element references against the <manifest>. Only reference elements that actually exist. Use the manifest\'s text content, component names, and bounding rects for precise instructions.');
   lines.push('- Be specific about values (colors, sizes, spacing) rather than vague ("make it look better")');
   lines.push('- Each task should be independently actionable by a worker that can only see its region');
   lines.push('- Regions should tightly bound the relevant UI element(s)');
@@ -364,6 +421,74 @@ export function buildReviewerPrompt(
   lines.push('</review>');
   lines.push('');
   lines.push('Do NOT modify any files. Output only a <review> block.');
+
+  return lines.join('\n');
+}
+
+// ============================
+// Plan executor prompt (single-session multi-task)
+// ============================
+
+export function buildPlanExecutorPrompt(
+  screenshotPath: string,
+  tasks: Array<{
+    planTaskId: string;
+    annotationId: string;
+    instruction: string;
+    region: { x: number; y: number; width: number; height: number };
+    linkedSelector?: string;
+    elements?: Array<{ selector: string; reactComponent?: string }>;
+  }>,
+  pageUrl: string,
+  viewport: { width: number; height: number },
+  provider?: Provider,
+): string {
+  const lines: string[] = [];
+
+  lines.push('You are implementing a series of UI changes on a web application.');
+  lines.push('');
+  if (provider !== 'codex') {
+    lines.push(`IMPORTANT: First, use the Read tool to view the screenshot at: ${screenshotPath}`);
+    lines.push('');
+  }
+  lines.push(`Page: ${pageUrl} (${viewport.width}x${viewport.height})`);
+  lines.push('');
+  lines.push('## Tasks');
+  lines.push('Each task targets a specific region of the page. Complete them in order.');
+  lines.push('');
+
+  for (const task of tasks) {
+    lines.push(`### Task ${task.planTaskId} (annotationId: ${task.annotationId})`);
+    lines.push(`Instruction: ${task.instruction}`);
+    lines.push(`Region: (${task.region.x}, ${task.region.y}) ${task.region.width}x${task.region.height}`);
+    if (task.linkedSelector) {
+      lines.push(`Target element: ${task.linkedSelector}`);
+    }
+    if (task.elements && task.elements.length > 0) {
+      const elemDesc = task.elements
+        .map(el => {
+          const parts = [el.selector];
+          if (el.reactComponent) parts.push(`(${el.reactComponent})`);
+          return parts.join(' ');
+        })
+        .join(', ');
+      lines.push(`Elements: ${elemDesc}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('## Instructions');
+  lines.push('- Apply each change to the source files — the dev server has HMR so changes appear immediately.');
+  lines.push('- IMPORTANT: If any elements you modify have a `data-pm` attribute, preserve it in the source.');
+  lines.push('- You may use parallel subagents (Task tool) for independent changes, or work serially — use your judgment.');
+  lines.push('');
+  lines.push('## Resolution');
+  lines.push('CRITICAL: After completing EACH task, immediately output a <resolution> block for that task.');
+  lines.push('Do NOT wait until all tasks are done — output each resolution as soon as that task is finished.');
+  lines.push('<resolution>');
+  lines.push('[{"annotationId":"<annotationId>","status":"resolved","summary":"<what you did>","filesModified":["<file>"]}]');
+  lines.push('</resolution>');
+  lines.push('Use status "resolved" when the change is complete, or "needs_review" if you\'re unsure about the result.');
 
   return lines.join('\n');
 }

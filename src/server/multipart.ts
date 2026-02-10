@@ -11,6 +11,8 @@ export type ParsedMultipart = {
   pageUrl?: string;
   viewport?: string;
   planId?: string;
+  manifest?: string;
+  tasks?: string;
 };
 
 /**
@@ -38,6 +40,8 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   let pageUrl: string | undefined;
   let viewport: string | undefined;
   let planId: string | undefined;
+  let manifest: string | undefined;
+  let tasks: string | undefined;
 
   // Split body by delimiter
   let offset = 0;
@@ -102,6 +106,10 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
       viewport = part.body.toString('utf-8');
     } else if (name === 'planId') {
       planId = part.body.toString('utf-8');
+    } else if (name === 'manifest') {
+      manifest = part.body.toString('utf-8');
+    } else if (name === 'tasks') {
+      tasks = part.body.toString('utf-8');
     }
   }
 
@@ -109,7 +117,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   // feedback is optional for plan endpoints
   if (!feedback) feedback = '';
 
-  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId };
+  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

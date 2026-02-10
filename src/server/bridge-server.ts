@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -7,10 +8,10 @@ import { join } from 'node:path';
 import { spawnClaude } from './claude-spawner';
 import { spawnCodex } from './codex-spawner';
 import { parseMultipart } from './multipart';
-import { buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
+import { buildPlanExecutorPrompt, buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parseAllResolutions, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
-import type { BridgeServerHandle, BridgeServerOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
+import type { PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
 
 const DEFAULT_PORT = 1111;
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
@@ -57,9 +58,9 @@ function sendSSE(client: SSEClient, event: SSEEvent) {
   }
 }
 
-export async function createBridgeServer(
-  options: BridgeServerOptions = {},
-): Promise<BridgeServerHandle> {
+export async function createPopmelt(
+  options: PopmeltOptions = {},
+): Promise<PopmeltHandle> {
   const port = options.port ?? DEFAULT_PORT;
   const projectRoot = options.projectRoot ?? process.cwd();
   const tempDir = options.tempDir ?? join(tmpdir(), 'popmelt-bridge');
@@ -68,6 +69,18 @@ export async function createBridgeServer(
   const allowedTools = options.allowedTools ?? DEFAULT_ALLOWED_TOOLS;
   const claudePath = options.claudePath ?? 'claude';
   const defaultProvider: Provider = options.provider ?? 'claude';
+
+  // Probe for installed CLI providers
+  type ProviderCapability = { available: boolean; path: string | null };
+  const capabilities: Record<string, ProviderCapability> = {};
+  for (const cli of ['claude', 'codex']) {
+    try {
+      const cliPath = execFileSync('which', [cli], { encoding: 'utf-8' }).trim();
+      capabilities[cli] = { available: true, path: cliPath };
+    } catch {
+      capabilities[cli] = { available: false, path: null };
+    }
+  }
 
   // Ensure temp dir exists
   await mkdir(tempDir, { recursive: true });
@@ -139,8 +152,27 @@ export async function createBridgeServer(
     console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
     console.log(`${tag} Prompt includes question instruction: ${prompt.includes('## Questions')}`);
 
+    // Incremental resolution tracking for plan executor jobs
+    const isPlanExecutor = !!(job as Job & { _isPlanExecutor?: boolean })._isPlanExecutor;
+    let deltaBuffer = '';
+    let lastResolutionCount = 0;
+
     const onEvent = (event: SSEEvent, jobId: string) => {
       queue.broadcast(event, jobId);
+
+      // For plan executor jobs, accumulate delta text and check for new resolutions
+      if (isPlanExecutor && event.type === 'delta' && 'text' in event) {
+        deltaBuffer += event.text;
+        const resolutions = parseAllResolutions(deltaBuffer);
+        if (resolutions.length > lastResolutionCount) {
+          const newResolutions = resolutions.slice(lastResolutionCount);
+          lastResolutionCount = resolutions.length;
+          queue.broadcast(
+            { type: 'task_resolved', jobId, planId: job.planId!, resolutions: newResolutions, threadId: job.threadId },
+            jobId,
+          );
+        }
+      }
     };
 
     // Use per-job tool overrides (e.g. planner gets Read-only)
@@ -174,6 +206,9 @@ export async function createBridgeServer(
 
     if (spawnResult.success) {
       console.log(`${tag} Iteration complete`);
+      if (spawnResult.fileEdits && spawnResult.fileEdits.length > 0) {
+        console.log(`${tag} Captured ${spawnResult.fileEdits.length} file edit(s): ${spawnResult.fileEdits.map(e => `${e.tool} ${e.file_path}`).join(', ')}`);
+      }
       job.status = 'done';
 
       // Parse both questions and resolutions (Claude may resolve some and ask about others)
@@ -302,6 +337,8 @@ export async function createBridgeServer(
         handleEvents(req, res);
       } else if (req.method === 'GET' && path === '/status') {
         handleStatus(res);
+      } else if (req.method === 'GET' && path === '/capabilities') {
+        sendJson(res, 200, { providers: capabilities });
       } else if (req.method === 'POST' && path === '/reply') {
         await handleReply(req, res);
       } else if (req.method === 'POST' && path === '/cancel') {
@@ -310,6 +347,8 @@ export async function createBridgeServer(
         await handlePlan(req, res);
       } else if (req.method === 'POST' && path === '/plan/approve') {
         await handlePlanApprove(req, res);
+      } else if (req.method === 'POST' && path === '/plan/execute') {
+        await handlePlanExecute(req, res);
       } else if (req.method === 'POST' && path === '/plan/review') {
         await handlePlanReview(req, res);
       } else if (req.method === 'GET' && path.startsWith('/plan/')) {
@@ -534,7 +573,7 @@ export async function createBridgeServer(
   }
 
   async function handlePlan(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr, manifest: manifestStr } = await parseMultipart(req);
 
     if (!screenshot || !goalStr) {
       sendJson(res, 400, { error: 'Missing screenshot or goal' });
@@ -546,6 +585,18 @@ export async function createBridgeServer(
     try {
       if (viewportStr) viewport = JSON.parse(viewportStr);
     } catch {}
+
+    // Parse optional feedback context (annotations + style modifications from the canvas)
+    let feedbackContext: string | undefined;
+    if (feedbackStr) {
+      try {
+        const feedback: FeedbackPayload = JSON.parse(feedbackStr);
+        const ctx = formatFeedbackContext(feedback);
+        if (ctx) feedbackContext = ctx;
+      } catch {
+        // Invalid feedback JSON — skip
+      }
+    }
 
     const planId = randomUUID().slice(0, 8);
     const jobId = randomUUID().slice(0, 8);
@@ -572,7 +623,7 @@ export async function createBridgeServer(
     jobGroups.set(planId, group);
 
     // Build planner prompt
-    const prompt = buildPlannerPrompt(screenshotPath, goalStr, pageUrl, viewport);
+    const prompt = buildPlannerPrompt(screenshotPath, goalStr, pageUrl, viewport, manifestStr, feedbackContext);
 
     // Append human message to thread
     await threadStore.appendMessage(threadId, {
@@ -654,6 +705,78 @@ export async function createBridgeServer(
     sendJson(res, 200, { planId, tasks, status: 'executing' });
   }
 
+  async function handlePlanExecute(req: IncomingMessage, res: ServerResponse) {
+    const { screenshot, planId: planIdStr, tasks: tasksStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+
+    if (!planIdStr || !tasksStr || !screenshot) {
+      sendJson(res, 400, { error: 'Missing planId, tasks, or screenshot' });
+      return;
+    }
+
+    const group = jobGroups.get(planIdStr);
+    if (!group) {
+      sendJson(res, 404, { error: 'Plan not found' });
+      return;
+    }
+
+    if (group.status !== 'executing') {
+      sendJson(res, 400, { error: `Plan status is ${group.status}, expected executing` });
+      return;
+    }
+
+    let tasks: Array<{
+      planTaskId: string;
+      annotationId: string;
+      instruction: string;
+      region: { x: number; y: number; width: number; height: number };
+      linkedSelector?: string;
+      elements?: Array<{ selector: string; reactComponent?: string }>;
+    }>;
+    try {
+      tasks = JSON.parse(tasksStr);
+    } catch {
+      sendJson(res, 400, { error: 'Invalid tasks JSON' });
+      return;
+    }
+
+    const jobId = randomUUID().slice(0, 8);
+    const screenshotPath = join(tempDir, `screenshot-exec-${planIdStr}.png`);
+    await writeFile(screenshotPath, screenshot);
+
+    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
+    const prompt = buildPlanExecutorPrompt(screenshotPath, tasks, group.pageUrl, group.viewport, provider);
+
+    // Collect all annotation IDs from tasks
+    const annotationIds = tasks.map(t => t.annotationId);
+
+    const job: Job = {
+      id: jobId,
+      status: 'queued',
+      screenshotPath,
+      feedback: {
+        timestamp: new Date().toISOString(),
+        url: group.pageUrl,
+        viewport: group.viewport,
+        scrollPosition: { x: 0, y: 0 },
+        annotations: [],
+        styleModifications: [],
+      },
+      createdAt: Date.now(),
+      provider,
+      model: modelStr || undefined,
+      planId: planIdStr,
+      annotationIds,
+    };
+
+    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
+    (job as Job & { _isPlanExecutor?: boolean })._isPlanExecutor = true;
+
+    group.executorJobId = jobId;
+
+    const position = queue.enqueue(job);
+    sendJson(res, 200, { jobId, planId: planIdStr, position });
+  }
+
   async function handlePlanReview(req: IncomingMessage, res: ServerResponse) {
     const { screenshot, planId: planIdStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
 
@@ -700,7 +823,7 @@ export async function createBridgeServer(
         styleModifications: [],
       },
       createdAt: Date.now(),
-      threadId: group.plannerThreadId,
+      // Don't set threadId — avoids resuming planner session, which would discard the review prompt
       provider,
       model: modelStr || undefined,
       planId: planIdStr,
@@ -739,7 +862,7 @@ export async function createBridgeServer(
     cleanupTempDir(tempDir).catch(() => {});
   }, CLEANUP_INTERVAL_MS);
 
-  return new Promise<BridgeServerHandle>((resolve, reject) => {
+  return new Promise<PopmeltHandle>((resolve, reject) => {
     server.on('error', (err) => {
       // If port is in use, the server is likely already running — treat as success
       if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {

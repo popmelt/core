@@ -4,7 +4,7 @@ import type { AnnotationResolution } from '../tools/types';
 
 export type Provider = 'claude' | 'codex';
 
-export type BridgeServerOptions = {
+export type PopmeltOptions = {
   port?: number;
   projectRoot?: string;
   tempDir?: string;
@@ -15,7 +15,7 @@ export type BridgeServerOptions = {
   provider?: Provider;
 };
 
-export type BridgeServerHandle = {
+export type PopmeltHandle = {
   port: number;
   close: () => Promise<void>;
 };
@@ -53,6 +53,15 @@ export type FeedbackPayload = {
       modified: string;
     }[];
   }[];
+  inspectedElement?: {
+    selector: string;
+    tagName: string;
+    id?: string;
+    className?: string;
+    textContent?: string;
+    reactComponent?: string;
+    context?: string;
+  };
 };
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'error';
@@ -85,6 +94,7 @@ export type SSEEvent =
   | { type: 'question'; jobId: string; threadId: string; question: string; annotationIds?: string[] }
   | { type: 'plan_ready'; jobId: string; planId: string; tasks: PlanTask[]; threadId?: string }
   | { type: 'plan_review'; planId: string; verdict: 'pass' | 'fail'; summary: string; issues?: string[] }
+  | { type: 'task_resolved'; jobId: string; planId: string; resolutions: AnnotationResolution[]; threadId?: string }
   | { type: 'queue_drained' };
 
 export type SSEClient = {
@@ -139,6 +149,7 @@ export type JobGroup = {
   plannerThreadId?: string;
   plan?: PlanTask[];
   workerJobIds: string[];
+  executorJobId?: string;
   screenshotPath: string;
   pageUrl: string;
   viewport: { width: number; height: number };

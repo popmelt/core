@@ -6,15 +6,15 @@ import { useEffect, useRef, useState } from 'react';
 import type { BridgeConnectionState } from '../hooks/useBridgeConnection';
 
 type InFlightJob = {
-  annotationIds: Set<string>;
-  styleSelectors: Set<string>;
+  annotationIds: string[];
+  styleSelectors: string[];
   color: string;
 };
 
 type BridgeEventStackProps = {
   bridge: BridgeConnectionState & { clearEvents: () => void };
   bridgeUrl: string;
-  inFlightJobs: Map<string, InFlightJob>;
+  inFlightJobs: Record<string, InFlightJob>;
   isVisible: boolean;
   onHover: (hovering: boolean) => void;
   clearSignal: number;
@@ -180,7 +180,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     setEntries((prev) => {
       const existingIds = new Set(prev.map((e) => e.jobId));
       const newEntries = [...prev];
-      for (const [jobId, job] of inFlightJobs) {
+      for (const [jobId, job] of Object.entries(inFlightJobs)) {
         if (!existingIds.has(jobId)) {
           newEntries.push({ jobId, color: job.color, status: 'queued' });
         }

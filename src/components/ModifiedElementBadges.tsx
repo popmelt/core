@@ -3,17 +3,9 @@
 import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useState } from 'react';
 
+import { useSpinner } from '../hooks/useSpinner';
 import type { AnnotationAction, StyleModification } from '../tools/types';
 import { findElementBySelector } from '../utils/dom';
-
-const SPINNER_FRAME_COUNT = 3;
-const SPINNER_INTERVAL = 250;
-const THINKING_WORDS = [
-  'reviewing', 'considering', 'thinking', 'zhuzhing',
-  'iterating', 'tweaking', 'reflecting', 'noodling',
-  'pondering', 'finessing', 'polishing', 'riffing',
-];
-const WORD_INTERVAL = 3000;
 
 type ModifiedElementBadgesProps = {
   styleModifications: StyleModification[];
@@ -63,15 +55,7 @@ export function ModifiedElementBadges({
 
   // Spinner animation for in-flight badges
   const hasInFlight = inFlightSelectors && inFlightSelectors.size > 0;
-  const [charIndex, setCharIndex] = useState(0);
-  const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * THINKING_WORDS.length));
-
-  useEffect(() => {
-    if (!hasInFlight) return;
-    const charTimer = setInterval(() => setCharIndex(i => (i + 1) % SPINNER_FRAME_COUNT), SPINNER_INTERVAL);
-    const wordTimer = setInterval(() => setWordIndex(i => (i + 1) % THINKING_WORDS.length), WORD_INTERVAL);
-    return () => { clearInterval(charTimer); clearInterval(wordTimer); };
-  }, [hasInFlight]);
+  const { charIndex, word: thinkingWord } = useSpinner(!!hasInFlight);
 
   useEffect(() => {
     // Hide all badges when inspecting an element
@@ -225,7 +209,7 @@ export function ModifiedElementBadges({
                     </>
                   )}
                 </svg>
-                {THINKING_WORDS[wordIndex]}
+                {thinkingWord}
               </span>
             )}
           </div>

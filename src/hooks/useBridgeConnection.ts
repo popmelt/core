@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import type { AnnotationResolution } from '../tools/types';
 import { checkBridgeHealth } from '../utils/bridge-client';
 
 export type BridgeEvent = {
@@ -52,6 +53,7 @@ export type BridgeConnectionState = {
   pendingQuestions: PendingQuestion[];
   pendingPlans: PendingPlan[];
   planReviews: PlanReviewResult[];
+  incrementalResolutions: AnnotationResolution[];
 };
 
 export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
@@ -71,6 +73,7 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
     pendingQuestions: [],
     pendingPlans: [],
     planReviews: [],
+    incrementalResolutions: [],
   });
 
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -269,6 +272,19 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
       }));
     });
 
+    es.addEventListener('task_resolved', (e) => {
+      const data = JSON.parse(e.data);
+      const resolutions = (data.resolutions ?? []) as AnnotationResolution[];
+      setState((prev) => ({
+        ...prev,
+        incrementalResolutions: [...prev.incrementalResolutions, ...resolutions],
+        events: [
+          ...prev.events,
+          { type: 'task_resolved', data, timestamp: Date.now() },
+        ],
+      }));
+    });
+
     es.addEventListener('queue_drained', () => {
       setState((prev) => ({
         ...prev,
@@ -279,6 +295,7 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
         currentThinking: '',
         jobResponses: {},
         jobThinking: {},
+        incrementalResolutions: [],
       }));
     });
 
@@ -361,6 +378,7 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
       jobThinking: {},
       lastResponseText: null,
       lastThreadId: null,
+      incrementalResolutions: [],
     }));
   }, []);
 

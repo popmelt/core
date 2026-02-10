@@ -14,22 +14,22 @@ import {
 import { useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution } from '../tools/types';
-import { FONT_FAMILY } from '../tools/text';
-import { approvePlan, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge } from '../utils/bridge-client';
+import { approvePlan, fetchCapabilities, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge } from '../utils/bridge-client';
 import { resolveRegionToElement } from '../utils/dom';
+import { buildPageManifest } from '../utils/page-manifest';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { BridgeEventStack } from './BridgeStatusPanel';
 import { ThreadPanel } from './ThreadPanel';
 
-type DevToolsContextValue = {
+type PopmeltContextValue = {
   isEnabled: boolean;
 };
 
-const DevToolsContext = createContext<DevToolsContextValue | null>(null);
+const PopmeltContext = createContext<PopmeltContextValue | null>(null);
 
-type DevToolsProviderProps = PropsWithChildren<{
+type PopmeltProviderProps = PropsWithChildren<{
   enabled?: boolean;
   bridgeUrl?: string;
 }>;
@@ -37,6 +37,8 @@ type DevToolsProviderProps = PropsWithChildren<{
 const DEFAULT_BRIDGE_URL = 'http://localhost:1111';
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
+const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
+const ACTIVE_PLAN_STORAGE_KEY = 'devtools-active-plan';
 
 // Model definitions per provider
 const CLAUDE_MODELS = [
@@ -58,76 +60,11 @@ function equivalentModelIndex(fromProvider: string, toProvider: string, currentI
   return Math.min(currentIndex, toModels.length - 1);
 }
 
-function PlanApprovalBar({ taskCount, onApprove, onDismiss }: {
-  taskCount: number;
-  onApprove: () => void;
-  onDismiss: () => void;
-}) {
-  return (
-    <div
-      data-devtools="plan-approval-bar"
-      style={{
-        position: 'fixed',
-        bottom: 72,
-        left: '50%',
-        transform: 'translateX(-50%)',
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '8px 16px',
-        backgroundColor: '#ffffff',
-        border: '1px solid rgba(0, 0, 0, 0.1)',
-        zIndex: 10001,
-        fontFamily: FONT_FAMILY,
-        fontSize: 12,
-        color: '#1f2937',
-      }}
-    >
-      <span style={{ fontWeight: 600 }}>
-        {taskCount} task{taskCount !== 1 ? 's' : ''} planned
-      </span>
-      <span style={{ color: '#6b7280' }}>
-        Review annotations, then approve to start workers
-      </span>
-      <button
-        onClick={onApprove}
-        style={{
-          padding: '4px 14px',
-          fontSize: 11,
-          fontWeight: 600,
-          fontFamily: FONT_FAMILY,
-          backgroundColor: '#1f2937',
-          color: '#ffffff',
-          border: 'none',
-          cursor: 'pointer',
-        }}
-      >
-        Approve
-      </button>
-      <button
-        onClick={onDismiss}
-        style={{
-          padding: '4px 14px',
-          fontSize: 11,
-          fontWeight: 600,
-          fontFamily: FONT_FAMILY,
-          backgroundColor: 'transparent',
-          color: '#6b7280',
-          border: '1px solid rgba(0, 0, 0, 0.1)',
-          cursor: 'pointer',
-        }}
-      >
-        Dismiss
-      </button>
-    </div>
-  );
-}
-
-export function DevToolsProvider({
+export function PopmeltProvider({
   children,
   enabled = process.env.NODE_ENV === 'development',
   bridgeUrl = DEFAULT_BRIDGE_URL,
-}: DevToolsProviderProps) {
+}: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
   const bridge = useBridgeConnection(bridgeUrl);
   const [provider, setProvider] = useState<string>(() => {
@@ -139,6 +76,32 @@ export function DevToolsProvider({
     const saved = localStorage.getItem(MODEL_STORAGE_KEY);
     return saved ? parseInt(saved, 10) || 0 : 0;
   });
+
+  // Available providers (detected from bridge capabilities)
+  const [availableProviders, setAvailableProviders] = useState<string[]>(['claude', 'codex']);
+
+  // Fetch capabilities when bridge connects
+  useEffect(() => {
+    if (!bridge.isConnected) return;
+    fetchCapabilities(bridgeUrl).then(caps => {
+      if (!caps) return;
+      const available = Object.entries(caps.providers)
+        .filter(([, v]) => v.available)
+        .map(([k]) => k);
+      if (available.length > 0) {
+        setAvailableProviders(available);
+      }
+    });
+  }, [bridge.isConnected, bridgeUrl]);
+
+  // Auto-switch provider if current one isn't available
+  useEffect(() => {
+    if (availableProviders.length > 0 && !availableProviders.includes(provider)) {
+      const fallback = availableProviders[0]!;
+      setProvider(fallback);
+      localStorage.setItem(PROVIDER_STORAGE_KEY, fallback);
+    }
+  }, [availableProviders, provider]);
 
   const models = provider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
   const currentModel = models[modelIndex] ?? models[0]!;
@@ -158,7 +121,10 @@ export function DevToolsProvider({
     localStorage.setItem(MODEL_STORAGE_KEY, String(newIndex));
   }, []);
   // Thread panel state (declared early so callbacks can reference setOpenThreadId)
-  const [openThreadId, setOpenThreadId] = useState<string | null>(null);
+  const [openThreadId, setOpenThreadId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(THREAD_ID_STORAGE_KEY) || null;
+  });
 
   // Active plan state
   const [activePlan, setActivePlan] = useState<{
@@ -167,15 +133,69 @@ export function DevToolsProvider({
     goal: string;
     tasks?: PendingPlan['tasks'];
     status: 'planning' | 'awaiting_approval' | 'executing' | 'reviewing' | 'done';
-  } | null>(null);
+  } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      const saved = localStorage.getItem(ACTIVE_PLAN_STORAGE_KEY);
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
+
+  // Persist openThreadId and activePlan to localStorage
+  useEffect(() => {
+    if (openThreadId) {
+      localStorage.setItem(THREAD_ID_STORAGE_KEY, openThreadId);
+    } else {
+      localStorage.removeItem(THREAD_ID_STORAGE_KEY);
+    }
+  }, [openThreadId]);
+
+  useEffect(() => {
+    if (activePlan) {
+      localStorage.setItem(ACTIVE_PLAN_STORAGE_KEY, JSON.stringify(activePlan));
+    } else {
+      localStorage.removeItem(ACTIVE_PLAN_STORAGE_KEY);
+    }
+  }, [activePlan]);
 
   // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors, color, threadId }
-  const [inFlightJobs, setInFlightJobs] = useState<Map<string, { annotationIds: Set<string>; styleSelectors: Set<string>; color: string; threadId?: string; planId?: string }>>(new Map());
+  const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string; planId?: string }>>({});
+
+  // Recovery: annotations hydrate from localStorage via PASTE_ANNOTATIONS (after mount).
+  // Any annotation stuck in 'in_flight' with no matching active job is a ghost — reset it.
+  // Also clear stale activePlan (planning/executing with no backing job).
+  const didRecoverRef = useRef(false);
+  useEffect(() => {
+    if (didRecoverRef.current) return;
+    if (state.annotations.length === 0) return; // not hydrated yet
+    didRecoverRef.current = true;
+    const activeJobAnnotationIds = new Set<string>();
+    for (const job of Object.values(inFlightJobs)) {
+      for (const id of job.annotationIds) activeJobAnnotationIds.add(id);
+    }
+    const stuckIds = state.annotations
+      .filter(a => {
+        if (activeJobAnnotationIds.has(a.id)) return false;
+        // In-flight with no job → ghost
+        if (a.status === 'in_flight') return true;
+        // Submitted (captured/threaded) but stuck at pending → prior buggy recovery
+        if ((a.status === 'pending' || !a.status) && (a.captured || a.threadId)) return true;
+        return false;
+      })
+      .map(a => a.id);
+    if (stuckIds.length > 0) {
+      dispatch({ type: 'SET_ANNOTATION_STATUS', payload: { ids: stuckIds, status: 'dismissed' } });
+    }
+    // Clear activePlan if it's in a transient state with no backing job
+    if (activePlan && (activePlan.status === 'planning' || activePlan.status === 'executing' || activePlan.status === 'reviewing') && Object.keys(inFlightJobs).length === 0) {
+      setActivePlan(null);
+    }
+  }, [state.annotations, inFlightJobs, dispatch, activePlan]);
 
   // Flatten all in-flight annotation IDs and style selectors for the canvas
   const inFlightAnnotationIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const job of inFlightJobs.values()) {
+    for (const job of Object.values(inFlightJobs)) {
       for (const id of job.annotationIds) ids.add(id);
     }
     return ids;
@@ -183,7 +203,7 @@ export function DevToolsProvider({
 
   const inFlightStyleSelectors = useMemo(() => {
     const selectors = new Set<string>();
-    for (const job of inFlightJobs.values()) {
+    for (const job of Object.values(inFlightJobs)) {
       for (const sel of job.styleSelectors) selectors.add(sel);
     }
     return selectors;
@@ -193,7 +213,7 @@ export function DevToolsProvider({
   // Includes both style modification selectors and linked annotation selectors
   const inFlightSelectorColors = useMemo(() => {
     const map = new Map<string, string>();
-    for (const job of inFlightJobs.values()) {
+    for (const job of Object.values(inFlightJobs)) {
       // Style modification selectors
       for (const sel of job.styleSelectors) {
         map.set(sel, job.color);
@@ -234,7 +254,7 @@ export function DevToolsProvider({
       // Skip orphan cleanup entirely while any jobs are in-flight.
       // HMR from Claude's edits temporarily removes DOM nodes, causing
       // false-positive orphan detection. Wait until all jobs finish.
-      if (inFlightJobsRef.current.size > 0) return;
+      if (Object.keys(inFlightJobsRef.current).length > 0) return;
 
       const annotations = annotationsRef.current;
       const styleModifications = styleModsRef.current;
@@ -296,31 +316,55 @@ export function DevToolsProvider({
 
   // Clear specific job's annotations when it completes or errors
   useEffect(() => {
-    if (bridge.lastCompletedJobId && inFlightJobs.has(bridge.lastCompletedJobId)) {
+    if (bridge.lastCompletedJobId && bridge.lastCompletedJobId in inFlightJobs) {
       setInFlightJobs((prev) => {
-        const next = new Map(prev);
-        next.delete(bridge.lastCompletedJobId!);
-        return next;
+        const { [bridge.lastCompletedJobId!]: _, ...rest } = prev;
+        return rest;
       });
     }
   }, [bridge.lastCompletedJobId]);
 
-  // Handle resolutions from done events
+  // Handle resolutions from done events (process ALL unprocessed, not just latest)
+  const processedDoneJobIdsRef = useRef(new Set<string>());
   useEffect(() => {
     const doneEvents = bridge.events.filter(e => e.type === 'done' && e.data.resolutions);
-    if (doneEvents.length === 0) return;
+    for (const event of doneEvents) {
+      const jobId = event.data.jobId as string;
+      if (processedDoneJobIdsRef.current.has(jobId)) continue;
+      processedDoneJobIdsRef.current.add(jobId);
 
-    const latestDone = doneEvents[doneEvents.length - 1];
-    if (latestDone && Array.isArray(latestDone.data.resolutions)) {
-      dispatch({
-        type: 'APPLY_RESOLUTIONS',
-        payload: {
-          resolutions: latestDone.data.resolutions as AnnotationResolution[],
-          threadId: latestDone.data.threadId as string | undefined,
-        },
-      });
+      if (Array.isArray(event.data.resolutions)) {
+        dispatch({
+          type: 'APPLY_RESOLUTIONS',
+          payload: {
+            resolutions: event.data.resolutions as AnnotationResolution[],
+            threadId: event.data.threadId as string | undefined,
+          },
+        });
+      }
     }
   }, [bridge.events, dispatch]);
+
+  // Handle incremental resolutions from plan executor (task_resolved events)
+  const lastIncrementalCountRef = useRef(0);
+  useEffect(() => {
+    const resolutions = bridge.incrementalResolutions;
+    if (resolutions.length <= lastIncrementalCountRef.current) return;
+    const newResolutions = resolutions.slice(lastIncrementalCountRef.current);
+    lastIncrementalCountRef.current = resolutions.length;
+
+    dispatch({
+      type: 'APPLY_RESOLUTIONS',
+      payload: { resolutions: newResolutions },
+    });
+  }, [bridge.incrementalResolutions, dispatch]);
+
+  // Reset incremental counter when resolutions are cleared
+  useEffect(() => {
+    if (bridge.incrementalResolutions.length === 0) {
+      lastIncrementalCountRef.current = 0;
+    }
+  }, [bridge.incrementalResolutions.length]);
 
   // On reconnect to idle bridge, clear any stale in-flight state
   const prevBridgeStatus = useRef(bridge.status);
@@ -329,7 +373,7 @@ export function DevToolsProvider({
     prevBridgeStatus.current = bridge.status;
 
     if (prev === 'disconnected' && bridge.status === 'idle') {
-      setInFlightJobs(new Map());
+      setInFlightJobs({});
     }
   }, [bridge.status]);
 
@@ -350,8 +394,21 @@ export function DevToolsProvider({
   // Plan goal handler: captures full-page screenshot and sends to planner
   const handlePlanGoal = useCallback(async (goal: string): Promise<boolean> => {
     try {
-      const screenshotBlob = await captureFullPage(document.body);
+      // Collect triggering annotations for screenshot overlay and feedback context
+      const activeAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
+
+      const screenshotBlob = await captureFullPage(document.body, activeAnnotations);
       if (!screenshotBlob) return false;
+
+      const manifest = buildPageManifest();
+
+      // Include pending annotations, uncaptured style mods, and inspected element as context
+      const uncapturedStyleMods = state.styleModifications.filter(m => !m.captured);
+      const inspectedInfo = state.inspectedElement?.info;
+      const hasFeedback = activeAnnotations.length > 0 || uncapturedStyleMods.length > 0 || !!inspectedInfo;
+      const feedbackJson = hasFeedback
+        ? JSON.stringify(buildFeedbackData(activeAnnotations, uncapturedStyleMods, inspectedInfo))
+        : undefined;
 
       const { planId, threadId } = await sendPlanToBridge(
         screenshotBlob,
@@ -361,6 +418,8 @@ export function DevToolsProvider({
         currentModel.id,
         window.location.href,
         { width: window.innerWidth, height: window.innerHeight },
+        manifest,
+        feedbackJson,
       );
 
       setActivePlan({
@@ -370,35 +429,53 @@ export function DevToolsProvider({
         status: 'planning',
       });
 
+      // Tag pending text annotations with the plan's threadId so badges can find them
+      if (threadId) {
+        const pendingTextIds = state.annotations
+          .filter(a => a.type === 'text' && (a.status ?? 'pending') === 'pending')
+          .map(a => a.id);
+        if (pendingTextIds.length > 0) {
+          dispatch({ type: 'SET_ANNOTATION_THREAD', payload: { ids: pendingTextIds, threadId } });
+        }
+      }
+      dispatch({ type: 'MARK_CAPTURED' });
+
       // Open thread panel to show planner streaming
       if (threadId) setOpenThreadId(threadId);
 
       return true;
     } catch (err) {
-      console.error('[DevTools] Failed to send plan:', err);
+      console.error('[Pare] Failed to send plan:', err);
       return false;
     }
-  }, [bridgeUrl, provider, currentModel.id]);
+  }, [bridgeUrl, provider, currentModel.id, state.annotations, state.styleModifications, state.inspectedElement, dispatch]);
 
   // Materialize plan tasks as annotations on the canvas
   const materializePlan = useCallback(async (tasks: PendingPlan['tasks']) => {
     const planId = activePlan?.planId;
     if (!planId) return;
 
+    // Compute distinct hue per worker so each task gets a unique color
+    const baseHueMatch = state.activeColor.match(/oklch\([^)]*\s+([\d.]+)\s*\)/);
+    const baseHue = baseHueMatch?.[1] ? parseFloat(baseHueMatch[1]) : 29;
+    const hueStep = tasks.length > 1 ? 360 / tasks.length : 0;
+
     // Stagger annotation creation for visual effect
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i]!;
+      const taskHue = (baseHue + i * hueStep) % 360;
+      const taskColor = `oklch(0.628 0.258 ${Math.round(taskHue)})`;
 
-      // Scroll the region into view
+      // Scroll the region into view (instant to ensure position is correct for elementFromPoint)
       const regionCenterY = task.region.y + task.region.height / 2;
       const viewportH = window.innerHeight;
       if (regionCenterY < window.scrollY || regionCenterY > window.scrollY + viewportH) {
         window.scrollTo({
           top: Math.max(0, regionCenterY - viewportH / 2),
-          behavior: 'smooth',
+          behavior: 'instant',
         });
-        // Wait for scroll to settle
-        await new Promise(r => setTimeout(r, 300));
+        // Double rAF for paint settle
+        await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
       }
 
       // Resolve region to DOM element
@@ -423,7 +500,7 @@ export function DevToolsProvider({
           planTaskId: task.id,
           instruction: task.instruction,
           region,
-          color: state.activeColor,
+          color: taskColor,
           linkedSelector: resolved?.selector,
           elements: resolved ? [resolved.info] : undefined,
         },
@@ -465,15 +542,16 @@ export function DevToolsProvider({
       const { jobId, threadId: assignedThreadId } = await sendToBridge(stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id);
 
       // Track which annotations and style modifications are in-flight for this job
-      const sentAnnotationIds = new Set(activeAnnotations.map(a => a.id));
-      const sentStyleSelectors = new Set(
-        state.styleModifications.filter(m => !m.captured).map(m => m.selector)
-      );
-      setInFlightJobs((prev) => new Map(prev).set(jobId, {
-        annotationIds: sentAnnotationIds,
-        styleSelectors: sentStyleSelectors,
-        color: state.activeColor,
-        threadId: assignedThreadId,
+      const sentAnnotationIds = activeAnnotations.map(a => a.id);
+      const sentStyleSelectors = state.styleModifications.filter(m => !m.captured).map(m => m.selector);
+      setInFlightJobs((prev) => ({
+        ...prev,
+        [jobId]: {
+          annotationIds: sentAnnotationIds,
+          styleSelectors: sentStyleSelectors,
+          color: state.activeColor,
+          threadId: assignedThreadId,
+        },
       }));
 
       dispatch({ type: 'MARK_CAPTURED' });
@@ -486,7 +564,7 @@ export function DevToolsProvider({
 
       return true;
     } catch (err) {
-      console.error('[DevTools] Failed to send to bridge:', err);
+      console.error('[Pare] Failed to send to bridge:', err);
       return false;
     }
   }, [state.annotations, state.styleModifications, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
@@ -498,11 +576,14 @@ export function DevToolsProvider({
       const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id);
 
       // Track the new continuation job (no specific annotations — reuses thread context)
-      setInFlightJobs(prev => new Map(prev).set(jobId, {
-        annotationIds: new Set<string>(),
-        styleSelectors: new Set<string>(),
-        color: state.activeColor,
-        threadId,
+      setInFlightJobs(prev => ({
+        ...prev,
+        [jobId]: {
+          annotationIds: [],
+          styleSelectors: [],
+          color: state.activeColor,
+          threadId,
+        },
       }));
 
       // Transition thread annotations back to in_flight (from waiting_input, resolved, or needs_review)
@@ -516,21 +597,25 @@ export function DevToolsProvider({
         });
         // Re-track them as in-flight for the new job
         setInFlightJobs(prev => {
-          const job = prev.get(jobId);
-          if (job) {
-            for (const a of threadAnnotations) job.annotationIds.add(a.id);
-          }
-          return new Map(prev);
+          const job = prev[jobId];
+          if (!job) return prev;
+          return {
+            ...prev,
+            [jobId]: {
+              ...job,
+              annotationIds: [...job.annotationIds, ...threadAnnotations.map(a => a.id)],
+            },
+          };
         });
       }
 
       bridge.dismissQuestion(threadId);
     } catch (err) {
-      console.error('[DevTools] Failed to send reply:', err);
+      console.error('[Pare] Failed to send reply:', err);
     }
   }, [state.activeColor, state.annotations, bridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
 
-  // Handle plan approval: dispatch workers for each approved annotation
+  // Handle plan approval: single-session execution for all tasks
   const handleApprovePlan = useCallback(async () => {
     if (!activePlan || !activePlan.planId) return;
 
@@ -540,52 +625,87 @@ export function DevToolsProvider({
 
       setActivePlan(prev => prev ? { ...prev, status: 'executing' } : null);
 
+      // Capture ONE full-page screenshot
+      const screenshotBlob = await captureFullPage(document.body);
+      if (!screenshotBlob) return;
+
       // Collect plan annotations that are still pending (user may have deleted some)
       const planAnnotations = state.annotations.filter(
         a => a.planId === activePlan.planId && a.type !== 'text' && (a.status ?? 'pending') === 'pending'
       );
 
-      const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
-      if (!canvas) return;
+      // Build tasks array from plan annotations
+      const tasks = planAnnotations.map(ann => {
+        const textAnn = ann.groupId
+          ? state.annotations.find(a => a.groupId === ann.groupId && a.type === 'text')
+          : undefined;
+        // Extract region from rectangle points [topLeft, bottomRight]
+        const p0 = ann.points[0] ?? { x: 0, y: 0 };
+        const p1 = ann.points[1] ?? p0;
+        const x = Math.min(p0.x, p1.x);
+        const y = Math.min(p0.y, p1.y);
+        const width = Math.abs(p1.x - p0.x) || 100;
+        const height = Math.abs(p1.y - p0.y) || 100;
+        return {
+          planTaskId: ann.planTaskId || ann.id,
+          annotationId: ann.id,
+          instruction: textAnn?.text || ann.text || 'No instruction',
+          region: { x, y, width, height },
+          linkedSelector: ann.linkedSelector,
+          elements: ann.elements?.map(el => ({ selector: el.selector, reactComponent: el.reactComponent })),
+        };
+      });
 
-      // Send each annotation as a worker job
+      if (tasks.length === 0) return;
+
+      // Send single execution job
+      const { jobId } = await sendPlanExecution(
+        screenshotBlob,
+        activePlan.planId,
+        tasks,
+        bridgeUrl,
+        provider,
+        currentModel.id,
+      );
+
+      // Collect ALL plan annotation IDs (rect + text) for in-flight tracking
+      const allPlanAnnotationIds: string[] = [];
+      const seen = new Set<string>();
       for (const ann of planAnnotations) {
-        const blobs = await captureScreenshot(document.body, canvas, [ann]);
-        if (blobs.length === 0) continue;
-
-        const stitchedBlob = await stitchBlobs(blobs);
-        if (!stitchedBlob) continue;
-
-        const feedbackData = buildFeedbackData([ann], []);
-        const feedbackJson = JSON.stringify(feedbackData);
-        const hexColor = cssColorToHex(ann.color);
-
-        const { jobId, threadId: assignedThreadId } = await sendToBridge(
-          stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id
-        );
-
-        // Track in-flight
-        setInFlightJobs(prev => new Map(prev).set(jobId, {
-          annotationIds: new Set([ann.id]),
-          styleSelectors: new Set<string>(),
-          color: ann.color,
-          threadId: assignedThreadId,
-          planId: activePlan.planId,
-        }));
-
-        // Mark annotation as in-flight
-        dispatch({
-          type: 'SET_ANNOTATION_STATUS',
-          payload: { ids: [ann.id], status: 'in_flight' },
-        });
+        if (!seen.has(ann.id)) { seen.add(ann.id); allPlanAnnotationIds.push(ann.id); }
+        if (ann.groupId) {
+          for (const mate of state.annotations) {
+            if (mate.groupId === ann.groupId && !seen.has(mate.id)) {
+              seen.add(mate.id);
+              allPlanAnnotationIds.push(mate.id);
+            }
+          }
+        }
       }
+
+      // Track one in-flight entry with ALL plan annotation IDs
+      setInFlightJobs(prev => ({
+        ...prev,
+        [jobId]: {
+          annotationIds: allPlanAnnotationIds,
+          styleSelectors: [],
+          color: state.activeColor,
+          planId: activePlan.planId,
+        },
+      }));
+
+      // Mark all plan annotations (rect + text) as in_flight
+      dispatch({
+        type: 'SET_ANNOTATION_STATUS',
+        payload: { ids: allPlanAnnotationIds, status: 'in_flight' },
+      });
 
       dispatch({ type: 'MARK_CAPTURED' });
 
     } catch (err) {
-      console.error('[DevTools] Failed to approve plan:', err);
+      console.error('[Pare] Failed to approve plan:', err);
     }
-  }, [activePlan, state.annotations, bridgeUrl, provider, currentModel.id, dispatch]);
+  }, [activePlan, state.annotations, state.activeColor, bridgeUrl, provider, currentModel.id, dispatch]);
 
   const handleDismissPlan = useCallback(() => {
     setActivePlan(null);
@@ -605,18 +725,29 @@ export function DevToolsProvider({
       if (processedQuestionJobIdsRef.current.has(q.jobId)) continue;
       processedQuestionJobIdsRef.current.add(q.jobId);
 
-      if (q.annotationIds && q.annotationIds.length > 0) {
+      let targetIds = q.annotationIds && q.annotationIds.length > 0
+        ? q.annotationIds
+        : undefined;
+
+      // Fallback: find annotations by threadId (covers planner questions with no annotationIds)
+      if (!targetIds && q.threadId) {
+        targetIds = state.annotations
+          .filter(a => a.threadId === q.threadId)
+          .map(a => a.id);
+      }
+
+      if (targetIds && targetIds.length > 0) {
         dispatch({
           type: 'SET_ANNOTATION_QUESTION',
           payload: {
-            ids: q.annotationIds,
+            ids: targetIds,
             question: q.question,
             threadId: q.threadId,
           },
         });
       }
     }
-  }, [bridge.pendingQuestions, dispatch]);
+  }, [bridge.pendingQuestions, dispatch, state.annotations]);
 
   // Handle plan_ready events → trigger materialization (and auto-approve single-task plans)
   const processedPlanIdsRef = useRef(new Set<string>());
@@ -680,7 +811,7 @@ export function DevToolsProvider({
     if (reviewTriggeredRef.current.has(activePlan.planId)) return;
 
     // Check if any plan-related jobs are still in flight
-    const planJobs = Array.from(inFlightJobs.entries()).filter(([_, j]) => j.planId === activePlan.planId);
+    const planJobs = Object.entries(inFlightJobs).filter(([_, j]) => j.planId === activePlan.planId);
     if (planJobs.length > 0) return;
 
     // All workers done — check if there are any plan annotations with resolved/needs_review status
@@ -700,18 +831,18 @@ export function DevToolsProvider({
         if (!screenshotBlob) return;
         await sendPlanReview(activePlan.planId, screenshotBlob, bridgeUrl, provider, currentModel.id);
       } catch (err) {
-        console.error('[DevTools] Failed to trigger review:', err);
+        console.error('[Pare] Failed to trigger review:', err);
       }
     })();
   }, [activePlan, inFlightJobs, state.annotations, bridgeUrl, provider, currentModel.id]);
 
   // Compute the active job's annotation color for the toolbar spinner
   const activeJobColor = useMemo(() => {
-    if (bridge.activeJobId && inFlightJobs.has(bridge.activeJobId)) {
-      return inFlightJobs.get(bridge.activeJobId)!.color;
+    if (bridge.activeJobId && bridge.activeJobId in inFlightJobs) {
+      return inFlightJobs[bridge.activeJobId]!.color;
     }
-    const entries = Array.from(inFlightJobs.values());
-    return entries.length > 0 ? entries[entries.length - 1]!.color : undefined;
+    const values = Object.values(inFlightJobs);
+    return values.length > 0 ? values[values.length - 1]!.color : undefined;
   }, [bridge.activeJobId, inFlightJobs]);
 
   const handleViewThread = useCallback((threadId: string) => {
@@ -719,19 +850,14 @@ export function DevToolsProvider({
   }, []);
 
   // Find the active jobId for the open thread (for per-job streaming data)
-  // Falls back to any active job so the panel always shows current activity
+  // Only matches jobs belonging to this thread — no fallback to avoid cross-thread leaking
   const threadActiveJobId = useMemo(() => {
     if (!openThreadId) return null;
-    // Prefer the job matched to this thread
-    for (const [jobId, job] of inFlightJobs) {
+    for (const [jobId, job] of Object.entries(inFlightJobs)) {
       if (job.threadId === openThreadId) return jobId;
     }
-    // Fall back to any active job so tool activity still shows in the panel
-    if (bridge.activeJobIds.length > 0) {
-      return bridge.activeJobIds[bridge.activeJobIds.length - 1]!;
-    }
     return null;
-  }, [openThreadId, inFlightJobs, bridge.activeJobIds]);
+  }, [openThreadId, inFlightJobs]);
 
   // Event stream hover visibility (debounced to bridge gap between crosshair and stack)
   const [eventStreamVisible, setEventStreamVisible] = useState(false);
@@ -775,7 +901,7 @@ export function DevToolsProvider({
   }
 
   return (
-    <DevToolsContext.Provider value={contextValue}>
+    <PopmeltContext.Provider value={contextValue}>
       {children}
 
       <AnnotationCanvas
@@ -788,6 +914,7 @@ export function DevToolsProvider({
         onReply={bridge.isConnected ? handleReply : undefined}
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
         isThreadPanelOpen={openThreadId !== null}
+        activePlan={activePlan}
       />
 
       <AnnotationToolbar
@@ -796,12 +923,13 @@ export function DevToolsProvider({
         onScreenshot={handleScreenshot}
         onSendToClaude={bridge.isConnected ? handleSendToClaude : undefined}
         onPlanGoal={bridge.isConnected ? handlePlanGoal : undefined}
-        hasActiveJobs={inFlightJobs.size > 0 || bridge.activeJobIds.length > 0}
+        hasActiveJobs={Object.keys(inFlightJobs).length > 0 || bridge.activeJobIds.length > 0}
         activeJobColor={activeJobColor}
         onCrosshairHover={handleEventStreamHover}
         onClear={handleClearEventStream}
         provider={provider}
-        onProviderChange={bridge.isConnected ? handleProviderChange : undefined}
+        onProviderChange={bridge.isConnected && availableProviders.length > 1 ? handleProviderChange : undefined}
+        availableProviders={availableProviders}
         modelIndex={modelIndex}
         modelCount={models.length}
         modelLabel={currentModel.label}
@@ -810,15 +938,6 @@ export function DevToolsProvider({
         isThreadPanelOpen={openThreadId !== null}
         activePlan={activePlan}
       />
-
-      {/* Plan approval bar */}
-      {activePlan?.status === 'awaiting_approval' && (
-        <PlanApprovalBar
-          taskCount={activePlan.tasks?.length ?? 0}
-          onApprove={handleApprovePlan}
-          onDismiss={handleDismissPlan}
-        />
-      )}
 
       {openThreadId && bridge.isConnected && (
         <ThreadPanel
@@ -835,6 +954,8 @@ export function DevToolsProvider({
           planAnnotations={activePlan ? state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text') : undefined}
           inFlightJobs={inFlightJobs}
           onViewThread={handleViewThread}
+          onApprovePlan={activePlan?.status === 'awaiting_approval' ? handleApprovePlan : undefined}
+          onDismissPlan={activePlan?.status === 'awaiting_approval' ? handleDismissPlan : undefined}
         />
       )}
 
@@ -849,14 +970,14 @@ export function DevToolsProvider({
           onReply={handleReply}
         />
       )}
-    </DevToolsContext.Provider>
+    </PopmeltContext.Provider>
   );
 }
 
-export function useDevTools() {
-  const ctx = useContext(DevToolsContext);
+export function usePopmelt() {
+  const ctx = useContext(PopmeltContext);
   if (!ctx) {
-    throw new Error('useDevTools must be used within DevToolsProvider');
+    throw new Error('usePopmelt must be used within PopmeltProvider');
   }
   return ctx;
 }

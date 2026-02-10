@@ -15,11 +15,21 @@ export type SpawnOptions = {
   onEvent?: (event: SSEEvent, jobId: string) => void;
 };
 
+export type FileEdit = {
+  tool: 'Edit' | 'Write';
+  file_path: string;
+  old_string?: string;  // Edit tool: text that was replaced
+  new_string?: string;  // Edit tool: replacement text
+  replace_all?: boolean;
+  content?: string;     // Write tool: full file content written
+};
+
 export type SpawnResult = {
   sessionId?: string;
   text: string;
   success: boolean;
   error?: string;
+  fileEdits?: FileEdit[];
 };
 
 export function spawnClaude(
@@ -71,6 +81,7 @@ export function spawnClaude(
   const result = new Promise<SpawnResult>((resolve) => {
     let capturedSessionId: string | undefined;
     const textChunks: string[] = [];
+    const fileEdits: FileEdit[] = [];
     let hadError = false;
     let errorMessage = '';
 
@@ -115,6 +126,21 @@ export function spawnClaude(
             if (block.type === 'tool_use' && block.name) {
               const file = block.input?.file_path || block.input?.path || undefined;
               onEvent?.({ type: 'tool_use', jobId, tool: block.name, ...(file ? { file } : {}) }, jobId);
+              if (block.name === 'Edit' && block.input?.file_path) {
+                fileEdits.push({
+                  tool: 'Edit',
+                  file_path: block.input.file_path,
+                  old_string: block.input.old_string,
+                  new_string: block.input.new_string,
+                  replace_all: block.input.replace_all,
+                });
+              } else if (block.name === 'Write' && block.input?.file_path) {
+                fileEdits.push({
+                  tool: 'Write',
+                  file_path: block.input.file_path,
+                  content: block.input.content,
+                });
+              }
             }
             if (block.type === 'thinking' && block.thinking) {
               onEvent?.({ type: 'thinking', jobId, text: block.thinking }, jobId);
@@ -153,6 +179,7 @@ export function spawnClaude(
         text: textChunks.join(''),
         success: !hadError,
         error: hadError ? errorMessage : undefined,
+        fileEdits: fileEdits.length > 0 ? fileEdits : undefined,
       });
     });
 
@@ -164,6 +191,7 @@ export function spawnClaude(
         text: textChunks.join(''),
         success: false,
         error: errorMessage,
+        fileEdits: fileEdits.length > 0 ? fileEdits : undefined,
       });
     });
   });

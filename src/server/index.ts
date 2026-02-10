@@ -1,16 +1,16 @@
-import { createBridgeServer } from './bridge-server';
-import type { BridgeServerHandle, BridgeServerOptions } from './types';
+import { createPopmelt } from './bridge-server';
+import type { PopmeltHandle, PopmeltOptions } from './types';
 
-export type { BridgeServerHandle, BridgeServerOptions };
+export type { PopmeltHandle, PopmeltOptions };
 
-export async function startBridgeServer(
-  options?: BridgeServerOptions & { force?: boolean },
-): Promise<BridgeServerHandle> {
+export async function startPopmelt(
+  options?: PopmeltOptions & { force?: boolean },
+): Promise<PopmeltHandle> {
   if (process.env.NODE_ENV === 'production' && !options?.force) {
     throw new Error(
       '[Bridge] Refusing to start in production. Pass { force: true } to override.',
     );
   }
 
-  return createBridgeServer(options);
+  return createPopmelt(options);
 }

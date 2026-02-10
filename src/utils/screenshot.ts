@@ -32,10 +32,15 @@ export type FeedbackData = {
   scrollPosition: { x: number; y: number };
   annotations: AnnotationData[];
   styleModifications: StyleModification[];
+  inspectedElement?: ElementInfo;
 };
 
 // Build structured feedback data from annotations
-export function buildFeedbackData(annotations: Annotation[], styleModifications: StyleModification[] = []): FeedbackData {
+export function buildFeedbackData(
+  annotations: Annotation[],
+  styleModifications: StyleModification[] = [],
+  inspectedElement?: ElementInfo,
+): FeedbackData {
   // Group annotations by groupId to find linked text instructions
   const groupedAnnotations = new Map<string, Annotation[]>();
   const standaloneAnnotations: Annotation[] = [];
@@ -89,6 +94,7 @@ export function buildFeedbackData(annotations: Annotation[], styleModifications:
     scrollPosition: { x: window.scrollX, y: window.scrollY },
     annotations: annotationDataList,
     styleModifications,
+    ...(inspectedElement ? { inspectedElement } : {}),
   };
 }
 
@@ -468,9 +474,13 @@ export async function stitchBlobs(blobs: Blob[]): Promise<Blob | null> {
   });
 }
 
-/** Capture the full page (top to bottom) as a single stitched image, no annotation overlay. */
-export async function captureFullPage(targetElement: HTMLElement): Promise<Blob | null> {
-  const dpr = window.devicePixelRatio || 1;
+/** Capture the full page (top to bottom) as a single stitched image.
+ *  Optionally overlays annotations (e.g., the triggering annotation for a plan). */
+export async function captureFullPage(targetElement: HTMLElement, annotations: Annotation[] = []): Promise<Blob | null> {
+  // Capture at 1x so image pixel coordinates = CSS pixel coordinates.
+  // The planner outputs region bounding boxes based on what it sees in the image,
+  // and we use those coordinates directly for elementFromPoint in CSS pixel space.
+  const dpr = 1;
   const viewportWidth = window.innerWidth;
   const viewportHeight = window.innerHeight;
   const pageHeight = Math.max(
@@ -496,9 +506,18 @@ export async function captureFullPage(targetElement: HTMLElement): Promise<Blob 
       // Double rAF for paint settle
       await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 
+      // Filter annotations that overlap this viewport region
+      const regionTop = scrollY;
+      const regionBottom = scrollY + viewportHeight;
+      const regionAnnotations = annotations.filter(a => {
+        const bounds = getAnnotationBounds(a);
+        if (!bounds) return false;
+        return bounds.maxY >= regionTop && bounds.minY <= regionBottom;
+      });
+
       const blob = await captureSingleRegion(
         targetElement,
-        [], // no annotations
+        regionAnnotations,
         scrollY,
         viewportWidth,
         Math.min(viewportHeight, pageHeight - scrollY),

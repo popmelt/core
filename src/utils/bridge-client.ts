@@ -7,6 +7,22 @@ export type BridgeStatus = {
   queueDepth: number;
 };
 
+export type ProviderCapabilities = {
+  providers: Record<string, { available: boolean; path: string | null }>;
+};
+
+export async function fetchCapabilities(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<ProviderCapabilities | null> {
+  try {
+    const res = await fetch(`${bridgeUrl}/capabilities`);
+    if (!res.ok) return null;
+    return (await res.json()) as ProviderCapabilities;
+  } catch {
+    return null;
+  }
+}
+
 export async function checkBridgeHealth(
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<BridgeStatus | null> {
@@ -70,6 +86,8 @@ export async function sendPlanToBridge(
   model?: string,
   pageUrl?: string,
   viewport?: { width: number; height: number },
+  manifest?: import('../tools/types').ManifestEntry[],
+  feedbackJson?: string,
 ): Promise<{ planId: string; jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
@@ -78,6 +96,8 @@ export async function sendPlanToBridge(
   if (viewport) formData.append('viewport', JSON.stringify(viewport));
   if (provider) formData.append('provider', provider);
   if (model) formData.append('model', model);
+  if (manifest) formData.append('manifest', JSON.stringify(manifest));
+  if (feedbackJson) formData.append('feedback', feedbackJson);
 
   const res = await fetch(`${bridgeUrl}/plan`, {
     method: 'POST',
@@ -125,6 +145,41 @@ export async function sendPlanReview(
   if (model) formData.append('model', model);
 
   const res = await fetch(`${bridgeUrl}/plan/review`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+
+  return res.json();
+}
+
+export async function sendPlanExecution(
+  screenshotBlob: Blob,
+  planId: string,
+  tasks: Array<{
+    planTaskId: string;
+    annotationId: string;
+    instruction: string;
+    region: { x: number; y: number; width: number; height: number };
+    linkedSelector?: string;
+    elements?: Array<{ selector: string; reactComponent?: string }>;
+  }>,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  provider?: string,
+  model?: string,
+): Promise<{ jobId: string; planId: string; position: number }> {
+  const formData = new FormData();
+  formData.append('screenshot', screenshotBlob, 'screenshot.png');
+  formData.append('planId', planId);
+  formData.append('tasks', JSON.stringify(tasks));
+  if (provider) formData.append('provider', provider);
+  if (model) formData.append('model', model);
+
+  const res = await fetch(`${bridgeUrl}/plan/execute`, {
     method: 'POST',
     body: formData,
   });

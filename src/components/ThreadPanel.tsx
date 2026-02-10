@@ -1,209 +1,12 @@
 'use client';
 
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { BridgeEvent } from '../hooks/useBridgeConnection';
+import { POPMELT_BORDER } from '../styles/border';
 import { FONT_FAMILY, PADDING } from '../tools/text';
-
-// ---------------------------------------------------------------------------
-// Lightweight markdown → React renderer (zero dependencies)
-// Supports: headings, bold, italic, bold+italic, inline code, code blocks,
-//           links, unordered/ordered lists, tables, horizontal rules
-// ---------------------------------------------------------------------------
-
-const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
-
-/** Parse inline markdown (bold, italic, code, links) into React nodes */
-function parseInline(text: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  // Order matters — longer/greedier patterns first
-  const re = /(`[^`]+`)|(\*\*\*(.+?)\*\*\*)|(\*\*(.+?)\*\*)|(\*(.+?)\*)|(_([^_]+?)_)|(\[([^\]]+)\]\(([^)]+)\))/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = re.exec(text)) !== null) {
-    if (match.index > last) nodes.push(text.slice(last, match.index));
-    if (match[1]) {
-      // inline code
-      nodes.push(
-        <code key={match.index} style={{
-          fontFamily: MONO, fontSize: '0.9em',
-          backgroundColor: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 2,
-        }}>
-          {match[1].slice(1, -1)}
-        </code>,
-      );
-    } else if (match[3] !== undefined) {
-      // bold+italic ***…***
-      nodes.push(<strong key={match.index}><em>{match[3]}</em></strong>);
-    } else if (match[5] !== undefined) {
-      // bold **…**
-      nodes.push(<strong key={match.index}>{match[5]}</strong>);
-    } else if (match[7] !== undefined) {
-      // italic *…*
-      nodes.push(<em key={match.index}>{match[7]}</em>);
-    } else if (match[9] !== undefined) {
-      // italic _…_
-      nodes.push(<em key={match.index}>{match[9]}</em>);
-    } else if (match[11] !== undefined && match[12] !== undefined) {
-      // link [text](url)
-      nodes.push(
-        <a key={match.index} href={match[12]} target="_blank" rel="noopener noreferrer"
-          style={{ color: 'inherit', textDecoration: 'underline' }}>
-          {match[11]}
-        </a>,
-      );
-    }
-    last = match.index + match[0].length;
-  }
-
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
-}
-
-/** Render a full markdown string to React elements */
-function renderMarkdown(src: string): ReactNode {
-  const lines = src.split('\n');
-  const elements: ReactNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i]!;
-
-    // Fenced code block ```
-    if (line.trimStart().startsWith('```')) {
-      const codeLines: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i]!.trimStart().startsWith('```')) {
-        codeLines.push(lines[i]!);
-        i++;
-      }
-      i++; // skip closing ```
-      elements.push(
-        <pre key={elements.length} style={{
-          fontFamily: MONO, fontSize: '0.9em', lineHeight: 1.4,
-          backgroundColor: 'rgba(0,0,0,0.04)', padding: '6px 8px',
-          margin: '4px 0', overflowX: 'auto', whiteSpace: 'pre',
-        }}>
-          {codeLines.join('\n')}
-        </pre>,
-      );
-      continue;
-    }
-
-    // Horizontal rule
-    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
-      elements.push(<hr key={elements.length} style={{ border: 'none', borderTop: '1px solid rgba(0,0,0,0.1)', margin: '6px 0' }} />);
-      i++;
-      continue;
-    }
-
-    // Heading
-    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
-    if (headingMatch) {
-      const level = headingMatch[1]!.length;
-      const sizes: Record<number, number> = { 1: 16, 2: 14, 3: 13, 4: 12 };
-      elements.push(
-        <div key={elements.length} style={{
-          fontWeight: 700, fontSize: sizes[level] ?? 12,
-          margin: '8px 0 2px',
-        }}>
-          {parseInline(headingMatch[2]!)}
-        </div>,
-      );
-      i++;
-      continue;
-    }
-
-    // Table (| col | col |)
-    if (line.trimStart().startsWith('|') && line.trimEnd().endsWith('|')) {
-      const tableRows: string[] = [];
-      while (i < lines.length && lines[i]!.trimStart().startsWith('|') && lines[i]!.trimEnd().endsWith('|')) {
-        tableRows.push(lines[i]!);
-        i++;
-      }
-      // Filter out separator rows (|---|---|)
-      const isSeparator = (r: string) => /^\|[\s\-:|]+\|$/.test(r);
-      const dataRows = tableRows.filter(r => !isSeparator(r));
-      const parseCells = (r: string) => r.split('|').slice(1, -1).map(c => c.trim());
-
-      elements.push(
-        <table key={elements.length} style={{
-          borderCollapse: 'collapse', margin: '4px 0', fontSize: '0.95em', width: '100%',
-        }}>
-          <tbody>
-            {dataRows.map((row, ri) => (
-              <tr key={ri}>
-                {parseCells(row).map((cell, ci) => {
-                  const Tag = ri === 0 ? 'th' : 'td';
-                  return (
-                    <Tag key={ci} style={{
-                      border: '1px solid rgba(0,0,0,0.1)',
-                      padding: '3px 6px',
-                      textAlign: 'left',
-                      fontWeight: ri === 0 ? 600 : 400,
-                    }}>
-                      {parseInline(cell)}
-                    </Tag>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>,
-      );
-      continue;
-    }
-
-    // Unordered list (- or *)
-    const ulMatch = line.match(/^(\s*)([-*])\s+(.+)/);
-    if (ulMatch) {
-      const items: ReactNode[] = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i]!)) {
-        const m = lines[i]!.match(/^\s*[-*]\s+(.+)/);
-        if (m) items.push(<li key={items.length}>{parseInline(m[1]!)}</li>);
-        i++;
-      }
-      elements.push(
-        <ul key={elements.length} style={{ margin: '2px 0', paddingLeft: 20 }}>{items}</ul>,
-      );
-      continue;
-    }
-
-    // Ordered list (1. 2. etc)
-    const olMatch = line.match(/^(\s*)\d+\.\s+(.+)/);
-    if (olMatch) {
-      const items: ReactNode[] = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]!)) {
-        const m = lines[i]!.match(/^\s*\d+\.\s+(.+)/);
-        if (m) items.push(<li key={items.length}>{parseInline(m[1]!)}</li>);
-        i++;
-      }
-      elements.push(
-        <ol key={elements.length} style={{ margin: '2px 0', paddingLeft: 20 }}>{items}</ol>,
-      );
-      continue;
-    }
-
-    // Blank line → spacer
-    if (line.trim() === '') {
-      elements.push(<div key={elements.length} style={{ height: 4 }} />);
-      i++;
-      continue;
-    }
-
-    // Regular paragraph
-    elements.push(
-      <div key={elements.length} style={{ margin: '2px 0' }}>
-        {parseInline(line)}
-      </div>,
-    );
-    i++;
-  }
-
-  return <>{elements}</>;
-}
+import { renderMarkdown } from '../utils/threadMarkdown';
 
 type ThreadMessage = {
   role: 'human' | 'assistant';
@@ -236,8 +39,10 @@ type ThreadPanelProps = {
   onReply?: (threadId: string, reply: string) => void;
   activePlan?: { planId: string; status: string; goal: string; tasks?: { id: string; instruction: string }[] } | null;
   planAnnotations?: PlanAnnotation[];
-  inFlightJobs?: Map<string, { annotationIds: Set<string>; threadId?: string }>;
+  inFlightJobs?: Record<string, { annotationIds: string[]; threadId?: string }>;
   onViewThread?: (threadId: string) => void;
+  onApprovePlan?: () => void;
+  onDismissPlan?: () => void;
 };
 
 // Match the toolbar's 16px inset, leave room for the 48px toolbar + gap at bottom
@@ -245,10 +50,11 @@ const panelStyle: CSSProperties = {
   position: 'fixed',
   top: 16,
   right: 16,
-  bottom: 72, // 16px inset + 48px toolbar + 8px gap
+  bottom: 88, // 16px inset + 56px toolbar (48 + 4px border x2) + 16px gap
   width: 400,
   backgroundColor: '#ffffff',
-  border: '1px solid rgba(0, 0, 0, 0.1)',
+  ...POPMELT_BORDER,
+  boxSizing: 'content-box',
   zIndex: 10000,
   display: 'flex',
   flexDirection: 'column',
@@ -298,6 +104,8 @@ function stripInternalTags(text: string): string {
   return text
     .replace(/<resolution>[\s\S]*?<\/resolution>/g, '')
     .replace(/<question>[\s\S]*?<\/question>/g, '')
+    .replace(/<plan>[\s\S]*?<\/plan>/g, '')
+    .replace(/<review>[\s\S]*?<\/review>/g, '')
     .trim();
 }
 
@@ -314,14 +122,11 @@ const THINKING_WORDS = [
 const WORD_INTERVAL = 3000;
 const CROSSHAIR_INTERVAL = 250;
 
-/** Claude sparkle icon */
+/** Claude logo icon */
 function ClaudeIcon({ size = 14 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
-      <path
-        d="M16.546 8.154L12.462 19.788C12.346 20.124 12.106 20.292 11.742 20.292C11.378 20.292 11.138 20.124 11.022 19.788L6.954 8.154C6.906 8.01 6.882 7.89 6.882 7.794C6.882 7.458 7.05 7.266 7.386 7.218L8.178 7.098C8.514 7.05 8.73 7.194 8.826 7.53L11.742 16.578L14.682 7.53C14.778 7.194 14.994 7.05 15.33 7.098L16.122 7.218C16.458 7.266 16.626 7.458 16.626 7.794C16.626 7.89 16.594 8.01 16.546 8.154Z"
-        fill="#6b7280"
-      />
+    <svg width={size} height={size} viewBox="0 0 1200 1200" fill="#6b7280" stroke="none" style={{ flexShrink: 0 }}>
+      <path d="M 233.959793 800.214905 L 468.644287 668.536987 L 472.590637 657.100647 L 468.644287 650.738403 L 457.208069 650.738403 L 417.986633 648.322144 L 283.892639 644.69812 L 167.597321 639.865845 L 54.926208 633.825623 L 26.577238 627.785339 L 3.3e-05 592.751709 L 2.73832 575.27533 L 26.577238 559.248352 L 60.724873 562.228149 L 136.187973 567.382629 L 249.422867 575.194763 L 331.570496 580.026978 L 453.261841 592.671082 L 472.590637 592.671082 L 475.328857 584.859009 L 468.724915 580.026978 L 463.570557 575.194763 L 346.389313 495.785217 L 219.543671 411.865906 L 153.100723 363.543762 L 117.181267 339.060425 L 99.060455 316.107361 L 91.248367 266.01355 L 123.865784 230.093994 L 167.677887 233.073853 L 178.872513 236.053772 L 223.248367 270.201477 L 318.040283 343.570496 L 441.825592 434.738342 L 459.946411 449.798706 L 467.194672 444.64447 L 468.080597 441.020203 L 459.946411 427.409485 L 392.617493 305.718323 L 320.778564 181.932983 L 288.80542 130.630859 L 280.348999 99.865845 C 277.369171 87.221436 275.194641 76.590698 275.194641 63.624268 L 312.322174 13.20813 L 332.8591 6.604126 L 382.389313 13.20813 L 403.248352 31.328979 L 434.013519 101.71814 L 483.865753 212.537048 L 561.181274 363.221497 L 583.812134 407.919434 L 595.892639 449.315491 L 600.40271 461.959839 L 608.214783 461.959839 L 608.214783 454.711609 L 614.577271 369.825623 L 626.335632 265.61084 L 637.771851 131.516846 L 641.718201 93.745117 L 660.402832 48.483276 L 697.530334 24.000122 L 726.52356 37.852417 L 750.362549 72 L 747.060486 94.067139 L 732.886047 186.201416 L 705.100708 330.52356 L 686.979919 427.167847 L 697.530334 427.167847 L 709.61084 415.087341 L 758.496704 350.174561 L 840.644348 247.490051 L 876.885925 206.738342 L 919.167847 161.71814 L 946.308838 140.29541 L 997.61084 140.29541 L 1035.38269 196.429626 L 1018.469849 254.416199 L 965.637634 321.422852 L 921.825562 378.201538 L 859.006714 462.765259 L 819.785278 530.41626 L 823.409424 535.812073 L 832.75177 534.92627 L 974.657776 504.724915 L 1051.328979 490.872559 L 1142.818848 475.167786 L 1184.214844 494.496582 L 1188.724854 514.147644 L 1172.456421 554.335693 L 1074.604126 578.496765 L 959.838989 601.449829 L 788.939636 641.879272 L 786.845764 643.409485 L 789.261841 646.389343 L 866.255127 653.637634 L 899.194702 655.409424 L 979.812134 655.409424 L 1129.932861 666.604187 L 1169.154419 692.537109 L 1192.671265 724.268677 L 1188.724854 748.429688 L 1128.322144 779.194641 L 1046.818848 759.865845 L 856.590759 714.604126 L 791.355774 698.335754 L 782.335693 698.335754 L 782.335693 703.731567 L 836.69812 756.885986 L 936.322205 846.845581 L 1061.073975 962.81897 L 1067.436279 991.490112 L 1051.409424 1014.120911 L 1034.496704 1011.704712 L 924.885986 929.234924 L 882.604126 892.107544 L 786.845764 811.48999 L 780.483276 811.48999 L 780.483276 819.946289 L 802.550415 852.241699 L 919.087341 1027.409424 L 925.127625 1081.127686 L 916.671204 1098.604126 L 886.469849 1109.154419 L 853.288696 1103.114136 L 785.073914 1007.355835 L 714.684631 899.516785 L 657.906067 802.872498 L 650.979858 806.81897 L 617.476624 1167.704834 L 601.771851 1186.147705 L 565.530212 1200 L 535.328857 1177.046997 L 519.302124 1139.919556 L 535.328857 1066.550537 L 554.657776 970.792053 L 570.362488 894.68457 L 584.536926 800.134277 L 592.993347 768.724976 L 592.429626 766.630859 L 585.503479 767.516968 L 514.22821 865.369263 L 405.825531 1011.865906 L 320.053711 1103.677979 L 299.516815 1111.812256 L 263.919525 1093.369263 L 267.221497 1060.429688 L 287.114136 1031.114136 L 405.825531 880.107361 L 477.422913 786.52356 L 523.651062 732.483276 L 523.328918 724.671265 L 520.590698 724.671265 L 205.288605 929.395935 L 149.154434 936.644409 L 124.993355 914.01355 L 127.973183 876.885986 L 139.409409 864.80542 L 234.201385 799.570435 L 233.879227 799.8927 Z" />
     </svg>
   );
 }
@@ -398,6 +203,8 @@ export function ThreadPanel({
   planAnnotations,
   inFlightJobs,
   onViewThread,
+  onApprovePlan,
+  onDismissPlan,
 }: ThreadPanelProps) {
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -474,14 +281,6 @@ export function ThreadPanel({
   const thinkingText = streamingThinking || '';
   const responseText = streamingResponse ? stripInternalTags(streamingResponse) : '';
 
-  const cornerDotStyle: CSSProperties = {
-    position: 'absolute',
-    width: 2,
-    height: 2,
-    backgroundColor: 'rgba(0, 0, 0, 0.25)',
-    pointerEvents: 'none',
-  };
-
   return (
     <>
     {/* Invisible backdrop to catch clicks outside the panel */}
@@ -499,12 +298,6 @@ export function ThreadPanel({
       style={panelStyle}
       data-devtools="thread-panel"
     >
-      {/* Corner dots */}
-      <div style={{ ...cornerDotStyle, top: -1, left: -1 }} />
-      <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
-      <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
-      <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
-
       {/* Header */}
       <div style={{ ...baseHeaderStyle, backgroundColor: accentColor, color: '#ffffff' }}>
         <span>Conversation</span>
@@ -545,9 +338,12 @@ export function ThreadPanel({
           const isHuman = msg.role === 'human';
           const text = isHuman
             ? (msg.replyToQuestion || msg.feedbackSummary || '(annotation)')
-            : stripInternalTags(msg.responseText || msg.question || '');
+            : stripInternalTags(msg.responseText || '');
 
-          if (!text) return null;
+          // Show the question field separately (it's stripped from responseText by stripInternalTags)
+          const questionText = !isHuman ? msg.question : undefined;
+
+          if (!text && !questionText) return null;
 
           const isLatest = i === messages.length - 1;
 
@@ -578,12 +374,23 @@ export function ThreadPanel({
                   {formatTimestamp(msg.timestamp)}
                 </span>
               </div>
-              <div style={{
-                lineHeight: 1.5,
-                wordBreak: 'break-word',
-              }}>
-                {isHuman ? text : renderMarkdown(text)}
-              </div>
+              {text && (
+                <div style={{
+                  lineHeight: 1.5,
+                  wordBreak: 'break-word',
+                }}>
+                  {isHuman ? text : renderMarkdown(text)}
+                </div>
+              )}
+              {questionText && (
+                <div style={{
+                  marginTop: text ? 4 : 0,
+                  lineHeight: 1.5,
+                  wordBreak: 'break-word',
+                }}>
+                  {renderMarkdown(questionText)}
+                </div>
+              )}
             </div>
           );
         })}
@@ -596,7 +403,7 @@ export function ThreadPanel({
             </div>
             {planAnnotations.map((ann) => {
               const task = activePlan.tasks?.find(t => t.id === ann.planTaskId);
-              const isInFlight = inFlightJobs && Array.from(inFlightJobs.values()).some(j => j.annotationIds.has(ann.id));
+              const isInFlight = inFlightJobs && Object.values(inFlightJobs).some(j => j.annotationIds.includes(ann.id));
               const statusLabel = isInFlight ? 'running' : (ann.status ?? 'pending');
               const statusColor = statusLabel === 'resolved' ? '#10b981'
                 : statusLabel === 'running' ? ann.color
@@ -632,6 +439,50 @@ export function ThreadPanel({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Plan approval — inline after the task list */}
+        {activePlan?.status === 'awaiting_approval' && onApprovePlan && onDismissPlan && (
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid rgba(0, 0, 0, 0.04)' }}>
+            <div style={{ fontWeight: 600, fontSize: 12 }}>
+              {planAnnotations?.length ?? 0} task{(planAnnotations?.length ?? 0) !== 1 ? 's' : ''} planned
+            </div>
+            <div style={{ color: '#6b7280', fontSize: 11, marginTop: 2, marginBottom: 8 }}>
+              Review annotations, then approve to start workers
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                onClick={onApprovePlan}
+                style={{
+                  padding: '5px 14px',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  fontFamily: FONT_FAMILY,
+                  backgroundColor: '#1f2937',
+                  color: '#ffffff',
+                  border: 'none',
+                  cursor: 'pointer',
+                }}
+              >
+                Approve
+              </button>
+              <button
+                onClick={onDismissPlan}
+                style={{
+                  padding: '5px 14px',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  fontFamily: FONT_FAMILY,
+                  backgroundColor: 'transparent',
+                  color: '#6b7280',
+                  border: '1px solid rgba(0, 0, 0, 0.1)',
+                  cursor: 'pointer',
+                }}
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
 
