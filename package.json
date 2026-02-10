@@ -52,7 +52,6 @@
   },
   "files": [
     "dist",
-    "src/assets",
     "LICENSE",
     "README.md"
   ],
