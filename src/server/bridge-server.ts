@@ -132,7 +132,7 @@ export async function createPopmelt(
         + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.';
     } else if (resumeSessionId) {
       // Resuming with new annotations: send the new feedback context
-      prompt = formatFeedbackContext(job.feedback)
+      prompt = formatFeedbackContext(job.feedback, job.imagePaths)
         + "\n\nFollow the developer's instructions. If they ask for changes, apply them to the source files."
         + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.'
         + (provider !== 'codex' ? `\n\nIMPORTANT: First, use the Read tool to view the updated screenshot at: ${job.screenshotPath}` : '');
@@ -145,6 +145,7 @@ export async function createPopmelt(
       prompt = replyPrompt ?? buildPrompt(job.screenshotPath, job.feedback, {
         threadHistory: threadHistory && threadHistory.length > 0 ? threadHistory : undefined,
         provider,
+        imagePaths: job.imagePaths,
       });
     }
 
@@ -227,6 +228,11 @@ export async function createPopmelt(
         }
       }
 
+      // Derive toolsUsed from file edits for the thread record
+      const toolsUsed = spawnResult.fileEdits && spawnResult.fileEdits.length > 0
+        ? spawnResult.fileEdits.map(e => `${e.tool} ${e.file_path.split('/').pop()}`)
+        : undefined;
+
       // Append assistant message to thread store
       if (job.threadId) {
         await threadStore.appendMessage(job.threadId, {
@@ -237,6 +243,7 @@ export async function createPopmelt(
           resolutions: resolutions.length > 0 ? resolutions : undefined,
           question: question ?? undefined,
           sessionId: spawnResult.sessionId,
+          toolsUsed,
         });
       }
 
@@ -357,7 +364,7 @@ export async function createPopmelt(
   });
 
   async function handleSend(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr, pastedImages } = await parseMultipart(req);
 
     let feedback: FeedbackPayload;
     try {
@@ -371,6 +378,17 @@ export async function createPopmelt(
     const jobId = randomUUID().slice(0, 8);
     const screenshotPath = join(tempDir, `screenshot-${jobId}.png`);
     await writeFile(screenshotPath, screenshot);
+
+    // Write pasted images to temp dir
+    const imagePaths: Record<string, string[]> = {};
+    if (pastedImages.length > 0) {
+      for (const img of pastedImages) {
+        const imgPath = join(tempDir, `pasted-${jobId}-${img.annotationId}-${img.index}.png`);
+        await writeFile(imgPath, img.data);
+        if (!imagePaths[img.annotationId]) imagePaths[img.annotationId] = [];
+        imagePaths[img.annotationId]!.push(imgPath);
+      }
+    }
 
     // Extract linkedSelector values for thread matching
     const linkedSelectors = feedback.annotations
@@ -404,6 +422,7 @@ export async function createPopmelt(
       annotationIds,
       provider: (providerStr === 'claude' || providerStr === 'codex') ? providerStr : undefined,
       model: modelStr || undefined,
+      ...(Object.keys(imagePaths).length > 0 ? { imagePaths } : {}),
     };
 
     // Append human message to thread
@@ -411,7 +430,7 @@ export async function createPopmelt(
       const feedbackSummary = feedback.annotations
         .map(a => a.instruction || `[${a.type}]`)
         .join('; ');
-      const feedbackContext = formatFeedbackContext(feedback);
+      const feedbackContext = formatFeedbackContext(feedback, Object.keys(imagePaths).length > 0 ? imagePaths : undefined);
 
       await threadStore.appendMessage(threadId, {
         role: 'human',
@@ -430,22 +449,51 @@ export async function createPopmelt(
   }
 
   async function handleReply(req: IncomingMessage, res: ServerResponse) {
-    // Read JSON body
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-    }
-    const body = Buffer.concat(chunks).toString('utf-8');
+    const contentType = req.headers['content-type'] || '';
+    let threadId: string | undefined;
+    let reply: string | undefined;
+    let color: string | undefined;
+    let providerStr: string | undefined;
+    let modelStr: string | undefined;
+    let replyImageBuffers: Buffer[] = [];
 
-    let parsed: { threadId?: string; reply?: string; color?: string; provider?: string; model?: string };
-    try {
-      parsed = JSON.parse(body);
-    } catch {
-      sendJson(res, 400, { error: 'Invalid JSON' });
-      return;
+    if (contentType.includes('multipart/form-data')) {
+      // Multipart: reply with attached images
+      const parsed = await parseMultipart(req);
+      // The "screenshot" field carries the first image; additional images are in pastedImages
+      // But for replies we repurpose: "feedback" = JSON with threadId/reply/etc, images = reply-image-*
+      const meta = parsed.feedback ? JSON.parse(parsed.feedback) : {};
+      threadId = meta.threadId;
+      reply = meta.reply;
+      color = meta.color;
+      providerStr = meta.provider;
+      modelStr = meta.model;
+      // Collect images: the main "screenshot" field is reused as first image if present and non-empty
+      // pastedImages carry reply-image-{index} fields
+      for (const img of parsed.pastedImages) {
+        replyImageBuffers.push(img.data);
+      }
+    } else {
+      // JSON: reply without images (original path)
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      }
+      const body = Buffer.concat(chunks).toString('utf-8');
+      let parsed: { threadId?: string; reply?: string; color?: string; provider?: string; model?: string };
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        sendJson(res, 400, { error: 'Invalid JSON' });
+        return;
+      }
+      threadId = parsed.threadId;
+      reply = parsed.reply;
+      color = parsed.color;
+      providerStr = parsed.provider;
+      modelStr = parsed.model;
     }
 
-    const { threadId, reply, color, provider: providerStr, model: modelStr } = parsed;
     if (!threadId || !reply) {
       sendJson(res, 400, { error: 'Missing threadId or reply' });
       return;
@@ -459,6 +507,14 @@ export async function createPopmelt(
     }
 
     const jobId = randomUUID().slice(0, 8);
+
+    // Write reply images to temp dir
+    const replyImagePaths: string[] = [];
+    for (let i = 0; i < replyImageBuffers.length; i++) {
+      const imgPath = join(tempDir, `reply-${jobId}-${i}.png`);
+      await writeFile(imgPath, replyImageBuffers[i]!);
+      replyImagePaths.push(imgPath);
+    }
 
     // Use last screenshot from thread history
     let screenshotPath = '';
@@ -501,7 +557,10 @@ export async function createPopmelt(
 
     // Build reply prompt
     const replyProvider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : undefined;
-    const prompt = buildReplyPrompt(screenshotPath, history, replyProvider);
+    const prompt = buildReplyPrompt(
+      screenshotPath, history, replyProvider,
+      replyImagePaths.length > 0 ? replyImagePaths : undefined,
+    );
 
     // Create a minimal job — no new screenshot or feedback needed
     const job: Job = {

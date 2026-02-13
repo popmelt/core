@@ -3,6 +3,7 @@
 import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { generateId } from '../hooks/useAnnotationState';
 import { useCanvasDrawing } from '../hooks/useCanvasDrawing';
 import { useModifierKeys } from '../hooks/useModifierKeys';
 import { useWheelZoom } from '../hooks/useWheelZoom';
@@ -46,9 +47,9 @@ type AnnotationCanvasProps = {
   inFlightAnnotationIds?: Set<string>;
   inFlightStyleSelectors?: Set<string>;
   inFlightSelectorColors?: Map<string, string>;
+  onAttachImages?: (annotationId: string, images: Blob[]) => void;
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
-  isThreadPanelOpen?: boolean;
   activePlan?: { planId: string; status: string; threadId?: string; tasks?: { id: string; instruction: string }[] } | null;
 };
 
@@ -63,6 +64,7 @@ type ActiveTextInput = {
   linkedSelector?: string; // CSS selector of linked DOM element
   linkedAnchor?: 'top-left' | 'bottom-left'; // Which corner to anchor to
   elements?: ElementInfo[]; // DOM elements for linked annotations
+  images?: Blob[]; // Pasted images (in-memory only, not serialized)
 };
 
 type HandleCorner = 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
@@ -90,7 +92,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onReply, onViewThread, isThreadPanelOpen, activePlan }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, activePlan }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeText, setActiveText] = useState<ActiveTextInput | null>(() => {
@@ -1061,26 +1063,41 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   const commitActiveText = useCallback(() => {
     if (!activeText) return;
 
-    if (activeText.text.trim()) {
-      // Has text - add or update
+    const imageCount = activeText.images?.length || 0;
+
+    if (activeText.text.trim() || imageCount > 0) {
+      // Has text or images - add or update
       if (activeText.isNew) {
+        const annotationId = generateId();
         dispatch({
           type: 'ADD_TEXT',
           payload: {
             point: activeText.point,
-            text: activeText.text,
+            text: activeText.text || (imageCount > 0 ? `[${imageCount} image${imageCount > 1 ? 's' : ''}]` : ''),
             fontSize: activeText.fontSize,
+            id: annotationId,
             groupId: activeText.groupId,
             linkedSelector: activeText.linkedSelector,
             linkedAnchor: activeText.linkedAnchor,
             elements: activeText.elements,
+            ...(imageCount > 0 ? { imageCount } : {}),
           },
         });
+        if (imageCount > 0 && activeText.images && onAttachImages) {
+          onAttachImages(annotationId, activeText.images);
+        }
       } else {
         dispatch({
           type: 'UPDATE_TEXT',
-          payload: { id: activeText.id, text: activeText.text },
+          payload: {
+            id: activeText.id,
+            text: activeText.text || (imageCount > 0 ? `[${imageCount} image${imageCount > 1 ? 's' : ''}]` : ''),
+            ...(imageCount > 0 ? { imageCount } : {}),
+          },
         });
+        if (imageCount > 0 && activeText.images && onAttachImages) {
+          onAttachImages(activeText.id, activeText.images);
+        }
       }
     } else if (!activeText.isNew) {
       // Empty text on existing annotation - delete it
@@ -1092,7 +1109,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     // Empty text on new annotation - just discard (don't add)
 
     setActiveText(null);
-  }, [activeText, dispatch]);
+  }, [activeText, dispatch, onAttachImages]);
 
   // --- Hand tool helpers ---
 
@@ -2401,6 +2418,27 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     // Shift+Enter allows newline (default textarea behavior)
   }, [commitActiveText]);
 
+  const handleTextPaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!activeText) return;
+    const items = e.clipboardData.items;
+    const imageBlobs: Blob[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      if (item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) imageBlobs.push(file);
+      }
+    }
+    if (imageBlobs.length > 0) {
+      e.preventDefault();
+      setActiveText(prev => prev ? {
+        ...prev,
+        images: [...(prev.images || []), ...imageBlobs],
+      } : null);
+    }
+    // No images: let default text paste proceed
+  }, [activeText]);
+
   // Hand tool right-click: open style panel
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     if (state.activeTool !== 'hand' || !state.isAnnotating) return;
@@ -2625,10 +2663,31 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             value={activeText.text}
             onChange={handleTextChange}
             onKeyDown={handleTextKeyDown}
+            onPaste={handleTextPaste}
             onBlur={commitActiveText}
             placeholder="Type here..."
             style={textInputStyle}
           />
+          {activeText.images && activeText.images.length > 0 && (
+            <div
+              data-devtools
+              style={{
+                position: 'fixed',
+                left: (activeText.point.x - PADDING - scroll.x),
+                top: (activeText.point.y - PADDING - scroll.y) - 20,
+                zIndex: 10000,
+                fontSize: 11,
+                fontFamily: 'system-ui, sans-serif',
+                color: '#fff',
+                backgroundColor: 'rgba(0,0,0,0.7)',
+                padding: '2px 6px',
+                borderRadius: 3,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {activeText.images.length} image{activeText.images.length > 1 ? 's' : ''} attached
+            </div>
+          )}
         </>
       )}
 
@@ -2652,30 +2711,16 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         />
       )}
 
-      {/* Thinking spinners for in-flight annotations (hidden when toolbar collapsed) */}
-      {state.isAnnotating && inFlightAnnotationIds && inFlightAnnotationIds.size > 0 && (
-        <ThinkingSpinners
+      {/* Unified annotation badges: thinking spinner OR reply count, click opens thread */}
+      {state.isAnnotating && (
+        <AnnotationBadges
           annotations={state.annotations}
+          supersededAnnotations={supersededAnnotations}
           inFlightIds={inFlightAnnotationIds}
           scrollX={scroll.x}
           scrollY={scroll.y}
           annotationGroupMap={annotationGroupMap}
           onViewThread={onViewThread}
-          onSelectAnnotation={selectAnnotation}
-        />
-      )}
-
-      {/* Resolution badges for resolved/needs_review annotations (hidden when toolbar collapsed) */}
-      {state.isAnnotating && (
-        <ResolutionBadges
-          annotations={state.annotations}
-          supersededAnnotations={supersededAnnotations}
-          scrollX={scroll.x}
-          scrollY={scroll.y}
-          annotationGroupMap={annotationGroupMap}
-          onReply={onReply}
-          onViewThread={onViewThread}
-          isThreadPanelOpen={isThreadPanelOpen}
           onSelectAnnotation={selectAnnotation}
         />
       )}
@@ -2887,8 +2932,11 @@ const THINKING_WORDS = [
 ];
 const WORD_INTERVAL = 3000;
 
-function ThinkingSpinners({
+// Unified badge: shows thinking spinner when in-flight, reply count when resolved.
+// Click always opens the thread panel.
+function AnnotationBadges({
   annotations,
+  supersededAnnotations,
   inFlightIds,
   scrollX,
   scrollY,
@@ -2897,7 +2945,8 @@ function ThinkingSpinners({
   onSelectAnnotation,
 }: {
   annotations: Annotation[];
-  inFlightIds: Set<string>;
+  supersededAnnotations: Set<Annotation>;
+  inFlightIds?: Set<string>;
   scrollX: number;
   scrollY: number;
   annotationGroupMap: Map<string, number>;
@@ -2907,7 +2956,10 @@ function ThinkingSpinners({
   const [charIndex, setCharIndex] = useState(0);
   const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * THINKING_WORDS.length));
 
+  // Only run spinner timers when there are in-flight annotations
+  const hasInFlight = !!(inFlightIds && inFlightIds.size > 0);
   useEffect(() => {
+    if (!hasInFlight) return;
     const charTimer = setInterval(() => {
       setCharIndex((i) => (i + 1) % SPINNER_FRAME_COUNT);
     }, SPINNER_INTERVAL);
@@ -2918,34 +2970,57 @@ function ThinkingSpinners({
       clearInterval(charTimer);
       clearInterval(wordTimer);
     };
-  }, []);
+  }, [hasInFlight]);
 
-  // Find text annotations that are in-flight (or whose group mate is in-flight)
-  const spinnerPositions: { id: string; threadId?: string; x: number; y: number; size: number; color: string }[] = [];
+  type BadgePos = {
+    id: string;
+    threadId?: string;
+    x: number;
+    y: number;
+    size: number;
+    color: string;
+    isInFlight: boolean;
+    isNeedsReview: boolean;
+    replyCount: number;
+  };
+
+  const badges: BadgePos[] = [];
 
   for (const annotation of annotations) {
     if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
+    if (supersededAnnotations.has(annotation)) continue;
 
-    // Check if this text annotation or its group is in-flight
-    const isInFlight = inFlightIds.has(annotation.id) ||
-      (annotation.groupId && annotations.some(
-        a => a.groupId === annotation.groupId && inFlightIds.has(a.id)
-      ));
+    const groupAnns = annotation.groupId
+      ? annotations.filter(a => a.groupId === annotation.groupId)
+      : [annotation];
 
-    if (!isInFlight) continue;
+    const isInFlight = !!(inFlightIds && (
+      inFlightIds.has(annotation.id) ||
+      groupAnns.some(a => inFlightIds.has(a.id))
+    ));
+    const status: AnnotationLifecycleStatus = annotation.status ?? 'pending';
+    const groupMateResolved = groupAnns.some(
+      a => a.status === 'resolved' || a.status === 'needs_review'
+    );
+    const hasThread = groupAnns.some(a => a.threadId);
+
+    // Show badge if in-flight, resolved/needs_review, or has a thread
+    if (!isInFlight && status !== 'resolved' && status !== 'needs_review' && !groupMateResolved && !hasThread) continue;
+
+    const threadId = annotation.threadId || groupAnns.find(a => a.threadId)?.threadId;
+    const isNeedsReview = status === 'needs_review' || groupAnns.some(a => a.status === 'needs_review');
+    const replyCount = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0) || 1;
 
     const point = annotation.points[0];
     const fontSize = annotation.fontSize || 12;
     const lineHeightPx = fontSize * LINE_HEIGHT;
     const lines = annotation.text.split('\n');
 
-    // Prepend group number if available
     const groupNumber = annotationGroupMap.get(annotation.id);
     const displayLines = groupNumber !== undefined
       ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
       : lines;
 
-    // Measure text width using a temporary canvas
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) continue;
@@ -2954,35 +3029,29 @@ function ThinkingSpinners({
     const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
     const totalHeight = displayLines.length * lineHeightPx;
 
-    // Square spinner flush with right edge of text bg, full annotation height
-    const annotationHeight = totalHeight + PADDING * 2;
-
-    // Resolve threadId from this annotation or a group mate
-    const groupAnns = annotation.groupId
-      ? annotations.filter(a => a.groupId === annotation.groupId)
-      : [annotation];
-    const threadId = annotation.threadId || groupAnns.find(a => a.threadId)?.threadId;
-
-    spinnerPositions.push({
+    badges.push({
       id: annotation.id,
       threadId,
-      x: point.x + maxWidth + PADDING, // right edge of text bg
-      y: point.y - PADDING,            // top of text bg
-      size: annotationHeight,
+      x: point.x + maxWidth + PADDING,
+      y: point.y - PADDING,
+      size: totalHeight + PADDING * 2,
       color: annotation.color,
+      isInFlight,
+      isNeedsReview,
+      replyCount,
     });
   }
 
-  if (spinnerPositions.length === 0) return null;
+  if (badges.length === 0) return null;
 
-  const clickable = !!(onViewThread);
+  const clickable = !!onViewThread;
 
   return (
     <>
-      {spinnerPositions.map((pos, i) => (
+      {badges.map((pos) => (
         <div
-          key={i}
-          data-devtools
+          key={pos.id}
+          data-devtools="annotation-badge"
           onClick={clickable && pos.threadId ? () => {
             onSelectAnnotation?.(pos.id);
             onViewThread!(pos.threadId!);
@@ -2995,7 +3064,7 @@ function ThinkingSpinners({
             display: 'flex',
             alignItems: 'center',
             pointerEvents: clickable ? 'auto' : 'none',
-            cursor: clickable ? 'pointer' : undefined,
+            cursor: clickable && pos.threadId ? 'pointer' : undefined,
             zIndex: 9999,
             backgroundColor: pos.color,
             fontFamily: FONT_FAMILY,
@@ -3007,373 +3076,47 @@ function ThinkingSpinners({
             whiteSpace: 'nowrap',
           }}
         >
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
-            {charIndex === 1 ? (
-              <>
-                <circle cx="7" cy="7" r="2" />
-                <circle cx="17" cy="7" r="2" />
-                <circle cx="7" cy="17" r="2" />
-                <circle cx="17" cy="17" r="2" />
-              </>
-            ) : (
-              <>
-                <circle cx="12" cy="6" r="2" />
-                <circle cx="6" cy="12" r="2" />
-                <circle cx="18" cy="12" r="2" />
-                <circle cx="12" cy="18" r="2" />
-              </>
-            )}
-          </svg>
-          <span style={{ opacity: 0.7 }}>{THINKING_WORDS[wordIndex]}</span>
-        </div>
-      ))}
-    </>
-  );
-}
-
-// Resolution badge overlay for resolved/needs_review annotations
-// Positioned flush with right edge of text annotation (like ThinkingSpinners)
-function ResolutionBadges({
-  annotations,
-  supersededAnnotations,
-  scrollX,
-  scrollY,
-  annotationGroupMap,
-  onReply,
-  onViewThread,
-  isThreadPanelOpen,
-  onSelectAnnotation,
-}: {
-  annotations: Annotation[];
-  supersededAnnotations: Set<Annotation>;
-  scrollX: number;
-  scrollY: number;
-  annotationGroupMap: Map<string, number>;
-  onReply?: (threadId: string, reply: string) => void;
-  onViewThread?: (threadId: string) => void;
-  isThreadPanelOpen?: boolean;
-  onSelectAnnotation?: (id: string) => void;
-}) {
-  // Find text annotations that are resolved/needs_review (or whose group mate is)
-  const badgePositions: { annotation: Annotation; x: number; y: number; size: number; isNeedsReview: boolean; groupNumber?: number }[] = [];
-
-  for (const annotation of annotations) {
-    if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
-    if (supersededAnnotations.has(annotation)) continue;
-
-    // Check if this text annotation or its group mate is resolved, needs_review,
-    // or has a threadId (captured annotation that's been through a conversation)
-    const status: AnnotationLifecycleStatus = annotation.status ?? 'pending';
-    const groupAnns = annotation.groupId
-      ? annotations.filter(a => a.groupId === annotation.groupId)
-      : [annotation];
-    const groupMateResolved = groupAnns.some(
-      a => a.status === 'resolved' || a.status === 'needs_review'
-    );
-    const hasThread = groupAnns.some(a => a.threadId);
-
-    if (status !== 'resolved' && status !== 'needs_review' && !groupMateResolved && !hasThread) continue;
-
-    const isNeedsReview = status === 'needs_review' ||
-      groupAnns.some(a => a.status === 'needs_review');
-
-    const point = annotation.points[0];
-    const fontSize = annotation.fontSize || 12;
-    const lineHeightPx = fontSize * LINE_HEIGHT;
-    const lines = annotation.text.split('\n');
-
-    const groupNumber = annotationGroupMap.get(annotation.id);
-    const displayLines = groupNumber !== undefined
-      ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
-      : lines;
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    if (!ctx) continue;
-
-    ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
-    const totalHeight = displayLines.length * lineHeightPx;
-    const annotationHeight = totalHeight + PADDING * 2;
-
-    badgePositions.push({
-      annotation,
-      x: point.x + maxWidth + PADDING,
-      y: point.y - PADDING,
-      size: annotationHeight,
-      isNeedsReview: !!isNeedsReview,
-      groupNumber,
-    });
-  }
-
-  if (badgePositions.length === 0) return null;
-
-  return (
-    <>
-      {badgePositions.map(({ annotation, x, y, size, isNeedsReview, groupNumber }) => (
-        <ResolutionBadge
-          key={`resolution-${annotation.id}`}
-          annotation={annotation}
-          annotations={annotations}
-          x={x - scrollX}
-          y={y - scrollY}
-          size={size}
-          isNeedsReview={!!isNeedsReview}
-          groupNumber={groupNumber}
-          onReply={onReply}
-          onViewThread={onViewThread}
-          isThreadPanelOpen={isThreadPanelOpen}
-          onSelectAnnotation={onSelectAnnotation}
-        />
-      ))}
-    </>
-  );
-}
-
-function ResolutionBadge({
-  annotation,
-  annotations,
-  x,
-  y,
-  size,
-  isNeedsReview,
-  groupNumber,
-  onReply,
-  onViewThread,
-  isThreadPanelOpen,
-  onSelectAnnotation,
-}: {
-  annotation: Annotation;
-  annotations: Annotation[];
-  x: number;
-  y: number;
-  size: number;
-  isNeedsReview: boolean;
-  groupNumber?: number;
-  onReply?: (threadId: string, reply: string) => void;
-  onViewThread?: (threadId: string) => void;
-  isThreadPanelOpen?: boolean;
-  onSelectAnnotation?: (id: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [replyText, setReplyText] = useState('');
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (expanded && textareaRef.current) {
-      textareaRef.current.focus();
-    }
-  }, [expanded]);
-
-  // Close on click outside or escape
-  useEffect(() => {
-    if (!expanded) return;
-    const handleClickOutside = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-        setExpanded(false);
-      }
-    };
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setExpanded(false);
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    document.addEventListener('keydown', handleEscape);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-      document.removeEventListener('keydown', handleEscape);
-    };
-  }, [expanded]);
-
-  // Gather conversation from the annotation group
-  const groupAnnotations = annotation.groupId
-    ? annotations.filter(a => a.groupId === annotation.groupId)
-    : [annotation];
-  const textAnn = groupAnnotations.find(a => a.type === 'text');
-  const userMessage = textAnn?.text || '(no text)';
-  const summary = groupAnnotations.find(a => a.resolutionSummary)?.resolutionSummary;
-  const threadId = groupAnnotations.find(a => a.threadId)?.threadId;
-
-  const handleSubmit = useCallback(() => {
-    if (!replyText.trim() || !threadId || !onReply) return;
-    onReply(threadId, replyText.trim());
-    setReplyText('');
-    setExpanded(false);
-  }, [replyText, threadId, onReply]);
-
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      handleSubmit();
-    }
-  }, [handleSubmit]);
-
-  return (
-    <div
-      ref={panelRef}
-      data-devtools="resolution-badge"
-      style={{
-        position: 'fixed',
-        left: x,
-        top: y,
-        zIndex: expanded ? 10002 : 9999,
-        pointerEvents: 'auto',
-      }}
-    >
-      {/* Collapsed badge */}
-      {!expanded && (
-        <div
-          onClick={() => {
-            onSelectAnnotation?.(annotation.id);
-            if (threadId && onViewThread) {
-              onViewThread(threadId);
-            }
-          }}
-          style={{
-            height: size,
-            display: 'flex',
-            alignItems: 'center',
-            cursor: 'pointer',
-            backgroundColor: annotation.color,
-            fontFamily: FONT_FAMILY,
-            fontSize: 12,
-            color: '#ffffff',
-            userSelect: 'none',
-            padding: `0 ${PADDING}px`,
-            gap: 4,
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {isNeedsReview ? (
-            <span style={{ fontWeight: 700 }}>?</span>
+          {pos.isInFlight ? (
+            <>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
+                {charIndex === 1 ? (
+                  <>
+                    <circle cx="7" cy="7" r="2" />
+                    <circle cx="17" cy="7" r="2" />
+                    <circle cx="7" cy="17" r="2" />
+                    <circle cx="17" cy="17" r="2" />
+                  </>
+                ) : (
+                  <>
+                    <circle cx="12" cy="6" r="2" />
+                    <circle cx="6" cy="12" r="2" />
+                    <circle cx="18" cy="12" r="2" />
+                    <circle cx="12" cy="18" r="2" />
+                  </>
+                )}
+              </svg>
+              <span style={{ opacity: 0.7 }}>{THINKING_WORDS[wordIndex]}</span>
+            </>
           ) : (
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <line x1="12" y1="3" x2="12" y2="9" />
-              <line x1="12" y1="15" x2="12" y2="21" />
-              <line x1="3" y1="12" x2="9" y2="12" />
-              <line x1="15" y1="12" x2="21" y2="12" />
-            </svg>
-          )}
-          <span style={{ opacity: 0.7 }}>
-            {(() => {
-              const groupAnns = annotation.groupId
-                ? annotations.filter(a => a.groupId === annotation.groupId)
-                : [annotation];
-              const count = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0) || 1;
-              return `${count} ${count === 1 ? 'reply' : 'replies'}`;
-            })()}
-          </span>
-        </div>
-      )}
-
-      {/* Expanded inline conversation */}
-      {expanded && (
-        <div
-          style={{
-            minWidth: 280,
-            maxWidth: 400,
-            backgroundColor: '#ffffff',
-            fontFamily: FONT_FAMILY,
-            fontSize: 12,
-            color: '#1f2937',
-            border: '1px solid rgba(0, 0, 0, 0.1)',
-          }}
-        >
-          {/* User message */}
-          <div style={{
-            padding: `${PADDING + 2}px ${PADDING + 4}px`,
-            backgroundColor: annotation.color,
-            color: '#ffffff',
-            lineHeight: 1.4,
-          }}>
-            {userMessage}
-          </div>
-
-          {/* Claude response */}
-          {summary && (
-            <div style={{
-              padding: `${PADDING + 2}px ${PADDING + 4}px`,
-              lineHeight: 1.4,
-              borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
-            }}>
-              {summary}
-            </div>
-          )}
-
-          {/* Reply area + View conversation */}
-          {threadId && (
-            <div style={{ padding: PADDING }}>
-              {onReply && (
-                <>
-                  <textarea
-                    ref={textareaRef}
-                    value={replyText}
-                    onChange={(e) => setReplyText(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    placeholder="Reply..."
-                    style={{
-                      width: '100%',
-                      minHeight: 40,
-                      padding: PADDING,
-                      fontSize: 12,
-                      fontFamily: FONT_FAMILY,
-                      backgroundColor: 'rgba(0, 0, 0, 0.04)',
-                      color: '#1f2937',
-                      border: '1px solid rgba(0, 0, 0, 0.1)',
-                      borderRadius: 0,
-                      outline: 'none',
-                      resize: 'vertical',
-                      lineHeight: 1.4,
-                      boxSizing: 'border-box',
-                    }}
-                  />
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
-                    <button
-                      onClick={handleSubmit}
-                      disabled={!replyText.trim()}
-                      style={{
-                        padding: '4px 12px',
-                        fontSize: 11,
-                        fontFamily: FONT_FAMILY,
-                        fontWeight: 600,
-                        backgroundColor: replyText.trim() ? annotation.color : 'rgba(0,0,0,0.1)',
-                        color: replyText.trim() ? '#ffffff' : 'rgba(0,0,0,0.3)',
-                        border: 'none',
-                        cursor: replyText.trim() ? 'pointer' : 'default',
-                      }}
-                    >
-                      Send &#8984;&#9166;
-                    </button>
-                  </div>
-                </>
+            <>
+              {pos.isNeedsReview ? (
+                <span style={{ fontWeight: 700 }}>?</span>
+              ) : (
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <line x1="12" y1="3" x2="12" y2="9" />
+                  <line x1="12" y1="15" x2="12" y2="21" />
+                  <line x1="3" y1="12" x2="9" y2="12" />
+                  <line x1="15" y1="12" x2="21" y2="12" />
+                </svg>
               )}
-              {onViewThread && (
-                <button
-                  onClick={() => {
-                    onViewThread(threadId);
-                    setExpanded(false);
-                  }}
-                  style={{
-                    width: '100%',
-                    padding: '5px 0',
-                    fontSize: 11,
-                    fontFamily: FONT_FAMILY,
-                    fontWeight: 500,
-                    backgroundColor: 'transparent',
-                    color: '#6b7280',
-                    border: '1px solid rgba(0, 0, 0, 0.1)',
-                    cursor: 'pointer',
-                    marginTop: onReply ? 8 : 0,
-                  }}
-                >
-                  View conversation &rarr;
-                </button>
-              )}
-            </div>
+              <span style={{ opacity: 0.7 }}>
+                {pos.replyCount} {pos.replyCount === 1 ? 'reply' : 'replies'}
+              </span>
+            </>
           )}
         </div>
-      )}
-    </div>
+      ))}
+    </>
   );
 }
 

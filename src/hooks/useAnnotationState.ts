@@ -112,13 +112,15 @@ function handleAddText(state: AnnotationState, payload: {
   point: { x: number; y: number };
   text: string;
   fontSize?: number;
+  id?: string;
   groupId?: string;
   linkedSelector?: string;
   linkedAnchor?: 'top-left' | 'bottom-left';
   elements?: ElementInfo[];
+  imageCount?: number;
 }): AnnotationState {
   const textAnnotation: Annotation = {
-    id: generateId(),
+    id: payload.id ?? generateId(),
     type: 'text',
     points: [payload.point],
     text: payload.text,
@@ -131,6 +133,7 @@ function handleAddText(state: AnnotationState, payload: {
     linkedSelector: payload.linkedSelector,
     linkedAnchor: payload.linkedAnchor,
     elements: payload.elements,
+    ...(payload.imageCount ? { imageCount: payload.imageCount } : {}),
   };
 
   // Skip undo for linked text (groupId) - the rectangle already saved the pre-creation state
@@ -141,12 +144,14 @@ function handleAddText(state: AnnotationState, payload: {
   };
 }
 
-function handleUpdateText(state: AnnotationState, payload: { id: string; text: string }): AnnotationState {
+function handleUpdateText(state: AnnotationState, payload: { id: string; text: string; imageCount?: number }): AnnotationState {
   const stateWithUndo = pushToUndoStack(state);
   return {
     ...stateWithUndo,
     annotations: state.annotations.map((a) =>
-      a.id === payload.id ? { ...a, text: payload.text } : a
+      a.id === payload.id
+        ? { ...a, text: payload.text, ...(payload.imageCount != null ? { imageCount: payload.imageCount } : {}) }
+        : a
     ),
   };
 }
@@ -621,20 +626,32 @@ function handleSetAnnotationStatus(state: AnnotationState, payload: { ids: strin
 
 function handleSetAnnotationThread(state: AnnotationState, payload: { ids: string[]; threadId: string }): AnnotationState {
   const idSet = new Set(payload.ids);
+  // Build groupId set so group mates (e.g. text annotations paired with shapes) also get the threadId
+  const groupIds = new Set<string>();
+  for (const a of state.annotations) {
+    if (idSet.has(a.id) && a.groupId) groupIds.add(a.groupId);
+  }
   return {
     ...state,
     annotations: state.annotations.map(a =>
-      idSet.has(a.id) ? { ...a, threadId: payload.threadId } : a
+      (idSet.has(a.id) || (a.groupId && groupIds.has(a.groupId)))
+        ? { ...a, threadId: payload.threadId }
+        : a
     ),
   };
 }
 
 function handleSetAnnotationQuestion(state: AnnotationState, payload: { ids: string[]; question: string; threadId: string }): AnnotationState {
   const idSet = new Set(payload.ids);
+  // Build groupId set so group mates (e.g. text annotations paired with shapes) also get the question state
+  const groupIds = new Set<string>();
+  for (const a of state.annotations) {
+    if (idSet.has(a.id) && a.groupId) groupIds.add(a.groupId);
+  }
   return {
     ...state,
     annotations: state.annotations.map(a =>
-      idSet.has(a.id)
+      (idSet.has(a.id) || (a.groupId && groupIds.has(a.groupId)))
         ? { ...a, status: 'waiting_input' as const, question: payload.question, threadId: payload.threadId }
         : a
     ),
@@ -862,4 +879,4 @@ export function useAnnotationState() {
   return [state, dispatch] as const;
 }
 
-export { annotationReducer, initialState };
+export { annotationReducer, generateId, initialState };

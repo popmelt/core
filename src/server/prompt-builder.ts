@@ -2,7 +2,7 @@ import type { AnnotationResolution } from '../tools/types';
 import type { FeedbackPayload, PlanTask, Provider, ThreadMessage } from './types';
 
 /** Format feedback annotations and style modifications into prompt-ready text */
-export function formatFeedbackContext(feedback: FeedbackPayload): string {
+export function formatFeedbackContext(feedback: FeedbackPayload, imagePaths?: Record<string, string[]>): string {
   const lines: string[] = [];
 
   if (feedback.annotations.length > 0) {
@@ -18,6 +18,14 @@ export function formatFeedbackContext(feedback: FeedbackPayload): string {
 
       const instruction = ann.instruction || 'No text';
       lines.push(`- id=${ann.id} [${ann.type}] ${instruction} → Elements: ${elementsDesc || 'none'}`);
+
+      // Reference pasted images for this annotation
+      const annImages = imagePaths?.[ann.id];
+      if (annImages && annImages.length > 0) {
+        for (const imgPath of annImages) {
+          lines.push(`  Attached image: use the Read tool to view ${imgPath}`);
+        }
+      }
     }
   }
 
@@ -58,6 +66,7 @@ export function buildPrompt(
   options?: {
     threadHistory?: ThreadMessage[];
     provider?: Provider;
+    imagePaths?: Record<string, string[]>;
   },
 ): string {
   const lines: string[] = [];
@@ -119,7 +128,7 @@ export function buildPrompt(
     lines.push('The current round is shown in full below.');
   }
 
-  const feedbackContext = formatFeedbackContext(feedback);
+  const feedbackContext = formatFeedbackContext(feedback, options?.imagePaths);
   if (feedbackContext) {
     lines.push('');
     lines.push(feedbackContext);
@@ -165,6 +174,7 @@ export function buildReplyPrompt(
   screenshotPath: string,
   threadHistory: ThreadMessage[],
   provider?: Provider,
+  imagePaths?: string[],
 ): string {
   const lines: string[] = [];
 
@@ -217,6 +227,16 @@ export function buildReplyPrompt(
   lines.push('Follow their instructions — apply code changes only if requested. The dev server has HMR so changes appear immediately.');
   lines.push('');
   lines.push('IMPORTANT: If any elements you modify have a `data-pm` attribute, preserve it in the source. This attribute tracks annotation positions.');
+
+  // Attached images from the reply
+  if (imagePaths && imagePaths.length > 0) {
+    lines.push('');
+    lines.push('## Attached Images');
+    lines.push('The developer attached reference images with their reply:');
+    for (const imgPath of imagePaths) {
+      lines.push(`Attached image: use the Read tool to view the image at: ${imgPath}`);
+    }
+  }
 
   // Resolution instruction
   lines.push('');

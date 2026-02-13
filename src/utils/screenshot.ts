@@ -23,6 +23,7 @@ type AnnotationData = {
   instruction?: string;
   linkedSelector?: string;
   elements: ElementInfo[];
+  imageCount?: number;
 };
 
 export type FeedbackData = {
@@ -64,6 +65,7 @@ export function buildFeedbackData(
 
     if (shape) {
       const linkedSelector = shape.linkedSelector || text?.linkedSelector;
+      const imageCount = text?.imageCount || shape.imageCount;
       annotationDataList.push({
         id: shape.id,
         type: shape.type,
@@ -71,6 +73,7 @@ export function buildFeedbackData(
         ...(linkedSelector ? { linkedSelector } : {}),
         // Use stored elements (captured at creation time) or empty array
         elements: shape.elements || [],
+        ...(imageCount ? { imageCount } : {}),
       });
     }
   }
@@ -84,6 +87,7 @@ export function buildFeedbackData(
       ...(annotation.linkedSelector ? { linkedSelector: annotation.linkedSelector } : {}),
       // Use stored elements (captured at creation time) or empty array
       elements: annotation.elements || [],
+      ...(annotation.imageCount ? { imageCount: annotation.imageCount } : {}),
     });
   }
 
@@ -273,8 +277,13 @@ function drawAnnotationsToCanvas(
         ctx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
         ctx.fillStyle = annotation.color;
 
+        // Prepend image count indicator if images are attached
+        const displayText = annotation.imageCount && annotation.imageCount > 0
+          ? `[${annotation.imageCount} image${annotation.imageCount > 1 ? 's' : ''}] ${annotation.text}`
+          : annotation.text;
+
         // Draw background
-        const lines = annotation.text.split('\n');
+        const lines = displayText.split('\n');
         const lineHeight = fontSize * 1.2;
         const padding = 4;
         let maxWidth = 0;

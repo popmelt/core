@@ -16,6 +16,8 @@ type ThreadMessage = {
   responseText?: string;
   question?: string;
   replyToQuestion?: string;
+  toolsUsed?: string[];
+  resolutions?: { annotationId: string; status: string; summary: string; filesModified?: string[] }[];
 };
 
 type PlanAnnotation = {
@@ -36,7 +38,7 @@ type ThreadPanelProps = {
   streamingThinking?: string;
   streamingEvents?: BridgeEvent[];
   onClose: () => void;
-  onReply?: (threadId: string, reply: string) => void;
+  onReply?: (threadId: string, reply: string, images?: Blob[]) => void;
   activePlan?: { planId: string; status: string; goal: string; tasks?: { id: string; instruction: string }[] } | null;
   planAnnotations?: PlanAnnotation[];
   inFlightJobs?: Record<string, { annotationIds: string[]; threadId?: string }>;
@@ -168,13 +170,10 @@ function ThinkingBadge({ color }: { color: string }) {
   );
 }
 
-/** Format tool_use events into a step label like the BridgeEventStack does */
-function formatToolStep(events: BridgeEvent[]): string | null {
-  const toolEvents = events.filter(e => e.type === 'tool_use');
-  if (toolEvents.length === 0) return null;
-  const last = toolEvents[toolEvents.length - 1]!;
-  const tool = String(last.data.tool || '');
-  const file = last.data.file ? String(last.data.file) : null;
+/** Format a single tool_use event into a step label */
+function formatToolEvent(event: BridgeEvent): string | null {
+  const tool = String(event.data.tool || '');
+  const file = event.data.file ? String(event.data.file) : null;
   const basename = file ? file.split('/').pop() ?? file : null;
   switch (tool) {
     case 'Read': return basename ? `Reading ${basename}` : 'Reading file';
@@ -187,6 +186,43 @@ function formatToolStep(events: BridgeEvent[]): string | null {
     case 'WebSearch': return 'Searching web';
     default: return tool ? `Using ${tool}` : null;
   }
+}
+
+type StreamSegment =
+  | { kind: 'tool'; label: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'thinking'; text: string };
+
+/** Build a chronological timeline of interleaved tool actions and text from streaming events */
+function buildStreamSegments(events: BridgeEvent[]): StreamSegment[] {
+  const segments: StreamSegment[] = [];
+
+  for (const e of events) {
+    if (e.type === 'tool_use') {
+      const label = formatToolEvent(e);
+      if (label) segments.push({ kind: 'tool', label });
+    } else if (e.type === 'delta') {
+      const text = String(e.data.text || '');
+      if (!text) continue;
+      const last = segments[segments.length - 1];
+      if (last && last.kind === 'text') {
+        last.text += text;
+      } else {
+        segments.push({ kind: 'text', text });
+      }
+    } else if (e.type === 'thinking') {
+      const text = String(e.data.text || '');
+      if (!text) continue;
+      const last = segments[segments.length - 1];
+      if (last && last.kind === 'thinking') {
+        last.text += text;
+      } else {
+        segments.push({ kind: 'thinking', text });
+      }
+    }
+  }
+
+  return segments;
 }
 
 export function ThreadPanel({
@@ -209,6 +245,7 @@ export function ThreadPanel({
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [replyText, setReplyText] = useState('');
+  const [replyImages, setReplyImages] = useState<Blob[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef(isStreaming);
@@ -237,12 +274,15 @@ export function ThreadPanel({
     prevStreamingRef.current = isStreaming;
   }, [isStreaming, fetchThread]);
 
+  // Build a unified chronological timeline interleaving tool events and text
+  const streamSegments = streamingEvents ? buildStreamSegments(streamingEvents) : [];
+
   // Auto-scroll to bottom on new content
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, streamingResponse, streamingThinking, isStreaming]);
+  }, [messages, streamSegments.length, isStreaming]);
 
   // Close on Escape
   useEffect(() => {
@@ -258,16 +298,34 @@ export function ThreadPanel({
   const handleSubmit = useCallback(() => {
     if (!replyText.trim() || !onReply) return;
     const text = replyText.trim();
+    const images = replyImages.length > 0 ? replyImages : undefined;
     // Optimistically show the reply immediately
     setMessages(prev => [...prev, {
       role: 'human' as const,
       timestamp: Date.now(),
       jobId: 'pending',
-      replyToQuestion: text,
+      replyToQuestion: images ? `${text} [${images.length} image${images.length > 1 ? 's' : ''}]` : text,
     }]);
-    onReply(threadId, text);
+    onReply(threadId, text, images);
     setReplyText('');
-  }, [replyText, threadId, onReply]);
+    setReplyImages([]);
+  }, [replyText, replyImages, threadId, onReply]);
+
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData.items;
+    const imageBlobs: Blob[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      if (item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) imageBlobs.push(file);
+      }
+    }
+    if (imageBlobs.length > 0) {
+      e.preventDefault();
+      setReplyImages(prev => [...prev, ...imageBlobs]);
+    }
+  }, []);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -275,11 +333,6 @@ export function ThreadPanel({
       handleSubmit();
     }
   }, [handleSubmit]);
-
-  // Derive live streaming display
-  const toolStep = streamingEvents ? formatToolStep(streamingEvents) : null;
-  const thinkingText = streamingThinking || '';
-  const responseText = streamingResponse ? stripInternalTags(streamingResponse) : '';
 
   return (
     <>
@@ -343,7 +396,11 @@ export function ThreadPanel({
           // Show the question field separately (it's stripped from responseText by stripInternalTags)
           const questionText = !isHuman ? msg.question : undefined;
 
-          if (!text && !questionText) return null;
+          // Build resolution summary for assistant messages that applied changes
+          const hasResolutions = !isHuman && msg.resolutions && msg.resolutions.length > 0;
+          const hasToolsUsed = !isHuman && msg.toolsUsed && msg.toolsUsed.length > 0;
+
+          if (!text && !questionText && !hasResolutions) return null;
 
           const isLatest = i === messages.length - 1;
 
@@ -389,6 +446,33 @@ export function ThreadPanel({
                   wordBreak: 'break-word',
                 }}>
                   {renderMarkdown(questionText)}
+                </div>
+              )}
+              {/* Tool activity + resolution summary */}
+              {(hasToolsUsed || hasResolutions) && (
+                <div style={{
+                  marginTop: text || questionText ? 6 : 0,
+                  padding: '4px 8px',
+                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                  fontSize: 11,
+                  lineHeight: 1.5,
+                  color: '#6b7280',
+                }}>
+                  {hasToolsUsed && (
+                    <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 }}>
+                      {msg.toolsUsed!.map((t, j) => (
+                        <div key={j}>{t}</div>
+                      ))}
+                    </div>
+                  )}
+                  {hasResolutions && msg.resolutions!.map((r, j) => (
+                    <div key={j} style={{ marginTop: hasToolsUsed ? 4 : 0 }}>
+                      <span style={{ color: r.status === 'resolved' ? '#10b981' : '#f59e0b' }}>
+                        {r.status === 'resolved' ? 'Done' : 'Needs review'}
+                      </span>
+                      {r.summary ? ` \u2014 ${r.summary}` : ''}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -486,7 +570,7 @@ export function ThreadPanel({
           </div>
         )}
 
-        {/* Live streaming section */}
+        {/* Live streaming section — unified chronological timeline */}
         {isStreaming && (
           <div style={{ padding: '8px 16px', borderBottom: '1px solid rgba(0, 0, 0, 0.04)' }}>
             {/* Claude header with crosshair thinking badge */}
@@ -500,47 +584,64 @@ export function ThreadPanel({
               </span>
             </div>
 
-            {/* Tool activity */}
-            {toolStep && (
-              <div style={{
-                paddingLeft: 12,
-                marginBottom: 4,
-                fontSize: 11,
-                color: '#9ca3af',
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              }}>
-                {toolStep}
-              </div>
-            )}
-
-            {/* Thinking text (model's internal monologue) */}
-            {thinkingText && (
-              <div style={{
-                paddingLeft: 12,
-                marginBottom: 4,
-                fontSize: 11,
-                color: '#9ca3af',
-                fontStyle: 'italic',
-                lineHeight: 1.4,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-                maxHeight: 120,
-                overflowY: 'auto',
-              }}>
-                {thinkingText}
-              </div>
-            )}
-
-            {/* Response text so far */}
-            {responseText && (
-              <div style={{
-                paddingLeft: 12,
-                lineHeight: 1.5,
-                wordBreak: 'break-word',
-              }}>
-                {renderMarkdown(responseText)}
-              </div>
-            )}
+            {/* Interleaved tool actions, thinking, and response text */}
+            {streamSegments.map((seg, i) => {
+              if (seg.kind === 'tool') {
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      paddingLeft: 12,
+                      fontSize: 11,
+                      color: '#9ca3af',
+                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    {seg.label}
+                  </div>
+                );
+              }
+              if (seg.kind === 'thinking') {
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      paddingLeft: 12,
+                      marginTop: 2,
+                      marginBottom: 2,
+                      fontSize: 11,
+                      color: '#9ca3af',
+                      fontStyle: 'italic',
+                      lineHeight: 1.4,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      maxHeight: 80,
+                      overflowY: 'auto',
+                    }}
+                  >
+                    {seg.text}
+                  </div>
+                );
+              }
+              // text segment
+              const stripped = stripInternalTags(seg.text);
+              if (!stripped) return null;
+              return (
+                <div
+                  key={i}
+                  style={{
+                    paddingLeft: 12,
+                    marginTop: 2,
+                    marginBottom: 2,
+                    lineHeight: 1.5,
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {renderMarkdown(stripped)}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -548,10 +649,36 @@ export function ThreadPanel({
       {/* Reply area */}
       {onReply && (
         <div style={replyAreaStyle}>
+          {replyImages.length > 0 && (
+            <div style={{
+              fontSize: 11,
+              color: '#6b7280',
+              marginBottom: 4,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+            }}>
+              <span>{replyImages.length} image{replyImages.length > 1 ? 's' : ''} attached</span>
+              <button
+                onClick={() => setReplyImages([])}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: 11,
+                  color: '#9ca3af',
+                  padding: '0 2px',
+                }}
+              >
+                &times;
+              </button>
+            </div>
+          )}
           <textarea
             value={replyText}
             onChange={(e) => setReplyText(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder="Reply... (Cmd+Enter to send)"
             style={{
               width: '100%',

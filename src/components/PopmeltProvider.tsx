@@ -68,6 +68,7 @@ export function PopmeltProvider({
 }: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
   const bridge = useBridgeConnection(bridgeUrl);
+  const annotationImagesRef = useRef(new Map<string, Blob[]>());
   const [provider, setProvider] = useState<string>(() => {
     if (typeof window === 'undefined') return 'claude';
     return localStorage.getItem(PROVIDER_STORAGE_KEY) || 'claude';
@@ -514,6 +515,11 @@ export function PopmeltProvider({
     }
   }, [activePlan?.planId, state.activeColor, dispatch]);
 
+  const handleAttachImages = useCallback((annotationId: string, images: Blob[]) => {
+    const existing = annotationImagesRef.current.get(annotationId) || [];
+    annotationImagesRef.current.set(annotationId, [...existing, ...images]);
+  }, []);
+
   const handleSendToClaude = useCallback(async (): Promise<boolean> => {
     const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
     if (!canvas) return false;
@@ -537,10 +543,38 @@ export function PopmeltProvider({
     const feedbackData = buildFeedbackData(activeAnnotations, state.styleModifications);
     const feedbackJson = JSON.stringify(feedbackData);
 
+    // Gather pasted images for pending annotations
+    const pastedImages = new Map<string, Blob[]>();
+    for (const ann of activeAnnotations) {
+      const blobs = annotationImagesRef.current.get(ann.id);
+      if (blobs && blobs.length > 0) {
+        pastedImages.set(ann.id, blobs);
+      }
+      // Also check group mates (text annotation may hold images for a grouped shape)
+      if (ann.groupId) {
+        for (const mate of activeAnnotations) {
+          if (mate.groupId === ann.groupId && mate.id !== ann.id) {
+            const mateBlobs = annotationImagesRef.current.get(mate.id);
+            if (mateBlobs && mateBlobs.length > 0) {
+              pastedImages.set(mate.id, mateBlobs);
+            }
+          }
+        }
+      }
+    }
+
     // Send to bridge
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId, threadId: assignedThreadId } = await sendToBridge(stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id);
+      const { jobId, threadId: assignedThreadId } = await sendToBridge(
+        stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id,
+        pastedImages.size > 0 ? pastedImages : undefined,
+      );
+
+      // Clean up sent image blobs from the side-channel
+      for (const annId of pastedImages.keys()) {
+        annotationImagesRef.current.delete(annId);
+      }
 
       // Track which annotations and style modifications are in-flight for this job
       const sentAnnotationIds = activeAnnotations.map(a => a.id);
@@ -557,6 +591,11 @@ export function PopmeltProvider({
 
       dispatch({ type: 'MARK_CAPTURED' });
 
+      // Tag annotations with their threadId so spinners/badges can link to the thread panel
+      if (assignedThreadId && sentAnnotationIds.length > 0) {
+        dispatch({ type: 'SET_ANNOTATION_THREAD', payload: { ids: sentAnnotationIds, threadId: assignedThreadId } });
+      }
+
       // Shift hue by ~60° for next round so successive iterations are visually distinct
       const hueMatch = state.activeColor.match(/oklch\([^)]*\s+([\d.]+)\s*\)/);
       const currentHue = hueMatch?.[1] ? parseFloat(hueMatch[1]) : 29;
@@ -571,10 +610,10 @@ export function PopmeltProvider({
   }, [state.annotations, state.styleModifications, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
 
   // Handle reply to a question from Claude
-  const handleReply = useCallback(async (threadId: string, reply: string) => {
+  const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id);
+      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id, images);
 
       // Track the new continuation job (no specific annotations — reuses thread context)
       setInFlightJobs(prev => ({
@@ -912,9 +951,9 @@ export function PopmeltProvider({
         inFlightAnnotationIds={inFlightAnnotationIds}
         inFlightStyleSelectors={inFlightStyleSelectors}
         inFlightSelectorColors={inFlightSelectorColors}
+        onAttachImages={handleAttachImages}
         onReply={bridge.isConnected ? handleReply : undefined}
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
-        isThreadPanelOpen={openThreadId !== null}
         activePlan={activePlan}
       />
 

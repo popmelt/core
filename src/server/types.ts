@@ -30,6 +30,7 @@ export type FeedbackPayload = {
     type: string;
     instruction?: string;
     linkedSelector?: string;
+    imageCount?: number;
     elements: {
       selector: string;
       tagName: string;
@@ -79,6 +80,7 @@ export type Job = {
   annotationIds?: string[];
   provider?: Provider;
   model?: string;
+  imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
   // Planner fields
   planId?: string;
   planTaskId?: string;

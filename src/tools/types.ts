@@ -76,6 +76,7 @@ export type Annotation = {
   elements?: ElementInfo[]; // DOM elements captured at creation time
   linkedSelector?: string; // CSS selector of linked DOM element (inspector pin)
   linkedAnchor?: 'top-left' | 'bottom-left'; // Which corner to anchor to
+  imageCount?: number; // Number of pasted images attached (blobs stored out-of-band)
   // Planner fields
   planId?: string;
   planTaskId?: string;
@@ -138,12 +139,14 @@ export type AnnotationAction =
       point: Point;
       text: string;
       fontSize?: number;
+      id?: string;
       groupId?: string;
       linkedSelector?: string;
       linkedAnchor?: 'top-left' | 'bottom-left';
       elements?: ElementInfo[];
+      imageCount?: number;
     } }
-  | { type: 'UPDATE_TEXT'; payload: { id: string; text: string } }
+  | { type: 'UPDATE_TEXT'; payload: { id: string; text: string; imageCount?: number } }
   | { type: 'UPDATE_TEXT_SIZE'; payload: { id: string; fontSize: number } }
   | { type: 'DELETE_ANNOTATION'; payload: { id: string } }
   | { type: 'MOVE_ANNOTATION'; payload: { id: string; delta: Point; saveUndo?: boolean } }

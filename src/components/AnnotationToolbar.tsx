@@ -943,7 +943,9 @@ export function AnnotationToolbar({
         <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         <div
           id="devtools-toolbar"
-          style={{ ...toolbarStyle, overflow: 'visible' }}
+          style={{ ...toolbarStyle, overflow: 'visible', opacity: 0.5, transition: 'opacity 150ms ease' }}
+          onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
+          onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.5')}
         >
           <button
             type="button"

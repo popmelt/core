@@ -49,6 +49,7 @@ export async function sendToBridge(
   color?: string,
   provider?: string,
   model?: string,
+  pastedImages?: Map<string, Blob[]>,
 ): Promise<{ jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
@@ -56,6 +57,13 @@ export async function sendToBridge(
   if (color) formData.append('color', color);
   if (provider) formData.append('provider', provider);
   if (model) formData.append('model', model);
+  if (pastedImages) {
+    for (const [annotationId, blobs] of pastedImages) {
+      for (let i = 0; i < blobs.length; i++) {
+        formData.append(`image-${annotationId}-${i}`, blobs[i]!, `image-${annotationId}-${i}.png`);
+      }
+    }
+  }
 
   const res = await fetch(`${bridgeUrl}/send`, {
     method: 'POST',
@@ -199,12 +207,39 @@ export async function sendReplyToBridge(
   color?: string,
   provider?: string,
   model?: string,
+  images?: Blob[],
 ): Promise<{ jobId: string; position: number; threadId?: string }> {
-  const res = await fetch(`${bridgeUrl}/reply`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId, reply, color, provider, model }),
-  });
+  let res: Response;
+
+  if (images && images.length > 0) {
+    // Multipart: include attached images
+    const formData = new FormData();
+    // 1x1 transparent PNG placeholder for the required "screenshot" field
+    const placeholder = new Blob([new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+      0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+      0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x62, 0x00, 0x00, 0x00, 0x02,
+      0x00, 0x01, 0xe5, 0x27, 0xde, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+      0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ])], { type: 'image/png' });
+    formData.append('screenshot', placeholder, 'screenshot.png');
+    formData.append('feedback', JSON.stringify({ threadId, reply, color, provider, model }));
+    for (let i = 0; i < images.length; i++) {
+      formData.append(`image-reply-${i}`, images[i]!, `reply-image-${i}.png`);
+    }
+    res = await fetch(`${bridgeUrl}/reply`, {
+      method: 'POST',
+      body: formData,
+    });
+  } else {
+    // JSON: no images
+    res = await fetch(`${bridgeUrl}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId, reply, color, provider, model }),
+    });
+  }
 
   if (!res.ok) {
     const body = await res.text();

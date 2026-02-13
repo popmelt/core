@@ -13,6 +13,8 @@ export type ParsedMultipart = {
   planId?: string;
   manifest?: string;
   tasks?: string;
+  // Pasted images (from annotation comments)
+  pastedImages: { annotationId: string; index: number; data: Buffer }[];
 };
 
 /**
@@ -42,6 +44,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   let planId: string | undefined;
   let manifest: string | undefined;
   let tasks: string | undefined;
+  const pastedImages: { annotationId: string; index: number; data: Buffer }[] = [];
 
   // Split body by delimiter
   let offset = 0;
@@ -110,6 +113,15 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
       manifest = part.body.toString('utf-8');
     } else if (name === 'tasks') {
       tasks = part.body.toString('utf-8');
+    } else if (name!.startsWith('image-')) {
+      // image-{annotationId}-{index}
+      const segments = name!.split('-');
+      // Handle annotation IDs that may contain hyphens: last segment is index, middle is annotationId
+      const idx = parseInt(segments[segments.length - 1]!, 10);
+      const annotationId = segments.slice(1, -1).join('-');
+      if (annotationId && !isNaN(idx)) {
+        pastedImages.push({ annotationId, index: idx, data: part.body });
+      }
     }
   }
 
@@ -117,7 +129,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   // feedback is optional for plan endpoints
   if (!feedback) feedback = '';
 
-  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks };
+  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks, pastedImages };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
