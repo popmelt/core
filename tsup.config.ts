@@ -9,6 +9,7 @@ export default defineConfig([
     esbuildOptions(options) {
       options.jsx = 'automatic';
     },
+    minify: true,
     external: ['react', 'react-dom', 'modern-screenshot', 'lucide-react'],
     outDir: 'dist',
     clean: true,
@@ -18,6 +19,7 @@ export default defineConfig([
     entry: { server: 'src/server/index.ts' },
     format: 'esm',
     dts: true,
+    minify: true,
     platform: 'node',
     outDir: 'dist',
     clean: false,
