@@ -1,9 +1,10 @@
 'use client';
 
 import type { CSSProperties } from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { BridgeConnectionState } from '../hooks/useBridgeConnection';
+import { POPMELT_BORDER } from '../styles/border';
 
 type InFlightJob = {
   annotationIds: string[];
@@ -35,7 +36,7 @@ const stackContainerStyle: CSSProperties = {
   zIndex: 9999,
   display: 'flex',
   flexDirection: 'column',
-  gap: 1,
+  gap: 10,
 };
 
 const rowStyle: CSSProperties = {
@@ -44,12 +45,13 @@ const rowStyle: CSSProperties = {
   gap: 6,
   padding: '4px 10px',
   backgroundColor: 'rgba(255, 255, 255, 0.85)',
-  border: '1px solid rgba(0, 0, 0, 0.1)',
+  ...POPMELT_BORDER,
   backdropFilter: 'blur(32px)',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   fontSize: 11,
   color: '#1f2937',
   whiteSpace: 'nowrap' as const,
+  transition: 'transform 200ms ease, opacity 200ms ease',
 };
 
 function formatStepText(events: BridgeConnectionState['events']): string {
@@ -165,6 +167,64 @@ function ErrorDot() {
   );
 }
 
+/** Wraps a child so swiping right dismisses it. */
+function SwipeDismiss({ onDismiss, children }: { onDismiss: () => void; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ startX: number; startY: number; locked: boolean } | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
+  const THRESHOLD = 60;
+
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    drag.current = { startX: e.clientX, startY: e.clientY, locked: false };
+    ref.current?.setPointerCapture(e.pointerId);
+  }, []);
+
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    // Lock direction after 4px of movement
+    if (!d.locked) {
+      if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      d.locked = true;
+      // If more vertical than horizontal, abort swipe
+      if (Math.abs(dy) > Math.abs(dx)) { drag.current = null; return; }
+    }
+    setOffset(Math.max(0, dx)); // right only
+  }, []);
+
+  const onPointerUp = useCallback(() => {
+    if (!drag.current) return;
+    drag.current = null;
+    if (offset >= THRESHOLD) {
+      setDismissed(true);
+      setTimeout(onDismiss, 200);
+    } else {
+      setOffset(0);
+    }
+  }, [offset, onDismiss]);
+
+  return (
+    <div
+      ref={ref}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      style={{
+        transform: dismissed ? 'translateX(120%)' : `translateX(${offset}px)`,
+        opacity: dismissed ? 0 : 1 - offset / (THRESHOLD * 3),
+        transition: drag.current ? 'none' : 'transform 200ms ease, opacity 200ms ease',
+        touchAction: 'pan-y',
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
 
@@ -244,13 +304,15 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                 : 'Error';
 
         return (
-          <div key={entry.jobId} style={rowStyle}>
-            {entry.status === 'working' && <DotSpinner color={entry.color} />}
-            {entry.status === 'queued' && <ColorSquare color={entry.color} />}
-            {entry.status === 'done' && <Checkmark color={entry.color} />}
-            {entry.status === 'error' && <ErrorDot />}
-            <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
-          </div>
+          <SwipeDismiss key={entry.jobId} onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
+            <div style={rowStyle}>
+              {entry.status === 'working' && <DotSpinner color={entry.color} />}
+              {entry.status === 'queued' && <ColorSquare color={entry.color} />}
+              {entry.status === 'done' && <Checkmark color={entry.color} />}
+              {entry.status === 'error' && <ErrorDot />}
+              <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
+            </div>
+          </SwipeDismiss>
         );
       })}
     </div>

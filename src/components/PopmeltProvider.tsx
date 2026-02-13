@@ -48,6 +48,7 @@ const CLAUDE_MODELS = [
 
 const CODEX_MODELS = [
   { id: 'gpt-5.3-codex', label: 'Codex 5.3' },
+  { id: 'gpt-5.3-codex-spark', label: 'Spark 5.3' },
   { id: 'gpt-5.1-codex-mini', label: 'Mini 5.1' },
 ] as const;
 

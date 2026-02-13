@@ -173,4 +173,6 @@ const { isEnabled } = usePopmelt();
 
 **If you need a custom license** for your use case, contact [reb@popmelt.com](mailto:reb@popmelt.com) with a brief outline of your desired terms.
 
+<p style="background: #efefef; padding: 4px; display: inline-flex">
 <img src="src/assets/popmelt-logo.svg" alt="Comment and zhuzh, then hand off." width="64" />
+</p>

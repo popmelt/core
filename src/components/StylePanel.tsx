@@ -4,6 +4,7 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlignCenter, AlignHorizontalSpaceAround, AlignJustify, AlignLeft, AlignRight, AlignVerticalSpaceAround, Baseline, Check, ChevronDown, Columns3, Grid2x2, MoveHorizontal, Plus, RectangleHorizontal, RotateCcw, Rows3, Shrink, UnfoldHorizontal, UnfoldVertical, WholeWord, X } from 'lucide-react';
 
+import { POPMELT_BORDER } from '../styles/border';
 import type { AnnotationAction, ElementInfo, StyleModification } from '../tools/types';
 import {
   applyInlineStyle,
@@ -24,6 +25,8 @@ type StylePanelProps = {
   styleModifications: StyleModification[];
   dispatch: React.Dispatch<AnnotationAction>;
   onClose: () => void;
+  /** null = mouse left panel, 'element' = general hover, 'padding' | 'gap' = field-specific */
+  onHover?: (hint: string | null) => void;
   accentColor?: string;
 };
 
@@ -1103,6 +1106,8 @@ function UnitInput({
   placeholder,
   showUnit = true,
   unitStyle: customUnitStyle,
+  preferredUnit,
+  onUnitCycle,
 }: {
   property: string;
   value: string;
@@ -1115,11 +1120,20 @@ function UnitInput({
   placeholder?: string;
   showUnit?: boolean;
   unitStyle?: CSSProperties;
+  /** Panel-wide unit preference — overrides the default unit for properties that support it */
+  preferredUnit?: 'rem' | 'px';
+  /** Called when the unit label is clicked to cycle the panel-wide preference */
+  onUnitCycle?: () => void;
 }) {
   const parsed = parseValue(value);
+  // Use panel-wide preference when the property supports it
+  const propertyDefault = getDefaultUnit(property);
+  const units = PROPERTY_UNITS[property];
+  const canUsePreference = preferredUnit && units && units.includes(preferredUnit);
+  const defaultUnit = canUsePreference ? preferredUnit : propertyDefault;
   const effectiveUnit = isModified
-    ? (parsed.unit || getDefaultUnit(property))
-    : getDefaultUnit(property);
+    ? (parsed.unit || defaultUnit)
+    : defaultUnit;
 
   // Convert display number when the effective unit differs from the value's unit
   // e.g. computed "32px" with default "rem" → display as 2 (rem)
@@ -1197,11 +1211,19 @@ function UnitInput({
   const hasTypedUnit = isFocused && /\s*(rem|em|px|%)\s*$/i.test(editText);
   const shownUnit = hasTypedUnit ? '' : effectiveUnit;
 
+  const isUnitClickable = onUnitCycle && (shownUnit === 'rem' || shownUnit === 'px');
+
   const defaultUnitSuffix: CSSProperties = {
     fontSize: 10,
     fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
     color: '#999',
     pointerEvents: 'none',
+  };
+
+  const clickableUnitStyle: CSSProperties = {
+    ...(customUnitStyle ?? defaultUnitSuffix),
+    pointerEvents: 'auto',
+    cursor: 'pointer',
   };
 
   return (
@@ -1218,7 +1240,11 @@ function UnitInput({
         style={inputStyle}
       />
       {showUnit && shownUnit && (
-        <span style={customUnitStyle ?? defaultUnitSuffix}>{shownUnit}</span>
+        <span
+          style={isUnitClickable ? clickableUnitStyle : (customUnitStyle ?? defaultUnitSuffix)}
+          onClick={isUnitClickable ? onUnitCycle : undefined}
+          title={isUnitClickable ? 'Click to switch units' : undefined}
+        >{shownUnit}</span>
       )}
     </>
   );
@@ -1702,6 +1728,9 @@ type LayoutSectionProps = {
   onDropdownChange: (dropdown: 'width' | 'height' | null) => void;
   panelContentRef: React.RefObject<HTMLDivElement | null>;
   accentColor: string;
+  onFieldHover?: (hint: string | null) => void;
+  preferredUnit: 'rem' | 'px';
+  onUnitCycle: () => void;
 };
 
 function LayoutSection({
@@ -1718,6 +1747,9 @@ function LayoutSection({
   onDropdownChange,
   panelContentRef,
   accentColor,
+  onFieldHover,
+  preferredUnit,
+  onUnitCycle,
 }: LayoutSectionProps) {
   const setActiveDropdown = onDropdownChange;
 
@@ -1755,7 +1787,10 @@ function LayoutSection({
   const gridRows = gridTemplateRows.split(/\s+/).filter(v => v && v !== 'none').length || 1;
 
   // Dimming logic
+  const [gridHovered, setGridHovered] = useState(false);
   const hasActiveDropdown = activeDropdown !== null;
+  const dimSiblings = hasActiveDropdown || gridHovered;
+  const siblingOpacity = hasActiveDropdown ? 0.3 : gridHovered ? 0.65 : 1;
 
   // Display mode button
   const DisplayModeButton = ({ mode, icon, active }: { mode: DisplayMode; icon: React.ReactNode; active: boolean }) => (
@@ -1802,48 +1837,111 @@ function LayoutSection({
     handleChange('padding', `${v} ${current.right} ${v} ${current.left}`);
   };
 
+  // Scrub display overrides — tracks live preview values so UnitInput shows them during drag
+  const [scrubDisplay, setScrubDisplay] = useState<Record<string, string>>({});
+
+  const scrubPreview = useCallback((key: string, domUpdate: (v: string) => void) => (v: string) => {
+    domUpdate(v);
+    setScrubDisplay(prev => ({ ...prev, [key]: v }));
+  }, []);
+
+  const clearScrub = useCallback((key: string) => {
+    setScrubDisplay(prev => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  // Live preview via inline style (no modification tracking)
+  const previewPaddingHorizontal = useCallback((v: string) => {
+    const current = parseSpacing(getValue('padding'));
+    applyInlineStyle(element, 'padding', `${current.top} ${v} ${current.bottom} ${v}`);
+  }, [element, getValue]);
+
+  const previewPaddingVertical = useCallback((v: string) => {
+    const current = parseSpacing(getValue('padding'));
+    applyInlineStyle(element, 'padding', `${v} ${current.right} ${v} ${current.left}`);
+  }, [element, getValue]);
+
+  const previewProperty = useCallback((property: string) => (v: string) => {
+    applyInlineStyle(element, property, v);
+  }, [element]);
+
   // 9-dot alignment grid for flex
-  const AlignmentGrid = () => {
-    const justify = getValue('justify-content');
-    const align = getValue('align-items');
-    const isColumn = flexDirection === 'column' || flexDirection === 'column-reverse';
+  // --- Alignment grid: swipe + click to set justify/align ---
+  const isColumn = flexDirection === 'column' || flexDirection === 'column-reverse';
 
-    // Map CSS values to grid positions
-    const getJustifyIndex = (val: string): number => {
-      if (val === 'flex-start' || val === 'start') return 0;
-      if (val === 'center') return 1;
-      if (val === 'flex-end' || val === 'end') return 2;
-      return 0;
-    };
+  const getAxisIndex = (val: string): number => {
+    if (val === 'center') return 1;
+    if (val === 'flex-end' || val === 'end') return 2;
+    return 0;
+  };
 
-    const getAlignIndex = (val: string): number => {
-      if (val === 'flex-start' || val === 'start') return 0;
-      if (val === 'center') return 1;
-      if (val === 'flex-end' || val === 'end') return 2;
-      return 0;
-    };
+  const justifyIdx = getAxisIndex(getValue('justify-content'));
+  const alignIdx = getAxisIndex(getValue('align-items'));
+  const gridActiveCol = isColumn ? alignIdx : justifyIdx;
+  const gridActiveRow = isColumn ? justifyIdx : alignIdx;
 
-    const justifyIdx = getJustifyIndex(justify);
-    const alignIdx = getAlignIndex(align);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const gridSwipeAccum = useRef({ x: 0, y: 0 });
+  const gridPosRef = useRef({ col: gridActiveCol, row: gridActiveRow });
+  gridPosRef.current = { col: gridActiveCol, row: gridActiveRow };
 
-    // For column direction, swap the axes
-    const activeCol = isColumn ? alignIdx : justifyIdx;
-    const activeRow = isColumn ? justifyIdx : alignIdx;
+  const applyGridPosition = useCallback((col: number, row: number) => {
+    const vals = ['flex-start', 'center', 'flex-end'];
+    if (isColumn) {
+      handleChange('justify-content', vals[row]!);
+      handleChange('align-items', vals[col]!);
+    } else {
+      handleChange('justify-content', vals[col]!);
+      handleChange('align-items', vals[row]!);
+    }
+  }, [isColumn, handleChange]);
+  const applyGridRef = useRef(applyGridPosition);
+  applyGridRef.current = applyGridPosition;
 
-    const handleClick = (col: number, row: number) => {
-      const justifyValues = ['flex-start', 'center', 'flex-end'];
-      const alignValues = ['flex-start', 'center', 'flex-end'];
-      if (isColumn) {
-        handleChange('justify-content', justifyValues[row]!);
-        handleChange('align-items', alignValues[col]!);
-      } else {
-        handleChange('justify-content', justifyValues[col]!);
-        handleChange('align-items', alignValues[row]!);
+  // Document-level capture listener — lives at LayoutSection level so it's never torn down mid-interaction.
+  useEffect(() => {
+    const THRESHOLD = 30;
+    const onWheel = (e: WheelEvent) => {
+      const grid = gridRef.current;
+      if (!grid || !grid.contains(e.target as Node)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      gridSwipeAccum.current.x += e.deltaX;
+      gridSwipeAccum.current.y += e.deltaY;
+
+      let { col, row } = gridPosRef.current;
+      let moved = false;
+
+      if (Math.abs(gridSwipeAccum.current.x) >= THRESHOLD) {
+        col = Math.max(0, Math.min(2, col + (gridSwipeAccum.current.x > 0 ? 1 : -1)));
+        gridSwipeAccum.current.x = 0;
+        gridSwipeAccum.current.y = 0;
+        moved = true;
+      }
+      if (!moved && Math.abs(gridSwipeAccum.current.y) >= THRESHOLD) {
+        row = Math.max(0, Math.min(2, row + (gridSwipeAccum.current.y > 0 ? 1 : -1)));
+        gridSwipeAccum.current.x = 0;
+        gridSwipeAccum.current.y = 0;
+        moved = true;
+      }
+
+      if (moved && (col !== gridPosRef.current.col || row !== gridPosRef.current.row)) {
+        applyGridRef.current(col, row);
       }
     };
+    document.addEventListener('wheel', onWheel, { passive: false, capture: true });
+    return () => document.removeEventListener('wheel', onWheel, { capture: true });
+  }, []);
 
-    return (
-      <div style={{
+  const renderAlignmentGrid = () => (
+    <div
+      ref={gridRef}
+      onMouseEnter={() => { setGridHovered(true); if (panelContentRef.current) panelContentRef.current.style.overflowY = 'hidden'; }}
+      onMouseLeave={() => { setGridHovered(false); if (panelContentRef.current) panelContentRef.current.style.overflowY = 'auto'; }}
+      style={{
         width: 56,
         height: 56,
         backgroundColor: FIELD_BG,
@@ -1853,40 +1951,66 @@ function LayoutSection({
         gridTemplateRows: 'repeat(3, 1fr)',
         padding: 6,
         gap: 2,
-      }}>
-        {[0, 1, 2].map(row =>
-          [0, 1, 2].map(col => {
-            const isActive = col === activeCol && row === activeRow;
-            return (
-              <button
-                key={`${row}-${col}`}
-                type="button"
-                onClick={() => handleClick(col, row)}
-                style={{
-                  width: '100%',
-                  height: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  border: 'none',
-                  backgroundColor: 'transparent',
-                  cursor: 'pointer',
-                  padding: 0,
-                }}
-              >
+        touchAction: 'none',
+      }}
+    >
+      {[0, 1, 2].map(row =>
+        [0, 1, 2].map(col => {
+          const isActive = col === gridActiveCol && row === gridActiveRow;
+          return (
+            <button
+              key={`${row}-${col}`}
+              type="button"
+              onClick={() => applyGridPosition(col, row)}
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: 'none',
+                backgroundColor: 'transparent',
+                cursor: 'pointer',
+                padding: 0,
+              }}
+            >
+              {isActive ? (
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{ flexShrink: 0 }}>
+                  {/* 3 horizontal lines: widths 8/5/7, aligned by column */}
+                  {col === 0 ? (
+                    <>
+                      <rect x="1" y="1.5" width="8" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="1" y="4.4" width="5" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="1" y="7.3" width="7" height="1.2" rx="0.5" fill={accentColor} />
+                    </>
+                  ) : col === 1 ? (
+                    <>
+                      <rect x="1" y="1.5" width="8" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="2.5" y="4.4" width="5" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="1.5" y="7.3" width="7" height="1.2" rx="0.5" fill={accentColor} />
+                    </>
+                  ) : (
+                    <>
+                      <rect x="1" y="1.5" width="8" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="4" y="4.4" width="5" height="1.2" rx="0.5" fill={accentColor} />
+                      <rect x="2" y="7.3" width="7" height="1.2" rx="0.5" fill={accentColor} />
+                    </>
+                  )}
+                </svg>
+              ) : (
                 <div style={{
-                  width: 6,
-                  height: 6,
+                  width: 5,
+                  height: 5,
                   borderRadius: '50%',
-                  backgroundColor: isActive ? accentColor : '#d1d5db',
+                  backgroundColor: '#aaa',
                 }} />
-              </button>
-            );
-          })
-        )}
-      </div>
-    );
-  };
+              )}
+            </button>
+          );
+        })
+      )}
+    </div>
+  );
 
   // GridDimensions moved to module level
   const gridModified = isModified('grid-template-columns') || isModified('grid-template-rows');
@@ -1902,7 +2026,7 @@ function LayoutSection({
 
       <div style={{ padding: '8px 12px' }}>
           {/* Display Mode - 4 button segmented control */}
-          <div style={{ display: 'flex', gap: 2, marginBottom: 8, backgroundColor: FIELD_BG, borderRadius: 2, padding: 2, opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
+          <div style={{ display: 'flex', gap: 2, marginBottom: 8, backgroundColor: FIELD_BG, borderRadius: 2, padding: 2, opacity: siblingOpacity, transition: 'opacity 150ms ease' }}>
             <DisplayModeButton mode="block" icon={<RectangleHorizontal size={16} />} active={displayMode === 'block'} />
             <DisplayModeButton mode="flex-col" icon={<Rows3 size={16} />} active={displayMode === 'flex-col'} />
             <DisplayModeButton mode="flex-row" icon={<Columns3 size={16} />} active={displayMode === 'flex-row'} />
@@ -1975,9 +2099,9 @@ function LayoutSection({
 
           {/* Flex: Alignment grid + Gap */}
           {isFlex && (
-            <div style={{ display: 'flex', gap: 8, marginBottom: 8, opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
-              <AlignmentGrid />
-              <div style={{ flex: 1 }}>
+            <div onMouseEnter={() => onFieldHover?.('gap')} onMouseLeave={() => onFieldHover?.('element')} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <div style={{ opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>{renderAlignmentGrid()}</div>
+              <div style={{ flex: 1, opacity: siblingOpacity, transition: 'opacity 150ms ease' }}>
                 <div
                   onClick={isModified('gap') ? () => onResetProperty('gap') : undefined}
                   title={isModified('gap') ? 'Click to reset' : undefined}
@@ -1992,28 +2116,29 @@ function LayoutSection({
                 >Gap</div>
                 <FieldWrapper dimmed={hasActiveDropdown}>
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    <span
-                      onClick={isModified('gap') ? () => onResetProperty('gap') : undefined}
-                      title={isModified('gap') ? 'Click to reset' : undefined}
-                      style={{
-                        color: isModified('gap') ? accentColor : '#999',
-                        padding: '0 4px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        cursor: isModified('gap') ? 'pointer' : 'default',
-                      }}
+                    <ScrubLabel
+                      value={gap}
+                      onChange={(v) => { clearScrub('gap'); handleChange('gap', v); }}
+                      onPreview={scrubPreview('gap', previewProperty('gap'))}
+                      onScrubEnd={() => clearScrub('gap')}
+                      onReset={() => onResetProperty('gap')}
+                      isModified={isModified('gap')}
+                      accentColor={accentColor}
+                      defaultUnit={preferredUnit}
                     >
                       {flexDirection === 'column' || flexDirection === 'column-reverse'
                         ? <UnfoldVertical size={12} strokeWidth={isModified('gap') ? 2.5 : 1.5} />
                         : <UnfoldHorizontal size={12} strokeWidth={isModified('gap') ? 2.5 : 1.5} />}
-                    </span>
+                    </ScrubLabel>
                     <UnitInput
                       property="gap"
-                      value={gap}
+                      value={scrubDisplay['gap'] || gap}
                       onChange={(v) => handleChange('gap', v)}
-                      isModified={isModified('gap')}
+                      isModified={isModified('gap') || 'gap' in scrubDisplay}
                       style={{ ...compactInputStyle, flex: 1, minWidth: 0 }}
                       unitStyle={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#999', padding: '0 8px' }}
+                      preferredUnit={preferredUnit}
+                      onUnitCycle={onUnitCycle}
                     />
                   </div>
                 </FieldWrapper>
@@ -2023,7 +2148,7 @@ function LayoutSection({
 
           {/* Grid: Dimensions + Row/Column gaps */}
           {isGrid && (
-            <div style={{ display: 'flex', gap: 8, marginBottom: 8, opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
+            <div onMouseEnter={() => onFieldHover?.('gap')} onMouseLeave={() => onFieldHover?.('element')} style={{ display: 'flex', gap: 8, marginBottom: 8, opacity: siblingOpacity, transition: 'opacity 150ms ease' }}>
               <GridDimensions
                 gridCols={gridCols}
                 gridRows={gridRows}
@@ -2035,53 +2160,55 @@ function LayoutSection({
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <FieldWrapper dimmed={hasActiveDropdown}>
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    <span
-                      onClick={isModified('column-gap') ? () => onResetProperty('column-gap') : undefined}
-                      title={isModified('column-gap') ? 'Click to reset' : undefined}
-                      style={{
-                        color: isModified('column-gap') ? accentColor : '#999',
-                        padding: '0 4px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        cursor: isModified('column-gap') ? 'pointer' : 'default',
-                      }}
+                    <ScrubLabel
+                      value={columnGap || gap}
+                      onChange={(v) => { clearScrub('column-gap'); handleChange('column-gap', v); }}
+                      onPreview={scrubPreview('column-gap', previewProperty('column-gap'))}
+                      onScrubEnd={() => clearScrub('column-gap')}
+                      onReset={() => onResetProperty('column-gap')}
+                      isModified={isModified('column-gap')}
+                      accentColor={accentColor}
+                      defaultUnit={preferredUnit}
                     >
                       <UnfoldHorizontal size={12} strokeWidth={isModified('column-gap') ? 2.5 : 1.5} />
-                    </span>
+                    </ScrubLabel>
                     <UnitInput
                       property="column-gap"
-                      value={columnGap || gap}
+                      value={scrubDisplay['column-gap'] || columnGap || gap}
                       onChange={(v) => handleChange('column-gap', v)}
-                      isModified={isModified('column-gap')}
+                      isModified={isModified('column-gap') || 'column-gap' in scrubDisplay}
                       placeholder="col"
                       style={{ ...compactInputStyle, flex: 1, minWidth: 0 }}
                       unitStyle={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#999', padding: '0 8px' }}
+                      preferredUnit={preferredUnit}
+                      onUnitCycle={onUnitCycle}
                     />
                   </div>
                 </FieldWrapper>
                 <FieldWrapper dimmed={hasActiveDropdown}>
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    <span
-                      onClick={isModified('row-gap') ? () => onResetProperty('row-gap') : undefined}
-                      title={isModified('row-gap') ? 'Click to reset' : undefined}
-                      style={{
-                        color: isModified('row-gap') ? accentColor : '#999',
-                        padding: '0 4px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        cursor: isModified('row-gap') ? 'pointer' : 'default',
-                      }}
+                    <ScrubLabel
+                      value={rowGap || gap}
+                      onChange={(v) => { clearScrub('row-gap'); handleChange('row-gap', v); }}
+                      onPreview={scrubPreview('row-gap', previewProperty('row-gap'))}
+                      onScrubEnd={() => clearScrub('row-gap')}
+                      onReset={() => onResetProperty('row-gap')}
+                      isModified={isModified('row-gap')}
+                      accentColor={accentColor}
+                      defaultUnit={preferredUnit}
                     >
                       <UnfoldVertical size={12} strokeWidth={isModified('row-gap') ? 2.5 : 1.5} />
-                    </span>
+                    </ScrubLabel>
                     <UnitInput
                       property="row-gap"
-                      value={rowGap || gap}
+                      value={scrubDisplay['row-gap'] || rowGap || gap}
                       onChange={(v) => handleChange('row-gap', v)}
-                      isModified={isModified('row-gap')}
+                      isModified={isModified('row-gap') || 'row-gap' in scrubDisplay}
                       placeholder="row"
                       style={{ ...compactInputStyle, flex: 1, minWidth: 0 }}
                       unitStyle={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#999', padding: '0 8px' }}
+                      preferredUnit={preferredUnit}
+                      onUnitCycle={onUnitCycle}
                     />
                   </div>
                 </FieldWrapper>
@@ -2091,56 +2218,60 @@ function LayoutSection({
 
           {/* Padding - horizontal + vertical fields (for flex/grid) */}
           {isFlexOrGrid && (
-            <div style={{ display: 'flex', gap: 4, marginBottom: 8, opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
+            <div onMouseEnter={() => onFieldHover?.('padding')} onMouseLeave={() => onFieldHover?.('element')} style={{ display: 'flex', gap: 4, marginBottom: 8, opacity: siblingOpacity, transition: 'opacity 150ms ease' }}>
               <FieldWrapper style={{ flex: 1 }} dimmed={hasActiveDropdown}>
                 <div style={{ display: 'flex', alignItems: 'center' }}>
-                  <span
-                    onClick={isModified('padding') ? () => onResetProperty('padding') : undefined}
-                    title={isModified('padding') ? 'Click to reset' : undefined}
-                    style={{
-                      color: isModified('padding') ? accentColor : '#999',
-                      padding: '0 4px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      cursor: isModified('padding') ? 'pointer' : 'default',
-                    }}
+                  <ScrubLabel
+                    value={padding.left}
+                    onChange={(v) => { clearScrub('padding-h'); handlePaddingHorizontal(v); }}
+                    onPreview={scrubPreview('padding-h', previewPaddingHorizontal)}
+                    onScrubEnd={() => clearScrub('padding-h')}
+                    onReset={() => onResetProperty('padding')}
+                    isModified={isModified('padding')}
+                    accentColor={accentColor}
+                    defaultUnit={preferredUnit}
+                    snapSteps={PADDING_SNAP_STEPS}
                   >
                     <AlignHorizontalSpaceAround size={12} strokeWidth={isModified('padding') ? 2.5 : 1.5} />
-                  </span>
+                  </ScrubLabel>
                   <UnitInput
                     property="padding"
-                    value={padding.left}
+                    value={scrubDisplay['padding-h'] || padding.left}
                     onChange={(v) => handlePaddingHorizontal(v)}
-                    isModified={isModified('padding')}
+                    isModified={isModified('padding') || 'padding-h' in scrubDisplay}
                     placeholder="H pad"
                     style={{ ...compactInputStyle, flex: 1, minWidth: 0 }}
                     unitStyle={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#999', padding: '0 8px' }}
+                    preferredUnit={preferredUnit}
+                    onUnitCycle={onUnitCycle}
                   />
                 </div>
               </FieldWrapper>
               <FieldWrapper style={{ flex: 1 }} dimmed={hasActiveDropdown}>
                 <div style={{ display: 'flex', alignItems: 'center' }}>
-                  <span
-                    onClick={isModified('padding') ? () => onResetProperty('padding') : undefined}
-                    title={isModified('padding') ? 'Click to reset' : undefined}
-                    style={{
-                      color: isModified('padding') ? accentColor : '#999',
-                      padding: '0 4px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      cursor: isModified('padding') ? 'pointer' : 'default',
-                    }}
+                  <ScrubLabel
+                    value={padding.top}
+                    onChange={(v) => { clearScrub('padding-v'); handlePaddingVertical(v); }}
+                    onPreview={scrubPreview('padding-v', previewPaddingVertical)}
+                    onScrubEnd={() => clearScrub('padding-v')}
+                    onReset={() => onResetProperty('padding')}
+                    isModified={isModified('padding')}
+                    accentColor={accentColor}
+                    defaultUnit={preferredUnit}
+                    snapSteps={PADDING_SNAP_STEPS}
                   >
                     <AlignVerticalSpaceAround size={12} strokeWidth={isModified('padding') ? 2.5 : 1.5} />
-                  </span>
+                  </ScrubLabel>
                   <UnitInput
                     property="padding"
-                    value={padding.top}
+                    value={scrubDisplay['padding-v'] || padding.top}
                     onChange={(v) => handlePaddingVertical(v)}
-                    isModified={isModified('padding')}
+                    isModified={isModified('padding') || 'padding-v' in scrubDisplay}
                     placeholder="V pad"
                     style={{ ...compactInputStyle, flex: 1, minWidth: 0 }}
                     unitStyle={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#999', padding: '0 8px' }}
+                    preferredUnit={preferredUnit}
+                    onUnitCycle={onUnitCycle}
                   />
                 </div>
               </FieldWrapper>
@@ -2148,7 +2279,7 @@ function LayoutSection({
           )}
 
           {/* Clip content checkbox */}
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 11, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#64748b', opacity: hasActiveDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 11, fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', color: '#64748b', opacity: siblingOpacity, transition: 'opacity 150ms ease' }}>
             <input
               type="checkbox"
               checked={overflow === 'hidden'}
@@ -2177,6 +2308,8 @@ type TypographySectionProps = {
   activeColorDropdown: string | null;
   onColorDropdownChange: (property: string | null) => void;
   panelContentRef: React.RefObject<HTMLDivElement | null>;
+  preferredUnit: 'rem' | 'px';
+  onUnitCycle: () => void;
 };
 
 // Font weight labels
@@ -2206,6 +2339,8 @@ function TypographySection({
   activeColorDropdown,
   onColorDropdownChange,
   panelContentRef,
+  preferredUnit,
+  onUnitCycle,
 }: TypographySectionProps) {
   const fontFamily = getValue('font-family');
   const fontSize = getValue('font-size');
@@ -2332,8 +2467,9 @@ function TypographySection({
                     fontSize: 10,
                     fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
                     color: '#999',
-                    pointerEvents: 'none',
                   }}
+                  preferredUnit={preferredUnit}
+                  onUnitCycle={onUnitCycle}
                 />
               </div>
             </FieldWrapper>
@@ -2443,6 +2579,162 @@ function parseValue(value: string): { num: number; unit: string } {
   return { num: 0, unit: '' };
 }
 
+/**
+ * Draggable label icon — horizontal drag scrubs the associated numeric value.
+ * Uses Pointer Lock for infinite cursor wrapping at viewport edges.
+ * Live preview via `onPreview` during drag; `onChange` only fires on mouseup.
+ */
+/** Padding snap steps in px — matches canvas handle snap behavior */
+const PADDING_SNAP_STEPS = [0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32] as const;
+
+function ScrubLabel({
+  value,
+  onChange,
+  onPreview,
+  onScrubEnd,
+  onReset,
+  isModified,
+  accentColor,
+  defaultUnit = 'rem',
+  snapSteps,
+  color,
+  style,
+  children,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  /** Called on every drag frame for live inline preview — should NOT record a modification */
+  onPreview?: (v: string) => void;
+  /** Called after mouseup to clean up any preview display state */
+  onScrubEnd?: () => void;
+  onReset?: () => void;
+  isModified?: boolean;
+  accentColor?: string;
+  /** Unit to use when the parsed value has no unit or is 'px'. Defaults to 'rem'. */
+  defaultUnit?: string;
+  /** Snap steps in px — when shift is held, value snaps to the nearest step. Beyond last step, snaps to multiples of 8. */
+  snapSteps?: readonly number[];
+  color?: string;
+  style?: CSSProperties;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const scrub = useRef<{ startValue: number; unit: string; accum: number; hasMoved: boolean } | null>(null);
+  const resetRef = useRef(onReset);
+  const modifiedRef = useRef(isModified);
+  const lastShiftRef = useRef(false);
+  resetRef.current = onReset;
+  modifiedRef.current = isModified;
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const s = scrub.current;
+      if (!s) return;
+      s.hasMoved = true;
+      lastShiftRef.current = e.shiftKey;
+      // Sensitivity: 1px/px, 0.1px/rem, 0.1px/em
+      const sens = (s.unit === 'rem' || s.unit === 'em') ? 0.1 : 1;
+      s.accum += e.movementX * sens;
+      let newVal = Math.max(0, Math.round((s.startValue + s.accum) * 10) / 10);
+      // Shift-snap to predefined steps
+      if (e.shiftKey && snapSteps) {
+        // Convert snap steps from px to current unit if needed
+        const rootFs = (s.unit === 'rem' || s.unit === 'em')
+          ? (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16)
+          : 1;
+        const pxVal = s.unit === 'rem' || s.unit === 'em' ? newVal * rootFs : newVal;
+        let snapped = snapSteps[snapSteps.length - 1]!;
+        for (let i = 0; i < snapSteps.length - 1; i++) {
+          const lo = snapSteps[i]!;
+          const hi = snapSteps[i + 1]!;
+          if (pxVal <= (lo + hi) / 2) { snapped = lo; break; }
+          if (pxVal < hi) { snapped = hi; break; }
+        }
+        // Beyond last step: snap to nearest multiple of 8
+        if (pxVal > snapSteps[snapSteps.length - 1]!) {
+          snapped = Math.round(pxVal / 8) * 8;
+        }
+        newVal = s.unit === 'rem' || s.unit === 'em'
+          ? Math.round((snapped / rootFs) * 1000) / 1000
+          : snapped;
+      }
+      onPreview?.(`${newVal}${s.unit}`);
+    };
+    const onUp = () => {
+      const s = scrub.current;
+      if (!s) return;
+      let finalVal = Math.max(0, Math.round((s.startValue + s.accum) * 10) / 10);
+      // Re-apply shift-snap for the committed value
+      if (lastShiftRef.current && snapSteps) {
+        const rootFs = (s.unit === 'rem' || s.unit === 'em')
+          ? (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16)
+          : 1;
+        const pxVal = s.unit === 'rem' || s.unit === 'em' ? finalVal * rootFs : finalVal;
+        let snapped = snapSteps[snapSteps.length - 1]!;
+        for (let i = 0; i < snapSteps.length - 1; i++) {
+          const lo = snapSteps[i]!;
+          const hi = snapSteps[i + 1]!;
+          if (pxVal <= (lo + hi) / 2) { snapped = lo; break; }
+          if (pxVal < hi) { snapped = hi; break; }
+        }
+        if (pxVal > snapSteps[snapSteps.length - 1]!) {
+          snapped = Math.round(pxVal / 8) * 8;
+        }
+        finalVal = s.unit === 'rem' || s.unit === 'em'
+          ? Math.round((snapped / rootFs) * 1000) / 1000
+          : snapped;
+      }
+      const changed = s.hasMoved && finalVal !== s.startValue;
+      scrub.current = null;
+      document.exitPointerLock();
+      if (changed) {
+        onChange(`${finalVal}${s.unit}`);
+      } else if (s.hasMoved) {
+        // Scrubbed back to original — revert preview
+        onPreview?.(`${s.startValue}${s.unit}`);
+      } else if (modifiedRef.current && resetRef.current) {
+        // Click with no drag on a modified field → reset
+        resetRef.current();
+      }
+      onScrubEnd?.();
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+  }, [onChange, onPreview, onScrubEnd]);
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const parsed = parseValue(value);
+    // Use defaultUnit when the value is unitless or in px (computed values are always px)
+    const unit = (parsed.unit && parsed.unit !== 'px') ? parsed.unit : defaultUnit;
+    scrub.current = { startValue: parsed.num, unit, accum: 0, hasMoved: false };
+    ref.current?.requestPointerLock();
+  }, [value, defaultUnit]);
+
+  return (
+    <span
+      ref={ref}
+      onMouseDown={onMouseDown}
+      title={isModified ? 'Click to reset · Drag to scrub' : 'Drag to scrub'}
+      style={{
+        color: isModified ? (accentColor || '#3b82f6') : (color || '#999'),
+        padding: '0 4px',
+        display: 'flex',
+        alignItems: 'center',
+        cursor: 'ew-resize',
+        ...style,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
 // Convert RGB/RGBA to hex
 function rgbToHex(color: string): string {
   const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
@@ -2462,23 +2754,34 @@ export function StylePanel({
   styleModifications,
   dispatch,
   onClose,
+  onHover,
   accentColor = '#3b82f6',
 }: StylePanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const panelContentRef = useRef<HTMLDivElement>(null);
 
-  // Delayed fade-in to avoid flash at (0,0) before positioning
-  const [visible, setVisible] = useState(false);
+  // Delayed fade-in to avoid flash at (0,0) before positioning.
+  // Skip if we have a saved position — panel won't jump so no flash.
+  const [visible, setVisible] = useState(() => {
+    try { return !!localStorage.getItem('devtools-panel-position'); } catch { return false; }
+  });
   useEffect(() => {
+    if (visible) return;
     const id = setTimeout(() => setVisible(true), 50);
     return () => clearTimeout(id);
-  }, []);
+  }, [visible]);
 
   // Track which dropdown is open globally (for dimming sibling sections)
   const [activeDropdown, setActiveDropdown] = useState<'width' | 'height' | null>(null);
   // Track which color dropdown is open
   const [activeColorDropdown, setActiveColorDropdown] = useState<string | null>(null);
   const hasActiveDropdown = activeDropdown !== null || activeColorDropdown !== null;
+
+  // Panel-wide unit preference — cycles between rem and px
+  const [preferredUnit, setPreferredUnit] = useState<'rem' | 'px'>('rem');
+  const cycleUnit = useCallback(() => {
+    setPreferredUnit(u => u === 'rem' ? 'px' : 'rem');
+  }, []);
 
 
   // Track original values for this element
@@ -2510,45 +2813,134 @@ export function StylePanel({
   const positionRef = useRef({ top: 0, left: 0, maxHeight: 400 });
   const [, forceUpdate] = useState(0);
 
+  // Draggable header — persisted to localStorage
+  const PANEL_POS_KEY = 'devtools-panel-position';
+  const dragOffset = useRef({ x: 0, y: 0 });
+  const dragState = useRef<{ startX: number; startY: number; startOffsetX: number; startOffsetY: number } | null>(null);
+  const hasSavedPosition = useRef(false);
+
+  // On mount, check for a saved position
   useEffect(() => {
+    try {
+      const stored = localStorage.getItem(PANEL_POS_KEY);
+      if (stored) {
+        const pos = JSON.parse(stored);
+        if (typeof pos.top === 'number' && typeof pos.left === 'number') {
+          hasSavedPosition.current = true;
+          positionRef.current = { ...positionRef.current, top: pos.top, left: pos.left };
+        }
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      const ds = dragState.current;
+      if (!ds) return;
+      const rawX = ds.startOffsetX + (e.clientX - ds.startX);
+      const rawY = ds.startOffsetY + (e.clientY - ds.startY);
+
+      // Clamp so the panel stays within 16px of left/top/right edges
+      const panelWidth = 280;
+      const edgePad = 16;
+      const clampedLeft = Math.max(edgePad, Math.min(window.innerWidth - panelWidth - edgePad, positionRef.current.left + rawX));
+      const clampedTop = Math.max(edgePad, positionRef.current.top + rawY);
+
+      dragOffset.current = {
+        x: clampedLeft - positionRef.current.left,
+        y: clampedTop - positionRef.current.top,
+      };
+      const panel = panelRef.current;
+      const wrapper = panel?.parentElement;
+      if (!wrapper) return;
+
+      wrapper.style.top = `${clampedTop}px`;
+      wrapper.style.left = `${clampedLeft}px`;
+
+      // Recalculate max height based on dragged position vs toolbar
+      const toolbar = document.getElementById('devtools-toolbar');
+      const toolbarRect = toolbar?.getBoundingClientRect();
+      let bottomLimit = window.innerHeight - 16;
+      if (toolbarRect && clampedLeft + panelWidth > toolbarRect.left) {
+        bottomLimit = toolbarRect.top - 8;
+      }
+      const visibleTop = Math.max(0, clampedTop);
+      const maxHeight = Math.max(200, bottomLimit - visibleTop);
+      if (panel) panel.style.maxHeight = `${maxHeight}px`;
+    };
+    const onMouseUp = () => {
+      if (!dragState.current) return;
+      // Persist final absolute position
+      const finalTop = positionRef.current.top + dragOffset.current.y;
+      const finalLeft = positionRef.current.left + dragOffset.current.x;
+      positionRef.current = { ...positionRef.current, top: finalTop, left: finalLeft };
+      dragOffset.current = { x: 0, y: 0 };
+      hasSavedPosition.current = true;
+      try { localStorage.setItem(PANEL_POS_KEY, JSON.stringify({ top: finalTop, left: finalLeft })); } catch { /* ignore */ }
+      dragState.current = null;
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
+
+  const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
+    // Only drag on left-click, ignore if clicking buttons inside header
+    if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return;
+    e.preventDefault();
+    dragState.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startOffsetX: dragOffset.current.x,
+      startOffsetY: dragOffset.current.y,
+    };
+  }, []);
+
+  useEffect(() => {
+    // Reset drag offset when inspecting a new element
+    dragOffset.current = { x: 0, y: 0 };
+
     const updatePosition = (isScrollEvent = false) => {
       const panel = panelRef.current;
-      const rect = element.getBoundingClientRect();
       const panelWidth = 280;
-      const padding = 16;
+      const gap = 8;
 
-      // Toolbar dimensions (bottom-right corner)
-      const toolbarWidth = 300; // Approximate expanded width
-      const toolbarHeight = 50;
-      const toolbarRight = padding;
-      const toolbarBottom = padding;
+      let top: number;
+      let left: number;
 
-      // Try to position to the right of the element
-      let left = rect.right + padding;
-      let top = rect.top;
+      if (hasSavedPosition.current) {
+        // Use persisted position — don't follow element
+        top = positionRef.current.top;
+        left = positionRef.current.left;
+      } else {
+        // Default: position relative to element
+        const rect = element.getBoundingClientRect();
+        left = rect.right + gap;
+        top = rect.top;
 
-      // If it would go off the right edge, position to the left
-      if (left + panelWidth > window.innerWidth - padding) {
-        left = rect.left - panelWidth - padding;
+        if (left + panelWidth > window.innerWidth - gap) {
+          left = rect.left - panelWidth - gap;
+        }
+        if (left < gap) {
+          left = Math.max(gap, (window.innerWidth - panelWidth) / 2);
+        }
       }
 
-      // If it would go off the left edge, center it
-      if (left < padding) {
-        left = Math.max(padding, (window.innerWidth - panelWidth) / 2);
+      // Measure toolbar to avoid overlapping it
+      const toolbar = document.getElementById('devtools-toolbar');
+      const toolbarRect = toolbar?.getBoundingClientRect();
+
+      let bottomLimit = window.innerHeight - 16;
+      if (toolbarRect) {
+        const panelRight = left + panelWidth;
+        if (panelRight > toolbarRect.left) {
+          bottomLimit = toolbarRect.top - gap;
+        }
       }
 
-      // Allow panel to scroll off top edge with element (don't clamp to padding)
-
-      // Check if panel horizontally overlaps with toolbar
-      const panelRight = left + panelWidth;
-      const toolbarLeft = window.innerWidth - toolbarRight - toolbarWidth;
-      const overlapsToolbar = panelRight > toolbarLeft;
-
-      // Calculate max height: stop 16px before bottom, or 16px above toolbar if overlapping
-      const bottomLimit = overlapsToolbar
-        ? window.innerHeight - toolbarBottom - toolbarHeight - padding
-        : window.innerHeight - padding;
-      // When top is negative (scrolled off), calculate from viewport top (0)
       const visibleTop = Math.max(0, top);
       const maxHeight = Math.max(200, bottomLimit - visibleTop);
 
@@ -2557,13 +2949,12 @@ export function StylePanel({
       // During scroll, update DOM directly for smoothness
       if (isScrollEvent && panel) {
         const wrapper = panel.parentElement;
-        if (wrapper) {
-          wrapper.style.top = `${top}px`;
-          wrapper.style.left = `${left}px`;
+        if (wrapper && !hasSavedPosition.current) {
+          wrapper.style.top = `${top + dragOffset.current.y}px`;
+          wrapper.style.left = `${left + dragOffset.current.x}px`;
         }
         panel.style.maxHeight = `${maxHeight}px`;
       } else {
-        // For initial render and resize, use React state
         forceUpdate(n => n + 1);
       }
     };
@@ -2804,8 +3195,9 @@ export function StylePanel({
                   fontSize: 10,
                   fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
                   color: '#999',
-                  pointerEvents: 'none',
                 }}
+                preferredUnit={preferredUnit}
+                onUnitCycle={cycleUnit}
               />
             </InputWrapper>
           );
@@ -2900,8 +3292,7 @@ export function StylePanel({
     backgroundColor: 'rgba(255, 255, 255, 0.85)',
     backdropFilter: 'blur(32px)',
     WebkitBackdropFilter: 'blur(32px)',
-    border: '1px solid rgba(0,0,0,0.1)',
-    borderRadius: 0,
+    ...POPMELT_BORDER,
     zIndex: 10000,
     fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
     fontSize: 12,
@@ -2912,22 +3303,16 @@ export function StylePanel({
     transition: 'opacity 150ms ease',
   };
 
-  const cornerDotStyle: CSSProperties = {
-    position: 'absolute',
-    width: 2,
-    height: 2,
-    backgroundColor: 'rgba(0, 0, 0, 0.25)',
-    pointerEvents: 'none',
-    zIndex: 1,
-  };
 
   const headerStyle: CSSProperties = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
+    margin: '3px 3px 0',
     padding: '8px 7px 8px 12px',
     borderBottom: '1px solid rgba(0,0,0,0.1)',
-    backgroundColor: 'rgba(248, 250, 252, 0.6)',
+    backgroundColor: '#f8fafc',
+    cursor: dragState.current ? 'grabbing' : 'grab',
   };
 
   const sectionHeaderStyle: CSSProperties = {
@@ -2960,14 +3345,14 @@ export function StylePanel({
   return (
     <div data-devtools="panel-wrapper" style={{
       position: 'fixed',
-      top: positionRef.current.top,
-      left: positionRef.current.left,
+      top: positionRef.current.top + dragOffset.current.y,
+      left: positionRef.current.left + dragOffset.current.x,
       zIndex: 10000,
       pointerEvents: 'none',
     }}>
-    <div ref={panelRef} data-devtools="panel" style={{ ...panelStyle, position: 'relative', top: 0, left: 0, zIndex: 0, pointerEvents: 'auto' }}>
+    <div ref={panelRef} data-devtools="panel" style={{ ...panelStyle, position: 'relative', top: 0, left: 0, zIndex: 0, pointerEvents: 'auto' }} onMouseEnter={() => onHover?.('element')} onMouseLeave={() => onHover?.(null)}>
       {/* Header */}
-      <div style={headerStyle}>
+      <div style={headerStyle} onMouseDown={handleHeaderMouseDown}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, overflow: 'hidden' }}>
           <span style={{
             fontWeight: 600,
@@ -2976,7 +3361,7 @@ export function StylePanel({
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
           }}>
-            <span style={{ color: accentColor, fontSize: 13 }}>⊹</span> {elementInfo.tagName}
+            {elementInfo.tagName}
           </span>
           {modificationCount > 0 && (
             <span style={{
@@ -3035,7 +3420,7 @@ export function StylePanel({
       </div>
 
       {/* Scrollable content */}
-      <div ref={panelContentRef} style={{ flex: 1, overflowY: 'auto' }}>
+      <div ref={panelContentRef} style={{ flex: 1, overflowY: 'auto', margin: '0 3px 3px' }}>
         {/* Layout Section - Custom Figma-style controls */}
         <div style={{ opacity: activeColorDropdown ? 0.3 : 1, transition: 'opacity 150ms ease' }}>
           <LayoutSection
@@ -3052,6 +3437,9 @@ export function StylePanel({
             onDropdownChange={setActiveDropdown}
             panelContentRef={panelContentRef}
             accentColor={accentColor}
+            onFieldHover={onHover}
+            preferredUnit={preferredUnit}
+            onUnitCycle={cycleUnit}
           />
         </div>
 
@@ -3071,6 +3459,8 @@ export function StylePanel({
             activeColorDropdown={activeColorDropdown}
             onColorDropdownChange={setActiveColorDropdown}
             panelContentRef={panelContentRef}
+            preferredUnit={preferredUnit}
+            onUnitCycle={cycleUnit}
           />
         </div>
 
@@ -3160,11 +3550,6 @@ export function StylePanel({
         </div>
       </div>
     </div>
-      {/* Corner dots (after panel so they paint on top of backdrop-filter) */}
-      <div style={{ ...cornerDotStyle, top: -1, left: -1 }} />
-      <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
-      <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
-      <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
     </div>
   );
 }

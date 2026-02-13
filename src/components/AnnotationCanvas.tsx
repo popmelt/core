@@ -137,6 +137,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
   const [handHoveredElement, setHandHoveredElement] = useState<Element | null>(null);
   const [handHoveredSide, setHandHoveredSide] = useState<PaddingSide | null>(null);
+  const [stylePanelHint, setStylePanelHint] = useState<string | null>(null);
   const [handDragging, setHandDragging] = useState<{ side: PaddingSide; padding: { top: number; right: number; bottom: number; left: number } } | null>(null);
   const handCursorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const [handCursorPos, setHandCursorPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -1136,6 +1137,15 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     (e: React.MouseEvent | React.TouchEvent) => {
       if (!state.isAnnotating) return;
 
+      // If StylePanel is open (hand tool right-click inspect), close it on left-click only.
+      // Right-click (button 2) is handled by contextmenu which replaces the selection directly.
+      if (state.inspectedElement && state.activeTool === 'hand' && !('button' in e && e.button === 2)) {
+        e.preventDefault();
+        e.stopPropagation();
+        dispatch({ type: 'SELECT_ELEMENT', payload: null });
+        return;
+      }
+
       const point = getPoint(e);
       const isShiftClick = 'shiftKey' in e && e.shiftKey;
 
@@ -1379,7 +1389,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       setIsDrawing(true);
       dispatch({ type: 'START_PATH', payload: point });
     },
-    [state.isAnnotating, state.activeTool, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
+    [state.isAnnotating, state.activeTool, state.inspectedElement, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
   );
 
   const handlePointerMove = useCallback(
@@ -2104,8 +2114,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         const drag = gapDragRef.current;
         const el = drag.element;
 
-        if (!drag.hasMoved && el && drag.selector && drag.elementInfo) {
-          // CLICK — cycle justify-content: between → around → stretch → normal (fixed)
+        const isRightClick = 'button' in e && e.button === 2;
+        if (!drag.hasMoved && !isRightClick && el && drag.selector && drag.elementInfo) {
+          // LEFT CLICK — cycle justify-content: between → around → stretch → normal (fixed)
           if (el instanceof HTMLElement) {
             el.style.removeProperty('transition');
           }
@@ -2390,19 +2401,20 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     // Shift+Enter allows newline (default textarea behavior)
   }, [commitActiveText]);
 
-  // Inspector right-click: open style panel
+  // Hand tool right-click: open style panel
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
-    if (state.activeTool !== 'inspector' || !state.isAnnotating) return;
+    if (state.activeTool !== 'hand' || !state.isAnnotating) return;
     e.preventDefault();
-    if (hoveredElement && !isElementInFlight(hoveredElement)) {
-      const info = extractElementInfo(hoveredElement);
-      const selector = getUniqueSelector(hoveredElement);
+    const target = handHoveredElement || gapHoveredElement || radiusHoveredElement || textHoveredElement;
+    if (target && !isElementInFlight(target)) {
+      const info = extractElementInfo(target);
+      const selector = getUniqueSelector(target);
       dispatch({
         type: 'SELECT_ELEMENT',
-        payload: { el: hoveredElement, info: { ...info, selector } },
+        payload: { el: target, info: { ...info, selector } },
       });
     }
-  }, [state.activeTool, state.isAnnotating, hoveredElement, dispatch, isElementInFlight]);
+  }, [state.activeTool, state.isAnnotating, handHoveredElement, gapHoveredElement, radiusHoveredElement, textHoveredElement, dispatch, isElementInFlight]);
 
   // Position tracking: linked annotations follow their elements
   useEffect(() => {
@@ -2770,10 +2782,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         />
       )}
 
-      {/* Inspector mode: Element highlight */}
+      {/* Inspector mode: Element hover highlight */}
       {state.activeTool === 'inspector' && state.isAnnotating && (
         <>
-          {/* Hover highlight (not selected) */}
           {hoveredElement && !state.inspectedElement && (() => {
             // Hide the tooltip badge when a linked annotation is being created
             // or already exists for the hovered element
@@ -2793,9 +2804,13 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
               />
             );
           })()}
+        </>
+      )}
 
-          {/* Selected element highlight */}
-          {state.inspectedElement && (() => {
+      {/* Hand tool: Selected element highlight + StylePanel (right-click inspect) */}
+      {state.activeTool === 'hand' && state.isAnnotating && state.inspectedElement && (
+        <>
+          {stylePanelHint && stylePanelHint !== 'padding' && stylePanelHint !== 'gap' && (() => {
             // Calculate annotation number: count annotation groups + position in style mods
             const annotationGroupCount = new Set(
               state.annotations.map(a => a.groupId || a.id)
@@ -2823,18 +2838,38 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             );
           })()}
 
-          {/* Style panel for selected element */}
-          {state.inspectedElement && (
-            <StylePanel
+          {/* Panel field hover: show padding handles on inspected element */}
+          {stylePanelHint === 'padding' && (
+            <PaddingHandles
               element={state.inspectedElement.el}
-              elementInfo={state.inspectedElement.info}
-              selector={state.inspectedElement.info.selector}
-              styleModifications={state.styleModifications}
-              dispatch={dispatch}
-              onClose={() => dispatch({ type: 'SELECT_ELEMENT', payload: null })}
+              padding={getComputedPadding(state.inspectedElement.el)}
               accentColor={state.activeColor}
+              hoveredSide={null}
+              draggingSide={null}
             />
           )}
+
+          {/* Panel field hover: show gap handles on inspected element */}
+          {stylePanelHint === 'gap' && (
+            <GapHandles
+              element={state.inspectedElement.el}
+              gap={getComputedGap(state.inspectedElement.el)}
+              accentColor={state.activeColor}
+              hoveredAxis={null}
+              draggingAxis={null}
+            />
+          )}
+
+          <StylePanel
+            element={state.inspectedElement.el}
+            elementInfo={state.inspectedElement.info}
+            selector={state.inspectedElement.info.selector}
+            styleModifications={state.styleModifications}
+            dispatch={dispatch}
+            onClose={() => dispatch({ type: 'SELECT_ELEMENT', payload: null })}
+            onHover={setStylePanelHint}
+            accentColor={state.activeColor}
+          />
         </>
       )}
     </>

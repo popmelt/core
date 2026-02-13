@@ -60,7 +60,7 @@ function handleSetAnnotating(state: AnnotationState, payload: boolean): Annotati
 }
 
 function handleSetTool(state: AnnotationState, payload: ToolType): AnnotationState {
-  return { ...state, activeTool: payload };
+  return { ...state, activeTool: payload, inspectedElement: null };
 }
 
 function handleSetColor(state: AnnotationState, payload: string): AnnotationState {
