@@ -13,8 +13,8 @@ import {
 
 import { useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
-import type { AnnotationResolution } from '../tools/types';
-import { approvePlan, fetchCapabilities, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge } from '../utils/bridge-client';
+import type { AnnotationResolution, SpacingTokenChange } from '../tools/types';
+import { addComponentToModel, approvePlan, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { resolveRegionToElement } from '../utils/dom';
 import { buildPageManifest } from '../utils/page-manifest';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
@@ -43,7 +43,7 @@ const ACTIVE_PLAN_STORAGE_KEY = 'devtools-active-plan';
 // Model definitions per provider
 const CLAUDE_MODELS = [
   { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { id: 'claude-sonnet-4-5-20250929', label: 'Sonn 4.5' },
+  { id: 'claude-sonnet-4-6', label: 'Sonn 4.6' },
 ] as const;
 
 const CODEX_MODELS = [
@@ -82,6 +82,10 @@ export function PopmeltProvider({
   // Available providers (detected from bridge capabilities)
   const [availableProviders, setAvailableProviders] = useState<string[]>(['claude', 'codex']);
 
+  // MCP server detection results per provider
+  const [mcpStatus, setMcpStatus] = useState<Record<string, McpDetectionResult>>({});
+  const [mcpJustInstalled, setMcpJustInstalled] = useState(false);
+
   // Fetch capabilities when bridge connects
   useEffect(() => {
     if (!bridge.isConnected) return;
@@ -93,6 +97,14 @@ export function PopmeltProvider({
       if (available.length > 0) {
         setAvailableProviders(available);
       }
+      const mcp: Record<string, McpDetectionResult> = {};
+      for (const [name, provider] of Object.entries(caps.providers)) {
+        if (provider.mcp) mcp[name] = provider.mcp;
+      }
+      setMcpStatus(mcp);
+      // Clear justInstalled flag if all providers are now configured
+      const allConfigured = Object.values(mcp).every(s => s.found);
+      if (allConfigured) setMcpJustInstalled(false);
     });
   }, [bridge.isConnected, bridgeUrl]);
 
@@ -122,6 +134,108 @@ export function PopmeltProvider({
     setModelIndex(newIndex);
     localStorage.setItem(MODEL_STORAGE_KEY, String(newIndex));
   }, []);
+
+  const handleInstallMcp = useCallback(async () => {
+    const result = await installMcp(bridgeUrl);
+    if (!result) return;
+    const mcp: Record<string, McpDetectionResult> = {};
+    for (const [name, p] of Object.entries(result.capabilities.providers)) {
+      if (p.mcp) mcp[name] = p.mcp;
+    }
+    setMcpStatus(mcp);
+    if (result.results.some(r => r.installed)) {
+      setMcpJustInstalled(true);
+    }
+  }, [bridgeUrl]);
+
+  // Model tool state: track component names in the local design model
+  const [modelComponentNames, setModelComponentNames] = useState<Set<string>>(new Set());
+  const [modelSelectedComponent, setModelSelectedComponent] = useState<string | null>(null);
+  // Bidirectional hover: canvas tells us what's hovered, panel tells us what's hovered
+  const [modelCanvasHoveredComponent, setModelCanvasHoveredComponent] = useState<string | null>(null);
+  const [modelPanelHoveredComponent, setModelPanelHoveredComponent] = useState<{ name: string; instanceIndex: number } | null>(null);
+  const [modelSpacingTokenHover, setModelSpacingTokenHover] = useState<{ name: string; px: number; token?: import('../utils/domQuery').TokenBinding } | null>(null);
+
+  // Fetch model component names on mount and when bridge connects
+  useEffect(() => {
+    if (!bridge.isConnected) return;
+    fetchModel(bridgeUrl).then(model => {
+      if (model?.components) {
+        setModelComponentNames(new Set(Object.keys(model.components)));
+      }
+    });
+  }, [bridge.isConnected, bridgeUrl]);
+
+  const handleModelComponentsAdd = useCallback(async (names: string[]) => {
+    const added: string[] = [];
+    for (const name of names) {
+      try {
+        const result = await addComponentToModel(name, bridgeUrl);
+        if (result.added) {
+          added.push(name);
+        }
+      } catch (err) {
+        console.error('[Popmelt] Failed to add component to model:', name, err);
+      }
+    }
+    if (added.length > 0) {
+      setModelComponentNames(prev => {
+        const next = new Set(prev);
+        for (const name of added) next.add(name);
+        return next;
+      });
+      setModelSelectedComponent(added[added.length - 1]!);
+    }
+  }, [bridgeUrl]);
+
+  const handleModelComponentFocus = useCallback((name: string) => {
+    setModelSelectedComponent(name);
+  }, []);
+
+  const handleModelComponentAdded = useCallback(() => {
+    // Re-fetch model to update component names
+    fetchModel(bridgeUrl).then(model => {
+      if (model?.components) {
+        setModelComponentNames(new Set(Object.keys(model.components)));
+      }
+    });
+  }, [bridgeUrl]);
+
+  const handleModelComponentRemoved = useCallback(async (name: string) => {
+    try {
+      const result = await removeComponentFromModel(name, bridgeUrl);
+      if (result.removed) {
+        setModelComponentNames(prev => {
+          const next = new Set(prev);
+          next.delete(name);
+          return next;
+        });
+      }
+    } catch (err) {
+      console.error('[Popmelt] Failed to remove component from model:', err);
+    }
+  }, [bridgeUrl]);
+
+  const handleSpacingTokenUpdate = useCallback(async (path: string, value: string) => {
+    try {
+      await updateModelToken(path, value, bridgeUrl);
+    } catch (err) {
+      console.error('[Popmelt] Failed to update token:', err);
+    }
+  }, [bridgeUrl]);
+
+  const handleSpacingTokenDelete = useCallback(async (tokenPath: string) => {
+    try {
+      await removeModelToken(tokenPath, bridgeUrl);
+    } catch (err) {
+      console.error('[Popmelt] Failed to delete token:', err);
+    }
+  }, [bridgeUrl]);
+
+  const handleSpacingTokenChange = useCallback((change: SpacingTokenChange) => {
+    dispatch({ type: 'ADD_SPACING_TOKEN_CHANGE', payload: change });
+  }, [dispatch]);
+
   // Thread panel state (declared early so callbacks can reference setOpenThreadId)
   const [openThreadId, setOpenThreadId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
@@ -526,8 +640,9 @@ export function PopmeltProvider({
 
     // Detect planner mode: no pending annotations = planner goal
     const activeAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
-    if (activeAnnotations.length === 0 && state.styleModifications.filter(m => !m.captured).length === 0) {
-      // No annotations or style changes — this is handled by the toolbar goal input
+    const uncapturedSpacingChanges = state.spacingTokenChanges.filter(c => !c.captured);
+    if (activeAnnotations.length === 0 && state.styleModifications.filter(m => !m.captured).length === 0 && uncapturedSpacingChanges.length === 0) {
+      // No annotations, style changes, or spacing token changes — this is handled by the toolbar goal input
       return false;
     }
 
@@ -539,8 +654,8 @@ export function PopmeltProvider({
     const stitchedBlob = await stitchBlobs(blobs);
     if (!stitchedBlob) return false;
 
-    // Build feedback data
-    const feedbackData = buildFeedbackData(activeAnnotations, state.styleModifications);
+    // Build feedback data (include uncaptured spacing token changes)
+    const feedbackData = buildFeedbackData(activeAnnotations, state.styleModifications, undefined, uncapturedSpacingChanges.length > 0 ? uncapturedSpacingChanges : undefined);
     const feedbackJson = JSON.stringify(feedbackData);
 
     // Gather pasted images for pending annotations
@@ -607,7 +722,7 @@ export function PopmeltProvider({
       console.error('[Pare] Failed to send to bridge:', err);
       return false;
     }
-  }, [state.annotations, state.styleModifications, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
+  }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
@@ -955,6 +1070,12 @@ export function PopmeltProvider({
         onReply={bridge.isConnected ? handleReply : undefined}
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
         activePlan={activePlan}
+        onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
+        onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
+        onModelComponentHover={setModelCanvasHoveredComponent}
+        modelComponentNames={modelComponentNames}
+        modelPanelHoveredComponent={modelPanelHoveredComponent}
+        modelSpacingTokenHover={modelSpacingTokenHover}
       />
 
       <AnnotationToolbar
@@ -977,6 +1098,19 @@ export function PopmeltProvider({
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
         isThreadPanelOpen={openThreadId !== null}
         activePlan={activePlan}
+        mcpStatus={mcpStatus}
+        onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
+        mcpJustInstalled={mcpJustInstalled}
+        bridgeUrl={bridgeUrl}
+        modelSelectedComponent={modelSelectedComponent}
+        modelCanvasHoveredComponent={modelCanvasHoveredComponent}
+        onModelComponentHover={setModelPanelHoveredComponent}
+        onSpacingTokenHover={setModelSpacingTokenHover}
+        onSpacingTokenUpdate={bridge.isConnected ? handleSpacingTokenUpdate : undefined}
+        onSpacingTokenChange={handleSpacingTokenChange}
+        onModelComponentAdded={handleModelComponentAdded}
+        onSpacingTokenDelete={bridge.isConnected ? handleSpacingTokenDelete : undefined}
+        onModelComponentRemoved={handleModelComponentRemoved}
       />
 
       {openThreadId && bridge.isConnected && (

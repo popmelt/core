@@ -7,11 +7,15 @@ import { join } from 'node:path';
 
 import { spawnClaude } from './claude-spawner';
 import { spawnCodex } from './codex-spawner';
+import { DecisionStore } from './decision-store';
+import { Materializer } from './materializer';
+import { detectClaudeMcp, detectCodexMcp } from './mcp-detect';
+import { installClaudeMcp, installCodexMcp } from './mcp-install';
 import { parseMultipart } from './multipart';
-import { buildPlanExecutorPrompt, buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parseAllResolutions, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
+import { buildPlanExecutorPrompt, buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parseAllResolutions, parseNovelPatterns, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
-import type { PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
+import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
 
 const DEFAULT_PORT = 1111;
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
@@ -32,7 +36,7 @@ function setCors(req: IncomingMessage, res: ServerResponse) {
   const origin = req.headers.origin;
   if (isLocalhostOrigin(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin!);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   }
 }
@@ -71,7 +75,7 @@ export async function createPopmelt(
   const defaultProvider: Provider = options.provider ?? 'claude';
 
   // Probe for installed CLI providers
-  type ProviderCapability = { available: boolean; path: string | null };
+  type ProviderCapability = { available: boolean; path: string | null; mcp?: McpDetection };
   const capabilities: Record<string, ProviderCapability> = {};
   for (const cli of ['claude', 'codex']) {
     try {
@@ -82,15 +86,32 @@ export async function createPopmelt(
     }
   }
 
+  // Detect MCP server configuration for each provider
+  const [claudeMcp, codexMcp] = await Promise.all([
+    detectClaudeMcp(projectRoot),
+    detectCodexMcp(projectRoot),
+  ]);
+  if (capabilities.claude) capabilities.claude.mcp = claudeMcp;
+  if (capabilities.codex) capabilities.codex.mcp = codexMcp;
+
   // Ensure temp dir exists
   await mkdir(tempDir, { recursive: true });
 
   // Cleanup old files on startup
   cleanupTempDir(tempDir).catch(() => {});
 
-  const queue = new JobQueue();
+  const queue = new JobQueue(1);
   const sseClients: Set<SSEClient> = new Set();
   const threadStore = new ThreadFileStore(projectRoot);
+  const decisionStore = new DecisionStore(projectRoot);
+  const materializer = new Materializer(projectRoot, decisionStore, {
+    claudePath,
+    onEvent: (event) => {
+      for (const client of sseClients) {
+        sendSSE(client, event);
+      }
+    },
+  });
   const jobGroups = new Map<string, JobGroup>();
 
   // Wire up SSE broadcasting from queue
@@ -129,12 +150,12 @@ export async function createPopmelt(
         ?.messages.filter(m => m.role === 'human').pop();
       const replyText = lastReply?.replyToQuestion || lastReply?.feedbackSummary || '';
       prompt = replyText
-        + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.';
+        + '\n\nAfter completing work, output a <resolution> block with declaredScope and inferredScope. If the developer corrected scope, set finalScope. If unclear, output a <question> block.';
     } else if (resumeSessionId) {
       // Resuming with new annotations: send the new feedback context
       prompt = formatFeedbackContext(job.feedback, job.imagePaths)
         + "\n\nFollow the developer's instructions. If they ask for changes, apply them to the source files."
-        + '\n\nAfter completing work, output a <resolution> block. If unclear, output a <question> block.'
+        + '\n\nAfter completing work, output a <resolution> block with declaredScope and inferredScope. If unclear, output a <question> block.'
         + (provider !== 'codex' ? `\n\nIMPORTANT: First, use the Read tool to view the updated screenshot at: ${job.screenshotPath}` : '');
     } else {
       // No session to resume — build full prompt with thread history
@@ -142,10 +163,14 @@ export async function createPopmelt(
         ? await threadStore.getThreadHistory(job.threadId)
         : undefined;
 
+      // Load local design model for enforcement (best-effort)
+      const designModel = !replyPrompt ? await materializer.loadModel() : null;
+
       prompt = replyPrompt ?? buildPrompt(job.screenshotPath, job.feedback, {
         threadHistory: threadHistory && threadHistory.length > 0 ? threadHistory : undefined,
         provider,
         imagePaths: job.imagePaths,
+        designModel: designModel ?? undefined,
       });
     }
 
@@ -247,6 +272,64 @@ export async function createPopmelt(
         });
       }
 
+      // Persist decision record (best-effort, non-blocking)
+      decisionStore.captureGitDiff(projectRoot).then(async (gitDiff) => {
+        const completedAt = Date.now();
+        const tempImagePaths = job.imagePaths
+          ? Object.values(job.imagePaths).flat()
+          : [];
+        // Build relative pasted image paths for the record
+        const pastedImagePaths: string[] = [];
+        if (job.imagePaths) {
+          for (const [annId, paths] of Object.entries(job.imagePaths)) {
+            for (let i = 0; i < paths.length; i++) {
+              pastedImagePaths.push(`screenshots/p-${job.id}-${annId}-${i}.png`);
+            }
+          }
+        }
+        await decisionStore.persist(
+          {
+            version: 1,
+            id: job.id,
+            createdAt: job.createdAt,
+            completedAt,
+            durationMs: completedAt - job.createdAt,
+            url: job.feedback.url,
+            viewport: job.feedback.viewport,
+            screenshotPath: `screenshots/s-${job.id}.png`,
+            pastedImagePaths,
+            annotations: job.feedback.annotations,
+            styleModifications: job.feedback.styleModifications,
+            inspectedElement: job.feedback.inspectedElement,
+            provider: job.provider,
+            model: job.model,
+            sessionId: spawnResult.sessionId,
+            threadId: job.threadId,
+            planId: job.planId,
+            planTaskId: job.planTaskId,
+            responseText: spawnResult.text,
+            resolutions: resolutions.length > 0 ? resolutions : [],
+            question: question ?? undefined,
+            fileEdits: spawnResult.fileEdits ?? [],
+            toolsUsed,
+            gitDiff,
+          },
+          job.screenshotPath,
+          tempImagePaths,
+        );
+      }).catch(() => {}); // Best-effort — never block
+
+      // If this job has pattern-scoped resolutions, materialize into local model
+      if (resolutions.length > 0) {
+        const hasPatternScope = resolutions.some(r => {
+          const scope = r.finalScope ?? r.inferredScope;
+          return scope?.breadth === 'pattern';
+        });
+        if (hasPatternScope) {
+          materializer.run().catch(() => {}); // fire-and-forget
+        }
+      }
+
       // Planner completion: parse plan and broadcast plan_ready
       if (job.planId && !job.planTaskId) {
         const group = jobGroups.get(job.planId);
@@ -294,6 +377,16 @@ export async function createPopmelt(
         );
       }
 
+      // Broadcast novel patterns if Claude flagged any
+      const novelPatterns = parseNovelPatterns(spawnResult.text);
+      if (novelPatterns.length > 0) {
+        console.log(`${tag} Novel pattern(s): ${novelPatterns.map(p => `${p.category}/${p.element}`).join(', ')}`);
+        queue.broadcast(
+          { type: 'novel_patterns', jobId: job.id, patterns: novelPatterns, threadId: job.threadId },
+          job.id,
+        );
+      }
+
       queue.broadcast(
         { type: 'done', jobId: job.id, success: true, resolutions: resolutions.length > 0 ? resolutions : undefined, responseText: spawnResult.text, threadId: job.threadId },
         job.id,
@@ -335,10 +428,14 @@ export async function createPopmelt(
         handleStatus(res);
       } else if (req.method === 'GET' && path === '/capabilities') {
         sendJson(res, 200, { providers: capabilities });
+      } else if (req.method === 'POST' && path === '/mcp/install') {
+        await handleMcpInstall(req, res);
       } else if (req.method === 'POST' && path === '/reply') {
         await handleReply(req, res);
       } else if (req.method === 'POST' && path === '/cancel') {
         handleCancel(req, res);
+      } else if (req.method === 'POST' && path === '/materialize') {
+        await handleMaterialize(res);
       } else if (req.method === 'POST' && path === '/plan') {
         await handlePlan(req, res);
       } else if (req.method === 'POST' && path === '/plan/approve') {
@@ -349,6 +446,17 @@ export async function createPopmelt(
         await handlePlanReview(req, res);
       } else if (req.method === 'GET' && path.startsWith('/plan/')) {
         handleGetPlan(path.slice('/plan/'.length), res);
+      } else if (req.method === 'POST' && path === '/model/component') {
+        await handleAddComponent(req, res);
+      } else if (req.method === 'DELETE' && path === '/model/component') {
+        await handleRemoveComponent(req, res);
+      } else if (req.method === 'PATCH' && path === '/model/token') {
+        await handleUpdateToken(req, res);
+      } else if (req.method === 'DELETE' && path === '/model/token') {
+        await handleRemoveToken(req, res);
+      } else if (req.method === 'GET' && path === '/model') {
+        const model = await materializer.loadModel();
+        sendJson(res, 200, { model });
       } else if (req.method === 'GET' && path.startsWith('/thread/')) {
         const threadId = path.slice('/thread/'.length);
         await handleGetThread(threadId, res);
@@ -618,6 +726,20 @@ export async function createPopmelt(
     const jobId = reqUrl.searchParams.get('jobId');
     const cancelled = jobId ? queue.cancelJob(jobId) : queue.cancelActive();
     sendJson(res, 200, { cancelled });
+  }
+
+  async function handleMaterialize(res: ServerResponse) {
+    if (materializer.isRunning) {
+      sendJson(res, 200, { skipped: true, reason: 'Already running' });
+      return;
+    }
+    const pending = await materializer.getUnmaterializedPatternDecisions();
+    if (pending.length === 0) {
+      sendJson(res, 200, { skipped: true, reason: 'No unmaterialized pattern decisions' });
+      return;
+    }
+    materializer.run().catch(() => {}); // fire-and-forget
+    sendJson(res, 200, { started: true, decisionCount: pending.length, decisionIds: pending.map(d => d.id) });
   }
 
   async function handlePlan(req: IncomingMessage, res: ServerResponse) {
@@ -892,6 +1014,122 @@ export async function createPopmelt(
       return;
     }
     sendJson(res, 200, group);
+  }
+
+  async function handleMcpInstall(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    let serverUrl: string | undefined;
+    if (chunks.length > 0) {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+        serverUrl = body.serverUrl;
+      } catch {
+        // Empty or invalid body — use defaults
+      }
+    }
+
+    const results = [];
+
+    // Install for each available-but-unconfigured provider
+    if (capabilities.claude?.available && capabilities.claude.mcp && !capabilities.claude.mcp.found) {
+      results.push(await installClaudeMcp(serverUrl));
+    }
+    if (capabilities.codex?.available && capabilities.codex.mcp && !capabilities.codex.mcp.found) {
+      results.push(await installCodexMcp(serverUrl));
+    }
+
+    // Re-detect to update capabilities in memory
+    const [newClaudeMcp, newCodexMcp] = await Promise.all([
+      detectClaudeMcp(projectRoot),
+      detectCodexMcp(projectRoot),
+    ]);
+    if (capabilities.claude) capabilities.claude.mcp = newClaudeMcp;
+    if (capabilities.codex) capabilities.codex.mcp = newCodexMcp;
+
+    sendJson(res, 200, { results, capabilities: { providers: capabilities } });
+  }
+
+  async function handleAddComponent(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    let parsed: { name?: string };
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+      return;
+    }
+    if (!parsed.name || typeof parsed.name !== 'string') {
+      sendJson(res, 400, { error: 'Missing or invalid name' });
+      return;
+    }
+    const result = await materializer.addComponent(parsed.name);
+    sendJson(res, 200, result);
+  }
+
+  async function handleRemoveComponent(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    let parsed: { name?: string };
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+      return;
+    }
+    if (!parsed.name || typeof parsed.name !== 'string') {
+      sendJson(res, 400, { error: 'Missing or invalid name' });
+      return;
+    }
+    const result = await materializer.removeComponent(parsed.name);
+    sendJson(res, 200, result);
+  }
+
+  async function handleUpdateToken(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    let parsed: { path?: string; value?: string };
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+      return;
+    }
+    if (!parsed.path || typeof parsed.path !== 'string' || typeof parsed.value !== 'string') {
+      sendJson(res, 400, { error: 'Missing or invalid path/value' });
+      return;
+    }
+    const result = await materializer.updateToken(parsed.path, parsed.value);
+    sendJson(res, 200, result);
+  }
+
+  async function handleRemoveToken(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+    let parsed: { path?: string };
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+      return;
+    }
+    if (!parsed.path || typeof parsed.path !== 'string') {
+      sendJson(res, 400, { error: 'Missing or invalid path' });
+      return;
+    }
+    const result = await materializer.removeToken(parsed.path);
+    sendJson(res, 200, result);
   }
 
   async function handleGetThread(threadId: string, res: ServerResponse) {

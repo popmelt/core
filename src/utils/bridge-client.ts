@@ -7,8 +7,26 @@ export type BridgeStatus = {
   queueDepth: number;
 };
 
+export type McpDetectionResult = {
+  found: boolean;
+  name: string | null;
+  scope: 'user' | 'project' | 'mcp.json' | null;
+  disabled: boolean;
+};
+
+export type InstallResult = {
+  installed: boolean;
+  provider: string;
+  scope: 'user' | null;
+  reason?: string;
+};
+
 export type ProviderCapabilities = {
-  providers: Record<string, { available: boolean; path: string | null }>;
+  providers: Record<string, {
+    available: boolean;
+    path: string | null;
+    mcp?: McpDetectionResult;
+  }>;
 };
 
 export async function fetchCapabilities(
@@ -198,6 +216,107 @@ export async function sendPlanExecution(
   }
 
   return res.json();
+}
+
+export async function installMcp(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  serverUrl?: string,
+): Promise<{ results: InstallResult[]; capabilities: ProviderCapabilities } | null> {
+  try {
+    const res = await fetch(`${bridgeUrl}/mcp/install`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(serverUrl ? { serverUrl } : {}),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as { results: InstallResult[]; capabilities: ProviderCapabilities };
+  } catch {
+    return null;
+  }
+}
+
+export type DesignModel = {
+  tokens?: Record<string, Record<string, string>>;
+  components?: Record<string, Record<string, string>>;
+  rules?: string[];
+} | null;
+
+export async function addComponentToModel(
+  name: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<{ added: boolean; alreadyExists: boolean }> {
+  const res = await fetch(`${bridgeUrl}/model/component`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export async function removeComponentFromModel(
+  name: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<{ removed: boolean }> {
+  const res = await fetch(`${bridgeUrl}/model/component`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export async function updateModelToken(
+  path: string,
+  value: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<{ updated: boolean }> {
+  const res = await fetch(`${bridgeUrl}/model/token`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, value }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export async function removeModelToken(
+  path: string,
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<{ removed: boolean }> {
+  const res = await fetch(`${bridgeUrl}/model/token`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+export async function fetchModel(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<DesignModel> {
+  try {
+    const res = await fetch(`${bridgeUrl}/model`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.model ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function sendReplyToBridge(

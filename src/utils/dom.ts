@@ -8,6 +8,15 @@ export {
   getUniqueSelector,
   findElementBySelector,
   resolveRegionToElement,
+  getComponentBoundary,
+  findComponentBoundaryByName,
+  findAllComponentBoundariesByName,
+  getComponentPositions,
+  findSpacingUsages,
+  findSpacingUsagesByBinding,
+  type ComponentBoundary,
+  type SpacingRect,
+  type TokenBinding,
 } from './domQuery';
 
 export {

@@ -4,6 +4,7 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Circle,
+  Component,
   Hand,
   MessageCircle,
   Pen,
@@ -17,10 +18,18 @@ import { useLocalStorageBatch } from '../hooks/useLocalStorageBatch';
 import type { StorageKeys } from '../hooks/useLocalStorageBatch';
 import { useSpinner } from '../hooks/useSpinner';
 import { POPMELT_BORDER } from '../styles/border';
-import type { Annotation, AnnotationAction, AnnotationState, ToolType } from '../tools/types';
+import type { Annotation, AnnotationAction, AnnotationState, SpacingTokenChange, ToolType } from '../tools/types';
 import { computeSupersededAnnotations } from '../utils/superseded';
 import { applyStyleModifications, extractElementInfo, findElementBySelector, revertAllStyles } from '../utils/dom';
+import { LibraryPanel, type ComponentHoverInfo, type SpacingTokenHover } from './LibraryPanel';
 import { colors, ToolButton, ToolSeparator } from './ToolButton';
+
+type McpStatus = {
+  found: boolean;
+  name: string | null;
+  scope: 'user' | 'project' | 'mcp.json' | null;
+  disabled: boolean;
+};
 
 type AnnotationToolbarProps = {
   state: AnnotationState;
@@ -42,6 +51,19 @@ type AnnotationToolbarProps = {
   onViewThread?: (threadId: string) => void;
   isThreadPanelOpen?: boolean;
   activePlan?: { planId: string; status: string; goal: string } | null;
+  mcpStatus?: Record<string, McpStatus>;
+  onInstallMcp?: () => Promise<void>;
+  mcpJustInstalled?: boolean;
+  bridgeUrl?: string;
+  modelSelectedComponent?: string | null;
+  modelCanvasHoveredComponent?: string | null;
+  onModelComponentHover?: (info: ComponentHoverInfo) => void;
+  onSpacingTokenHover?: (info: SpacingTokenHover) => void;
+  onSpacingTokenUpdate?: (path: string, value: string) => void;
+  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
+  onSpacingTokenDelete?: (tokenPath: string) => void;
+  onModelComponentAdded?: () => void;
+  onModelComponentRemoved?: (name: string) => void;
 };
 
 type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: string };
@@ -54,6 +76,27 @@ const shapeTools: ToolDef[] = [
 ];
 
 const shapeToolTypes = new Set(shapeTools.map(t => t.type));
+
+function pointInTriangle(
+  px: number, py: number,
+  ax: number, ay: number,
+  bx: number, by: number,
+  cx: number, cy: number,
+): boolean {
+  const d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+  const d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+  const d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+  const hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+  const hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(hasNeg && hasPos);
+}
+
+function getPanelBottomEdge(): { left: number; right: number; y: number } {
+  const panelRight = window.innerWidth - 16;
+  const panelLeft = panelRight - 326; // 300 width + 24 padding + ~2 border
+  const panelBottomY = window.innerHeight - 80;
+  return { left: panelLeft, right: panelRight, y: panelBottomY };
+}
 
 const standaloneTools: ToolDef[] = [
   { type: 'text', icon: Type, label: 'Text', shortcut: 'T' },
@@ -183,6 +226,22 @@ const TOOL_GUIDANCE: Record<string, GuidanceEntry> = {
       { key: '⌘ Enter', desc: 'Hand off to your AI', accent: true },
     ],
   },
+  model: {
+    name: 'Model',
+    desc: 'Promote components into the local design model.',
+    usage: [
+      'Hover to highlight component boundaries',
+      'Scroll to walk up/down the component tree',
+      'Click to add to model.json',
+      'Green = already in model',
+    ],
+    keys: [
+      { key: 'M', desc: 'Select tool' },
+      { key: 'Scroll', desc: 'Walk tree depth' },
+      { key: 'Click', desc: 'Promote component' },
+      { key: 'Esc', desc: 'Deselect' },
+    ],
+  },
   counter: {
     name: 'Annotations',
     desc: 'Click to cycle, scroll to change color, long press to reset.',
@@ -237,11 +296,13 @@ const TOOL_STORAGE_KEY = 'devtools-active-tool';
 const COLOR_STORAGE_KEY = 'devtools-active-color';
 const STROKE_STORAGE_KEY = 'devtools-stroke-width';
 const INSPECTED_STORAGE_KEY = 'devtools-inspected-element';
+const SPACING_CHANGES_STORAGE_KEY = 'devtools-spacing-changes';
 
 const STORAGE_KEYS: StorageKeys = {
   expanded: STORAGE_KEY,
   annotations: ANNOTATIONS_STORAGE_KEY,
   styleMods: STYLE_MODS_STORAGE_KEY,
+  spacingChanges: SPACING_CHANGES_STORAGE_KEY,
   tool: TOOL_STORAGE_KEY,
   color: COLOR_STORAGE_KEY,
   stroke: STROKE_STORAGE_KEY,
@@ -284,6 +345,19 @@ export function AnnotationToolbar({
   onViewThread,
   isThreadPanelOpen,
   activePlan,
+  mcpStatus,
+  onInstallMcp,
+  mcpJustInstalled,
+  bridgeUrl,
+  modelSelectedComponent,
+  modelCanvasHoveredComponent,
+  onModelComponentHover,
+  onSpacingTokenHover,
+  onSpacingTokenUpdate,
+  onSpacingTokenChange,
+  onSpacingTokenDelete,
+  onModelComponentAdded,
+  onModelComponentRemoved,
 }: AnnotationToolbarProps) {
   const [isExpanded, setIsExpanded] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -317,20 +391,39 @@ export function AnnotationToolbar({
   const guidanceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const guidanceHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Mouse-position prediction cone refs (Amazon mega-menu pattern)
+  const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const pendingToolRef = useRef<string | null>(null);
+  const decisionPointRef = useRef<{ x: number; y: number } | null>(null);
+  const predictionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearPrediction = useCallback(() => {
+    pendingToolRef.current = null;
+    decisionPointRef.current = null;
+    if (predictionTimerRef.current) {
+      clearTimeout(predictionTimerRef.current);
+      predictionTimerRef.current = null;
+    }
+  }, []);
+
   const handleToolHoverStart = useCallback((tool: string) => {
     if (guidanceHideTimerRef.current) {
       clearTimeout(guidanceHideTimerRef.current);
       guidanceHideTimerRef.current = null;
     }
     if (guidanceVisibleRef.current) {
-      // Already showing — immediately flip to new tool
-      setGuidanceTool(tool);
-      if (guidanceTimerRef.current) {
-        clearTimeout(guidanceTimerRef.current);
-        guidanceTimerRef.current = null;
-      }
+      // Panel already visible — use prediction cone instead of immediate switch
+      pendingToolRef.current = tool;
+      decisionPointRef.current = { ...lastMouseRef.current };
+      if (predictionTimerRef.current) clearTimeout(predictionTimerRef.current);
+      predictionTimerRef.current = setTimeout(() => {
+        if (pendingToolRef.current) {
+          setGuidanceTool(pendingToolRef.current);
+          clearPrediction();
+        }
+      }, 300);
     } else {
-      // Start 1s delay
+      // Start 500ms show delay
       if (guidanceTimerRef.current) clearTimeout(guidanceTimerRef.current);
       guidanceTimerRef.current = setTimeout(() => {
         guidanceVisibleRef.current = true;
@@ -338,9 +431,10 @@ export function AnnotationToolbar({
         guidanceTimerRef.current = null;
       }, 500);
     }
-  }, []);
+  }, [clearPrediction]);
 
   const handleToolHoverEnd = useCallback(() => {
+    clearPrediction();
     if (guidanceTimerRef.current) {
       clearTimeout(guidanceTimerRef.current);
       guidanceTimerRef.current = null;
@@ -349,7 +443,19 @@ export function AnnotationToolbar({
       guidanceVisibleRef.current = false;
       setGuidanceTool(null);
     }, 150);
-  }, []);
+  }, [clearPrediction]);
+
+  const handleToolbarMouseMove = useCallback((e: React.MouseEvent) => {
+    lastMouseRef.current = { x: e.clientX, y: e.clientY };
+    if (pendingToolRef.current && decisionPointRef.current) {
+      const apex = decisionPointRef.current;
+      const edge = getPanelBottomEdge();
+      if (!pointInTriangle(e.clientX, e.clientY, apex.x, apex.y, edge.left, edge.y, edge.right, edge.y)) {
+        setGuidanceTool(pendingToolRef.current);
+        clearPrediction();
+      }
+    }
+  }, [clearPrediction]);
 
   // Dynamic provider guidance (computed from availableProviders instead of static TOOL_GUIDANCE)
   const providerGuidance = useMemo((): GuidanceEntry => {
@@ -424,6 +530,19 @@ export function AnnotationToolbar({
             dispatch({ type: 'RESTORE_STYLE_MODIFICATIONS', payload: styleModifications });
             // Apply styles to DOM
             applyStyleModifications(styleModifications);
+          }
+        } catch {
+          // Invalid JSON, ignore
+        }
+      }
+
+      // Restore spacing token changes from localStorage
+      const storedSpacingChanges = localStorage.getItem(SPACING_CHANGES_STORAGE_KEY);
+      if (storedSpacingChanges) {
+        try {
+          const spacingChanges = JSON.parse(storedSpacingChanges);
+          if (Array.isArray(spacingChanges) && spacingChanges.length > 0) {
+            dispatch({ type: 'RESTORE_SPACING_TOKEN_CHANGES', payload: spacingChanges });
           }
         } catch {
           // Invalid JSON, ignore
@@ -540,6 +659,7 @@ export function AnnotationToolbar({
   }, [dispatch]);
 
   const handleToolSelect = useCallback((tool: ToolType) => {
+    clearPrediction();
     dispatch({ type: 'SET_TOOL', payload: tool });
     if (!state.isAnnotating) {
       dispatch({ type: 'SET_ANNOTATING', payload: true });
@@ -549,7 +669,7 @@ export function AnnotationToolbar({
     setGuidanceTool(null);
     if (guidanceTimerRef.current) { clearTimeout(guidanceTimerRef.current); guidanceTimerRef.current = null; }
     if (guidanceHideTimerRef.current) { clearTimeout(guidanceHideTimerRef.current); guidanceHideTimerRef.current = null; }
-  }, [dispatch, state.isAnnotating]);
+  }, [dispatch, state.isAnnotating, clearPrediction]);
 
   const handleScreenshot = useCallback(async () => {
     window.focus();
@@ -578,7 +698,7 @@ export function AnnotationToolbar({
 
     if (!onSendToClaude) return;
     await onSendToClaude();
-  }, [onSendToClaude, onPlanGoal, state.annotations, state.styleModifications]);
+  }, [onSendToClaude, onPlanGoal, state.annotations, state.styleModifications, state.spacingTokenChanges]);
 
   const handleCollapse = useCallback(() => {
     dispatch({ type: 'SET_ANNOTATING', payload: false });
@@ -594,6 +714,7 @@ export function AnnotationToolbar({
     dispatch({ type: 'CLEAR_ALL_STYLES' });
     localStorage.removeItem(ANNOTATIONS_STORAGE_KEY);
     localStorage.removeItem(STYLE_MODS_STORAGE_KEY);
+    localStorage.removeItem(SPACING_CHANGES_STORAGE_KEY);
     setFocusedGroupIndex(null);
     onClear?.();
   }, [dispatch, state.styleModifications, onClear]);
@@ -677,11 +798,14 @@ export function AnnotationToolbar({
     }
   }, []);
 
-  // Cleanup long press timer
+  // Cleanup long press timer and prediction timer
   useEffect(() => {
     return () => {
       if (longPressTimerRef.current) {
         clearTimeout(longPressTimerRef.current);
+      }
+      if (predictionTimerRef.current) {
+        clearTimeout(predictionTimerRef.current);
       }
     };
   }, []);
@@ -867,7 +991,7 @@ export function AnnotationToolbar({
 
       // Cmd/Ctrl+Enter to send to Claude (when bridge connected and annotations exist)
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        if ((onSendToClaude || onPlanGoal) && (state.annotations.length > 0 || state.styleModifications.length > 0)) {
+        if ((onSendToClaude || onPlanGoal) && (state.annotations.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0)) {
           e.preventDefault();
           handleSendToClaude();
         }
@@ -904,6 +1028,13 @@ export function AnnotationToolbar({
         h: 'hand',
       };
 
+      // M key selects the Model tool
+      if (e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        handleToolSelect('model');
+        return;
+      }
+
       const tool = toolMap[e.key.toLowerCase()];
       if (tool) {
         e.preventDefault();
@@ -918,7 +1049,7 @@ export function AnnotationToolbar({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, onPlanGoal, handleClear, state.annotations.length, state.styleModifications.length]);
+  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, onPlanGoal, handleClear, state.annotations.length, state.styleModifications.length, state.spacingTokenChanges, guidanceTool]);
 
 
 
@@ -1018,11 +1149,43 @@ export function AnnotationToolbar({
           pointerEvents: 'none',
         }}
       />
-      {/* Tool guidance panel */}
-      {guidanceTool && (guidanceTool === 'provider' || TOOL_GUIDANCE[guidanceTool]) && (() => {
+      {/* Model panel (active tool or hover-triggered) */}
+      {(guidanceTool === 'model' || state.activeTool === 'model') && (
+        <LibraryPanel
+          bridgeUrl={bridgeUrl}
+          selectedComponent={modelSelectedComponent}
+          hoveredComponent={modelCanvasHoveredComponent}
+          onComponentHover={onModelComponentHover}
+          onSpacingTokenHover={onSpacingTokenHover}
+          onSpacingTokenUpdate={onSpacingTokenUpdate}
+          onSpacingTokenChange={onSpacingTokenChange}
+          onSpacingTokenDelete={onSpacingTokenDelete}
+          onComponentAdded={onModelComponentAdded}
+          onComponentRemoved={onModelComponentRemoved}
+          onMouseEnter={() => {
+            clearPrediction();
+            if (guidanceHideTimerRef.current) {
+              clearTimeout(guidanceHideTimerRef.current);
+              guidanceHideTimerRef.current = null;
+            }
+          }}
+          onMouseLeave={state.activeTool === 'model' ? undefined : handleToolHoverEnd}
+        />
+      )}
+      {/* Tool guidance panel (model has its own LibraryPanel, skip here) */}
+      {guidanceTool && guidanceTool !== 'model' && (guidanceTool === 'provider' || TOOL_GUIDANCE[guidanceTool]) && (() => {
         const g = guidanceTool === 'provider' ? providerGuidance : TOOL_GUIDANCE[guidanceTool]!;
         return (
-          <div style={{
+          <div
+            onMouseEnter={guidanceTool === 'collapse' ? () => {
+              clearPrediction();
+              if (guidanceHideTimerRef.current) {
+                clearTimeout(guidanceHideTimerRef.current);
+                guidanceHideTimerRef.current = null;
+              }
+            } : undefined}
+            onMouseLeave={guidanceTool === 'collapse' ? handleToolHoverEnd : undefined}
+            style={{
             position: 'fixed',
             bottom: 80,
             right: 16,
@@ -1035,7 +1198,7 @@ export function AnnotationToolbar({
             fontSize: 12,
             color: '#1f2937',
             padding: 12,
-            pointerEvents: 'none',
+            ...(guidanceTool !== 'collapse' ? { pointerEvents: 'none' as const } : {}),
           }}>
             {guidanceTool === 'collapse' && (
               <div style={{ marginBottom: 10 }}>
@@ -1065,6 +1228,77 @@ export function AnnotationToolbar({
                 <span>{line}</span>
               </div>
             ))}
+            {guidanceTool === 'collapse' && mcpStatus && Object.keys(mcpStatus).length > 0 && (() => {
+              const connected = Object.entries(mcpStatus)
+                .filter(([, s]) => s.found && !s.disabled)
+                .map(([name]) => name.charAt(0).toUpperCase() + name.slice(1));
+              const unconfigured = Object.entries(mcpStatus)
+                .filter(([, s]) => !s.found)
+                .map(([name]) => name);
+              if (connected.length === 0 && unconfigured.length === 0) return null;
+              const unconfiguredLabels = unconfigured.map((n) => n.charAt(0).toUpperCase() + n.slice(1));
+              return (
+                <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 10, paddingTop: 8, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+                  <span style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    backgroundColor: connected.length > 0 ? '#22c55e' : 'rgba(0,0,0,0.2)',
+                    flexShrink: 0,
+                  }} />
+                  {connected.length > 0 ? (
+                    <span style={{ color: '#6b7280', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span>
+                        Taste library ready in {connected.join(', ')}
+                        {mcpJustInstalled && ' — restart CLI to activate'}
+                      </span>
+                      {unconfigured.length > 0 && onInstallMcp && !mcpJustInstalled && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); onInstallMcp(); }}
+                          style={{
+                            border: 'none',
+                            background: 'transparent',
+                            color: '#3b82f6',
+                            fontSize: 10,
+                            fontWeight: 500,
+                            fontFamily: 'inherit',
+                            padding: 0,
+                            cursor: 'pointer',
+                            pointerEvents: 'auto',
+                            textDecoration: 'underline',
+                            textUnderlineOffset: 2,
+                          }}
+                        >
+                          + {unconfiguredLabels.join(', ')}
+                        </button>
+                      )}
+                    </span>
+                  ) : unconfigured.length > 0 && onInstallMcp ? (
+                    <span style={{ color: '#6b7280', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span>Connect Popmelt MCP</span>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); onInstallMcp(); }}
+                        style={{
+                          border: 'none',
+                          background: '#1f2937',
+                          color: '#fff',
+                          fontSize: 10,
+                          fontWeight: 600,
+                          fontFamily: 'inherit',
+                          padding: '2px 8px',
+                          cursor: 'pointer',
+                          pointerEvents: 'auto',
+                        }}
+                      >
+                        Connect
+                      </button>
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })()}
             {g.keys.length > 1 && (
               <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
                 {g.keys.slice(1).map((k, i) => (
@@ -1087,6 +1321,7 @@ export function AnnotationToolbar({
       <div
         id="devtools-toolbar"
         style={toolbarStyle}
+        onMouseMove={handleToolbarMouseMove}
       >
         {(state.annotations.length > 0 || state.styleModifications.length > 0) && (
           <>
@@ -1217,12 +1452,23 @@ export function AnnotationToolbar({
               </ToolButton>
             </span>
           ))}
+
+          {/* Model (design model browser / component promoter) */}
+          <span onMouseEnter={() => handleToolHoverStart('model')} onMouseLeave={handleToolHoverEnd}>
+            <ToolButton
+              active={state.isAnnotating && state.activeTool === 'model'}
+              siblingActive={state.isAnnotating}
+              onClick={() => handleToolSelect('model')}
+            >
+              <Component size={17} strokeWidth={1.5} />
+            </ToolButton>
+          </span>
         </div>
 
         <ToolSeparator />
 
         <div style={{ display: 'flex', flexDirection: 'row', gap: 4, alignItems: 'center' }}>
-          {(annotationGroups.length > 0 || state.styleModifications.length > 0) && (() => {
+          {(annotationGroups.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0) && (() => {
             // Check if focused on an annotation group (vs style modification)
             const focusedGroup = focusedGroupIndex !== null && focusedGroupIndex < annotationGroups.length
               ? annotationGroups[focusedGroupIndex]
@@ -1270,7 +1516,7 @@ export function AnnotationToolbar({
                   transition: 'background 150ms ease',
                 }}
               >
-                {focusedGroupIndex !== null ? focusedGroupIndex + 1 : annotationGroups.length + state.styleModifications.length}
+                {focusedGroupIndex !== null ? focusedGroupIndex + 1 : annotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length}
               </button>
               </span>
             );

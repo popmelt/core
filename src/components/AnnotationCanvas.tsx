@@ -10,6 +10,9 @@ import { useWheelZoom } from '../hooks/useWheelZoom';
 import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING } from '../tools/text';
 import type { Annotation, AnnotationAction, AnnotationLifecycleStatus, AnnotationState, ElementInfo, Point } from '../tools/types';
 import type { BorderRadiusCorner } from '../utils/dom';
+import type { ComponentBoundary } from '../utils/dom';
+import type { SpacingRect } from '../utils/dom';
+import type { TokenBinding } from '../utils/dom';
 import { computeSupersededAnnotations } from '../utils/superseded';
 import {
   applyInlineStyle,
@@ -17,6 +20,10 @@ import {
   computeGapZones,
   extractElementInfo,
   findElementBySelector,
+  getComponentBoundary,
+  findAllComponentBoundariesByName,
+  findSpacingUsages,
+  findSpacingUsagesByBinding,
   isAutoGap,
   getComputedBorderRadius,
   getComputedGap,
@@ -51,6 +58,12 @@ type AnnotationCanvasProps = {
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
   activePlan?: { planId: string; status: string; threadId?: string; tasks?: { id: string; instruction: string }[] } | null;
+  onModelComponentsAdd?: (names: string[]) => void;
+  onModelComponentFocus?: (name: string) => void;
+  onModelComponentHover?: (name: string | null) => void;
+  modelComponentNames?: Set<string>;
+  modelPanelHoveredComponent?: { name: string; instanceIndex: number } | null;
+  modelSpacingTokenHover?: { name: string; px: number; token?: TokenBinding } | null;
 };
 
 type ActiveTextInput = {
@@ -92,7 +105,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, activePlan }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, activePlan, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeText, setActiveText] = useState<ActiveTextInput | null>(() => {
@@ -119,6 +132,12 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   // Clipboard state for copy/paste
   const clipboardRef = useRef<Annotation[]>([]);
   const pasteCountRef = useRef<number>(0);
+
+  // Model tool state
+  const [modelHoveredComponent, setModelHoveredComponent] = useState<ComponentBoundary | null>(null);
+  const [modelFocusedComponents, setModelFocusedComponents] = useState<Map<string, ComponentBoundary>>(new Map());
+  const modelDepthOffsetRef = useRef(0);
+  const lastModelDomElementRef = useRef<Element | null>(null);
 
   // Inspector mode state
   const [hoveredElement, setHoveredElement] = useState<Element | null>(null);
@@ -293,6 +312,75 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   // Global wheel handler for text resize (works even when canvas has pointerEvents: none)
   // Also handles edit mode to ensure scroll is blocked
   useWheelZoom(activeText, setActiveText, hoveredTextId, state.annotations, dispatch);
+
+  // Model tool: Option+scroll to walk component tree depth
+  const modelHoveredComponentRef = useRef(modelHoveredComponent);
+  modelHoveredComponentRef.current = modelHoveredComponent;
+
+  useEffect(() => {
+    if (state.activeTool !== 'model' || !state.isAnnotating) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      // Only intercept when Option/Alt held — plain scroll passes through
+      if (!e.altKey || !modelHoveredComponentRef.current) return;
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -1 : 1; // scroll down = shallower (toward root), up = deeper
+      modelDepthOffsetRef.current = Math.max(0, modelDepthOffsetRef.current + delta);
+      const el = lastModelDomElementRef.current;
+      if (el) {
+        const boundary = getComponentBoundary(el, modelDepthOffsetRef.current);
+        setModelHoveredComponent(boundary);
+      }
+    };
+
+    window.addEventListener('wheel', handleWheel, { passive: false });
+    return () => window.removeEventListener('wheel', handleWheel);
+  }, [state.activeTool, state.isAnnotating]);
+
+  // Clear model hover/focus state when switching away from model tool
+  useEffect(() => {
+    if (state.activeTool !== 'model') {
+      setModelHoveredComponent(null);
+      setModelFocusedComponents(new Map());
+      modelDepthOffsetRef.current = 0;
+      lastModelDomElementRef.current = null;
+    }
+  }, [state.activeTool]);
+
+  // Notify parent of canvas hover changes (for panel highlighting)
+  useEffect(() => {
+    const name = modelHoveredComponent?.name ?? null;
+    // Only report in-model components (panel only shows those)
+    const inModel = name && modelComponentNames?.has(name) ? name : null;
+    onModelComponentHover?.(inModel);
+  }, [modelHoveredComponent, modelComponentNames, onModelComponentHover]);
+
+  // Resolve panel-hovered component to a DOM boundary for highlighting
+  const [modelPanelHoveredBoundary, setModelPanelHoveredBoundary] = useState<ComponentBoundary | null>(null);
+  useEffect(() => {
+    if (!modelPanelHoveredComponent) {
+      setModelPanelHoveredBoundary(null);
+      return;
+    }
+    const boundaries = findAllComponentBoundariesByName(modelPanelHoveredComponent.name);
+    const idx = modelPanelHoveredComponent.instanceIndex;
+    setModelPanelHoveredBoundary(boundaries[idx % boundaries.length] ?? null);
+  }, [modelPanelHoveredComponent]);
+
+  // Resolve spacing token hover to redline rects
+  // Binding-aware matching makes hover redlines useful (no cross-contamination between tokens)
+  const [spacingRedlines, setSpacingRedlines] = useState<SpacingRect[]>([]);
+  useEffect(() => {
+    if (!modelSpacingTokenHover) {
+      setSpacingRedlines([]);
+      return;
+    }
+    if (modelSpacingTokenHover.token?.bindings?.length) {
+      setSpacingRedlines(findSpacingUsagesByBinding(modelSpacingTokenHover.token));
+    } else {
+      setSpacingRedlines(findSpacingUsages(modelSpacingTokenHover.px));
+    }
+  }, [modelSpacingTokenHover]);
 
   // Option + horizontal swipe over flex containers: cycle justify-content start ↔ center ↔ end
   // Finds nearest flex container at cursor position — works anywhere on the element, not just gap zones
@@ -550,12 +638,30 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         // If editing text, let the text handler deal with it
         if (activeTextRef.current) return;
 
+        // Model tool: clear focused components
+        if (state.activeTool === 'model' && modelFocusedComponents.size > 0) {
+          e.preventDefault();
+          setModelFocusedComponents(new Map());
+          return;
+        }
+
         // If annotations selected, deselect them
         if (selectedIdsRef.current.length > 0) {
           e.preventDefault();
           clearSelection();
           return;
         }
+      }
+
+      // Model tool: Enter to confirm focused components
+      if (e.key === 'Enter' && state.activeTool === 'model' && modelFocusedComponents.size > 0 && onModelComponentsAdd) {
+        e.preventDefault();
+        const newNames = [...modelFocusedComponents.keys()].filter(n => !modelComponentNames?.has(n));
+        if (newNames.length > 0) {
+          onModelComponentsAdd(newNames);
+        }
+        setModelFocusedComponents(new Map());
+        return;
       }
 
 
@@ -613,7 +719,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [dispatch, clearSelection, selectAnnotation]); // All other values read from refs
+  }, [dispatch, clearSelection, selectAnnotation, state.activeTool, modelFocusedComponents, modelComponentNames, onModelComponentsAdd]); // All other values read from refs
 
   // Compute superseded annotations: when multiple annotation rounds target
   // the same linkedSelector, only the newest round is visible.
@@ -1209,6 +1315,45 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         return;
       }
 
+      // Model tool: click to focus/select, double-click or Enter to confirm
+      if (state.activeTool === 'model') {
+        if ('button' in e && e.button === 2) return;
+        if (modelHoveredComponent) {
+          const name = modelHoveredComponent.name;
+
+          // Already in model — just focus in LibraryPanel
+          if (modelComponentNames?.has(name)) {
+            onModelComponentFocus?.(name);
+            return;
+          }
+
+          const isShift = 'shiftKey' in e && e.shiftKey;
+
+          if (isShift) {
+            // Shift-click: toggle in focused set
+            setModelFocusedComponents(prev => {
+              const next = new Map(prev);
+              if (next.has(name)) {
+                next.delete(name);
+              } else {
+                next.set(name, modelHoveredComponent);
+              }
+              return next;
+            });
+          } else if (modelFocusedComponents.size === 1 && modelFocusedComponents.has(name)) {
+            // Second click on sole focused component — confirm add
+            if (onModelComponentsAdd) {
+              onModelComponentsAdd([name]);
+            }
+            setModelFocusedComponents(new Map());
+          } else {
+            // Plain click: replace focused set with just this component
+            setModelFocusedComponents(new Map([[name, modelHoveredComponent]]));
+          }
+        }
+        return;
+      }
+
       // Hand tool: start gap drag
       if (state.activeTool === 'hand' && gapHoveredElement && gapHoveredAxis) {
         const el = gapHoveredElement;
@@ -1406,7 +1551,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       setIsDrawing(true);
       dispatch({ type: 'START_PATH', payload: point });
     },
-    [state.isAnnotating, state.activeTool, state.inspectedElement, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
+    [state.isAnnotating, state.activeTool, state.inspectedElement, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, modelHoveredComponent, modelFocusedComponents, modelComponentNames, onModelComponentsAdd, onModelComponentFocus, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
   );
 
   const handlePointerMove = useCallback(
@@ -1423,6 +1568,24 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         if (el !== hoveredElement) {
           setHoveredElement(el);
           setHoveredElementInfo(el ? extractElementInfo(el) : null);
+        }
+        return;
+      }
+
+      // Model tool: highlight component boundary under cursor
+      if (state.activeTool === 'model' && state.isAnnotating) {
+        const viewportX = point.x - window.scrollX;
+        const viewportY = point.y - window.scrollY;
+        const el = getTopmostElementAtPoint(viewportX, viewportY);
+        if (el !== lastModelDomElementRef.current) {
+          lastModelDomElementRef.current = el;
+          modelDepthOffsetRef.current = 0;
+        }
+        if (el) {
+          const boundary = getComponentBoundary(el, modelDepthOffsetRef.current);
+          setModelHoveredComponent(boundary);
+        } else {
+          setModelHoveredComponent(null);
         }
         return;
       }
@@ -2850,6 +3013,84 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             );
           })()}
         </>
+      )}
+
+      {/* Model tool: Focused component highlights (purple, selected style) */}
+      {state.activeTool === 'model' && state.isAnnotating && modelFocusedComponents.size > 0 && (
+        [...modelFocusedComponents.entries()].map(([name, boundary]) => (
+          <ElementHighlight
+            key={name}
+            element={boundary.rootElement}
+            isSelected={true}
+            elementInfo={{
+              selector: '',
+              tagName: boundary.rootElement.tagName.toLowerCase(),
+              reactComponent: name,
+            }}
+            color="#8b5cf6"
+          />
+        ))
+      )}
+
+      {/* Model tool: Panel-hovered component highlight */}
+      {state.activeTool === 'model' && state.isAnnotating && modelPanelHoveredBoundary && (
+        <ElementHighlight
+          element={modelPanelHoveredBoundary.rootElement}
+          isSelected={true}
+          elementInfo={{
+            selector: '',
+            tagName: modelPanelHoveredBoundary.rootElement.tagName.toLowerCase(),
+            reactComponent: modelPanelHoveredBoundary.name,
+          }}
+          color="#22c55e"
+        />
+      )}
+
+      {/* Model tool: Spacing token redline overlays (z below panel 10001) */}
+      {state.activeTool === 'model' && state.isAnnotating && spacingRedlines.length > 0 && spacingRedlines.map((sr, i) => (
+        <div
+          key={i}
+          style={{
+            position: 'absolute',
+            left: sr.x,
+            top: sr.y,
+            width: sr.width,
+            height: sr.height,
+            backgroundColor: 'rgba(255, 0, 0, 0.08)',
+            pointerEvents: 'none',
+            zIndex: 9998,
+          }}
+        >
+          {sr.direction === 'vertical' ? (<>
+            <div style={{ position: 'absolute', left: '50%', top: 0, width: 6, height: 1, backgroundColor: '#FF0000', transform: 'translateX(-50%)' }} />
+            <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: 1, backgroundColor: '#FF0000', transform: 'translateX(-50%)' }} />
+            <div style={{ position: 'absolute', left: '50%', bottom: 0, width: 6, height: 1, backgroundColor: '#FF0000', transform: 'translateX(-50%)' }} />
+            <div style={{ position: 'absolute', left: 'calc(50% + 6px)', top: sr.height < 16 ? -6 : '50%', transform: sr.height < 16 ? 'none' : 'translateY(-50%)', fontSize: 11, fontWeight: 600, color: '#fff', backgroundColor: '#FF0000', padding: '2px 4px', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', lineHeight: 1 }}>
+              {Math.round(sr.height)}
+            </div>
+          </>) : (<>
+            <div style={{ position: 'absolute', left: 0, top: '50%', width: 1, height: 6, backgroundColor: '#FF0000', transform: 'translateY(-50%)' }} />
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '50%', height: 1, backgroundColor: '#FF0000', transform: 'translateY(-50%)' }} />
+            <div style={{ position: 'absolute', right: 0, top: '50%', width: 1, height: 6, backgroundColor: '#FF0000', transform: 'translateY(-50%)' }} />
+            <div style={{ position: 'absolute', left: sr.width < 30 ? 0 : '50%', top: sr.width < 30 ? undefined : undefined, bottom: 'calc(50% + 4px)', transform: sr.width < 30 ? 'none' : 'translateX(-50%)', fontSize: 11, fontWeight: 600, color: '#fff', backgroundColor: '#FF0000', padding: '2px 4px', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace', lineHeight: 1 }}>
+              {Math.round(sr.width)}
+            </div>
+          </>)}
+        </div>
+      ))}
+
+      {/* Model tool: Hover highlight (draws on top of focused) */}
+      {state.activeTool === 'model' && state.isAnnotating && modelHoveredComponent && (
+        <ElementHighlight
+          element={modelHoveredComponent.rootElement}
+          isSelected={false}
+          elementInfo={{
+            selector: '',
+            tagName: modelHoveredComponent.rootElement.tagName.toLowerCase(),
+            reactComponent: modelHoveredComponent.name,
+          }}
+          color={modelComponentNames?.has(modelHoveredComponent.name) ? '#22c55e' : '#8b5cf6'}
+        />
       )}
 
       {/* Hand tool: Selected element highlight + StylePanel (right-click inspect) */}
