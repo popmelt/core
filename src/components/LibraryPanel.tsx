@@ -3,27 +3,27 @@
 import React, { Component, createElement, useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 
 import { POPMELT_BORDER } from '../styles/border';
-import type { SpacingTokenChange } from '../tools/types';
+import type { SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { fetchModel, type DesignModel } from '../utils/bridge-client';
 import { findAllComponentBoundariesByName, getComponentPositions } from '../utils/dom';
-import { buildSpacingChangeContext, captureBindingsFromTargets, findElementsByTokenBinding, findSpacingElements, inferPropertyScope, resolveSpacingToken, updateBindingClasses, type SpacingElement, type TokenBinding } from '../utils/domQuery';
+import { buildSpacingChangeContext, captureBindingsFromTargets, findElementsByTokenBinding, inferPropertyScope, resolveSpacingToken, updateBindingClasses, getUniqueSelector, type SpacingElement, type TokenBinding } from '../utils/domQuery';
 
 export type ComponentHoverInfo = { name: string; instanceIndex: number } | null;
 export type SpacingTokenHover = { name: string; px: number; token?: TokenBinding } | null;
 
 type LibraryPanelProps = {
   bridgeUrl?: string;
+  modelRefreshKey?: number;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
   selectedComponent?: string | null;
   hoveredComponent?: string | null;
   onComponentHover?: (info: ComponentHoverInfo) => void;
   onSpacingTokenHover?: (info: SpacingTokenHover) => void;
-  onSpacingTokenUpdate?: (path: string, value: string) => void;
+  onModifySpacingToken?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDeleteSpacingToken?: (tokenPath: string, originalValue: string) => void;
   onComponentAdded?: () => void;
   onComponentRemoved?: (name: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onSpacingTokenDelete?: (tokenPath: string) => void;
 };
 
 type Tab = 'tokens' | 'components' | 'rules';
@@ -177,13 +177,12 @@ function snapToStep(raw: number): number {
   return Math.round(raw / 8) * 8;
 }
 
-function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onUpdate, onSpacingTokenChange, onDelete }: {
+function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onModify, onDelete }: {
   label: string; value: string; px: number; tokenPath: string;
   rawToken: string | TokenBinding;
   onHover?: (info: SpacingTokenHover) => void;
-  onUpdate?: (path: string, value: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onDelete?: (path: string) => void;
+  onModify?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDelete?: (path: string, originalValue: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [dragPx, setDragPx] = useState<number | null>(null);
@@ -223,38 +222,42 @@ function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onUpd
       draggingRef.current = false;
 
       setDragPx(current => {
-        if (current !== null && current !== px) {
+        if (current !== null && current !== px && onModify) {
           const token = resolveSpacingToken(rawToken);
           const hadBindings = token.bindings && token.bindings.length > 0;
 
+          // Compute the serialized new value for model.json
+          let newValue: string;
           if (hadBindings) {
-            // Token already had bindings — update value + recompute binding classes
             const newBindings = updateBindingClasses(token.bindings!, originalPxRef.current, current);
-            onUpdate?.(tokenPath, JSON.stringify({ ...token, value: `${current}px`, bindings: newBindings }));
+            newValue = JSON.stringify({ ...token, value: `${current}px`, bindings: newBindings });
           } else {
-            // No bindings yet — auto-populate from matched elements
             const bindings = captureBindingsFromTargets(targetsRef.current, originalPxRef.current);
             const property = inferPropertyScope(targetsRef.current);
             if (bindings.length > 0) {
               const newBindings = updateBindingClasses(bindings, originalPxRef.current, current);
-              onUpdate?.(tokenPath, JSON.stringify({ value: `${current}px`, property, bindings: newBindings }));
+              newValue = JSON.stringify({ value: `${current}px`, property, bindings: newBindings });
             } else {
-              onUpdate?.(tokenPath, `${current}px`);
+              newValue = `${current}px`;
             }
           }
 
+          // Serialize original value for undo
+          const originalValue = typeof rawToken === 'string' ? rawToken : JSON.stringify(rawToken);
+
+          // Capture target selectors for inline style undo
+          const targets = targetsRef.current.map(t => ({
+            selector: getUniqueSelector(t.element),
+            property: t.property,
+          }));
+
           // Build code-grounded context for AI
-          if (onSpacingTokenChange) {
-            const evidence = buildSpacingChangeContext(targetsRef.current, originalPxRef.current, current);
-            onSpacingTokenChange({
-              id: Math.random().toString(36).substring(2, 9),
-              tokenPath,
-              tokenName: label,
-              originalPx: originalPxRef.current,
-              newPx: current,
-              affectedElements: evidence,
-            });
-          }
+          const evidence = buildSpacingChangeContext(targetsRef.current, originalPxRef.current, current);
+
+          onModify(
+            { tokenPath, originalValue, currentValue: newValue, targets, originalPx: originalPxRef.current, currentPx: current },
+            { id: Math.random().toString(36).substring(2, 9), tokenPath, tokenName: label, originalPx: originalPxRef.current, newPx: current, affectedElements: evidence },
+          );
         }
         return current; // keep displaying the dragged value
       });
@@ -263,7 +266,7 @@ function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onUpd
     document.body.style.cursor = 'ew-resize';
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-  }, [px, label, tokenPath, rawToken, onHover, onUpdate, onSpacingTokenChange]);
+  }, [px, label, tokenPath, rawToken, onHover, onModify]);
 
   const token = resolveSpacingToken(rawToken);
 
@@ -281,7 +284,11 @@ function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onUpd
           <button
             type="button"
             title="Remove token"
-            onMouseDown={(e) => { e.stopPropagation(); onDelete(tokenPath); }}
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              const originalValue = typeof rawToken === 'string' ? rawToken : JSON.stringify(rawToken);
+              onDelete(tokenPath, originalValue);
+            }}
             style={{ border: 'none', background: 'none', cursor: 'pointer', padding: 0, fontSize: 10, lineHeight: 1, color: '#9ca3af' }}
             onMouseEnter={(e) => { e.currentTarget.style.color = '#FF0000'; }}
             onMouseLeave={(e) => { e.currentTarget.style.color = '#9ca3af'; }}
@@ -292,13 +299,12 @@ function SpacingTokenRow({ label, value, px, tokenPath, rawToken, onHover, onUpd
   );
 }
 
-function SpacingTokenList({ entries, categoryKey, rawTokens, onHover, onUpdate, onSpacingTokenChange, onDelete }: {
+function SpacingTokenList({ entries, categoryKey, rawTokens, onHover, onModify, onDelete }: {
   entries: [string, string][]; categoryKey: string;
   rawTokens?: Record<string, unknown>;
   onHover?: (info: SpacingTokenHover) => void;
-  onUpdate?: (path: string, value: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onDelete?: (path: string) => void;
+  onModify?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDelete?: (path: string, originalValue: string) => void;
 }) {
   const spacing: [string, string, number][] = [];
   const other: [string, string][] = [];
@@ -329,8 +335,7 @@ function SpacingTokenList({ entries, categoryKey, rawTokens, onHover, onUpdate, 
                 tokenPath={`tokens.${categoryKey}.${key}`}
                 rawToken={rawToken}
                 onHover={onHover}
-                onUpdate={onUpdate}
-                onSpacingTokenChange={onSpacingTokenChange}
+                onModify={onModify}
                 onDelete={onDelete}
               />
             );
@@ -367,17 +372,16 @@ function GenericList({ entries }: { entries: [string, string][] }) {
 }
 
 /** Pick the right renderer based on entry classification */
-function SmartEntries({ entries, categoryKey, rawTokens, onSpacingHover, onSpacingUpdate, onSpacingTokenChange, onSpacingDelete }: {
+function SmartEntries({ entries, categoryKey, rawTokens, onSpacingHover, onModifyToken, onDeleteToken }: {
   entries: [string, string][]; categoryKey: string;
   rawTokens?: Record<string, unknown>;
   onSpacingHover?: (info: SpacingTokenHover) => void;
-  onSpacingUpdate?: (path: string, value: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onSpacingDelete?: (path: string) => void;
+  onModifyToken?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDeleteToken?: (path: string, originalValue: string) => void;
 }) {
   const kind = classifyEntries(entries);
   if (kind === 'colors') return <ColorGrid entries={entries} />;
-  if (kind === 'spacing') return <SpacingTokenList entries={entries} categoryKey={categoryKey} rawTokens={rawTokens} onHover={onSpacingHover} onUpdate={onSpacingUpdate} onSpacingTokenChange={onSpacingTokenChange} onDelete={onSpacingDelete} />;
+  if (kind === 'spacing') return <SpacingTokenList entries={entries} categoryKey={categoryKey} rawTokens={rawTokens} onHover={onSpacingHover} onModify={onModifyToken} onDelete={onDeleteToken} />;
   return <GenericList entries={entries} />;
 }
 
@@ -471,12 +475,11 @@ function CategoryHeader({ children }: { children: ReactNode }) {
   );
 }
 
-function TokensTab({ tokens, onSpacingTokenHover, onSpacingTokenUpdate, onSpacingTokenChange, onSpacingTokenDelete }: {
+function TokensTab({ tokens, onSpacingTokenHover, onModifyToken, onDeleteToken }: {
   tokens?: Record<string, unknown>;
   onSpacingTokenHover?: (info: SpacingTokenHover) => void;
-  onSpacingTokenUpdate?: (path: string, value: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onSpacingTokenDelete?: (path: string) => void;
+  onModifyToken?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDeleteToken?: (path: string, originalValue: string) => void;
 }) {
   if (!tokens || Object.keys(tokens).length === 0) {
     return <div style={{ color: '#9ca3af', fontSize: 11 }}>No tokens defined yet.</div>;
@@ -486,7 +489,7 @@ function TokensTab({ tokens, onSpacingTokenHover, onSpacingTokenUpdate, onSpacin
       {Object.entries(tokens).map(([category, value]) => (
         <div key={category} style={{ marginBottom: 14 }}>
           <CategoryHeader>{category}</CategoryHeader>
-          <SmartEntries entries={flattenEntries(value)} categoryKey={category} rawTokens={value as Record<string, unknown>} onSpacingHover={onSpacingTokenHover} onSpacingUpdate={onSpacingTokenUpdate} onSpacingTokenChange={onSpacingTokenChange} onSpacingDelete={onSpacingTokenDelete} />
+          <SmartEntries entries={flattenEntries(value)} categoryKey={category} rawTokens={value as Record<string, unknown>} onSpacingHover={onSpacingTokenHover} onModifyToken={onModifyToken} onDeleteToken={onDeleteToken} />
         </div>
       ))}
     </>
@@ -690,7 +693,7 @@ function ComponentsTab({ components, selectedComponent, hoveredComponent, onRemo
 
 // --- Main ---
 
-export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onSpacingTokenUpdate, onComponentAdded, onComponentRemoved, onSpacingTokenChange, onSpacingTokenDelete }: LibraryPanelProps) {
+export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onModifySpacingToken, onDeleteSpacingToken, onComponentAdded, onComponentRemoved }: LibraryPanelProps) {
   const [model, setModel] = useState<DesignModel>(undefined as unknown as DesignModel);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>(() => {
@@ -698,7 +701,7 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
       const stored = localStorage.getItem(TAB_STORAGE_KEY);
       if (stored === 'tokens' || stored === 'components' || stored === 'rules') return stored;
     } catch {}
-    return 'tokens';
+    return 'components';
   });
 
   useEffect(() => {
@@ -706,7 +709,7 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
       setModel(m);
       setLoading(false);
     });
-  }, [bridgeUrl]);
+  }, [bridgeUrl, modelRefreshKey]);
 
   // Persist active tab
   useEffect(() => {
@@ -723,12 +726,11 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
     });
   }, [selectedComponent, bridgeUrl]);
 
-  const handleTokenDelete = useCallback((tokenPath: string) => {
+  const handleTokenDelete = useCallback((tokenPath: string, originalValue: string) => {
     // Optimistically remove from local state
     setModel(prev => {
       if (!prev?.tokens) return prev;
       const newTokens = JSON.parse(JSON.stringify(prev.tokens)) as Record<string, Record<string, string>>;
-      // tokenPath is like "tokens.spacing.section-gap" — navigate and delete
       const segments = tokenPath.split('.');
       let cursor: Record<string, unknown> = newTokens;
       for (let i = 1; i < segments.length - 1; i++) {
@@ -738,8 +740,8 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
       delete cursor[segments[segments.length - 1]!];
       return { ...prev, tokens: newTokens };
     });
-    onSpacingTokenDelete?.(tokenPath);
-  }, [onSpacingTokenDelete]);
+    onDeleteSpacingToken?.(tokenPath, originalValue);
+  }, [onDeleteSpacingToken]);
 
   const handleRemove = useCallback((name: string) => {
     // Optimistically remove from local state
@@ -777,7 +779,7 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 10, borderBottom: '1px solid rgba(0,0,0,0.08)', paddingBottom: 6 }}>
-        {(['tokens', 'components', 'rules'] as const).map(tab => (
+        {(['components', 'rules'] as const).map(tab => (
           <button
             key={tab}
             type="button"
@@ -799,8 +801,8 @@ export function LibraryPanel({ bridgeUrl, onMouseEnter, onMouseLeave, selectedCo
           </div>
         ) : (
           <>
-            {activeTab === 'tokens' && <TokensTab tokens={tokens} onSpacingTokenHover={onSpacingTokenHover} onSpacingTokenUpdate={onSpacingTokenUpdate} onSpacingTokenChange={onSpacingTokenChange} onSpacingTokenDelete={onSpacingTokenDelete ? handleTokenDelete : undefined} />}
             {activeTab === 'components' && <ComponentsTab components={components} selectedComponent={selectedComponent} hoveredComponent={hoveredComponent} onRemove={handleRemove} onHover={onComponentHover} />}
+            {activeTab === 'tokens' && <TokensTab tokens={tokens} onSpacingTokenHover={onSpacingTokenHover} onModifyToken={onModifySpacingToken} onDeleteToken={onDeleteSpacingToken ? handleTokenDelete : undefined} />}
             {activeTab === 'rules' && <RulesTab rules={rules} />}
           </>
         )}

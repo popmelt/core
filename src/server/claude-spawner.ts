@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
-import type { SSEEvent } from './types';
+import type { FileEdit, SSEEvent } from './types';
+
+export type { FileEdit };
 
 export type SpawnOptions = {
   prompt: string;
@@ -13,15 +15,6 @@ export type SpawnOptions = {
   resumeSessionId?: string;
   model?: string;
   onEvent?: (event: SSEEvent, jobId: string) => void;
-};
-
-export type FileEdit = {
-  tool: 'Edit' | 'Write';
-  file_path: string;
-  old_string?: string;  // Edit tool: text that was replaced
-  new_string?: string;  // Edit tool: replacement text
-  replace_all?: boolean;
-  content?: string;     // Write tool: full file content written
 };
 
 export type SpawnResult = {

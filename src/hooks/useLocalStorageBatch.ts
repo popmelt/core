@@ -6,6 +6,7 @@ export type StorageKeys = {
   expanded: string;
   annotations: string;
   styleMods: string;
+  spacingChanges: string;
   tool: string;
   color: string;
   stroke: string;
@@ -45,6 +46,9 @@ export function useLocalStorageBatch(
     // Style modifications
     localStorage.setItem(storageKeys.styleMods, JSON.stringify(state.styleModifications));
 
+    // Spacing token changes
+    localStorage.setItem(storageKeys.spacingChanges, JSON.stringify(state.spacingTokenChanges));
+
     // Tool, color, stroke
     localStorage.setItem(storageKeys.tool, state.activeTool);
     localStorage.setItem(storageKeys.color, state.activeColor);
@@ -63,6 +67,7 @@ export function useLocalStorageBatch(
     isExpanded,
     state.annotations,
     state.styleModifications,
+    state.spacingTokenChanges,
     state.activeTool,
     state.activeColor,
     state.strokeWidth,

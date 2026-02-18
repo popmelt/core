@@ -13,7 +13,7 @@ import {
 
 import { useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
-import type { AnnotationResolution, SpacingTokenChange } from '../tools/types';
+import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { addComponentToModel, approvePlan, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { resolveRegionToElement } from '../utils/dom';
 import { buildPageManifest } from '../utils/page-manifest';
@@ -216,25 +216,88 @@ export function PopmeltProvider({
     }
   }, [bridgeUrl]);
 
-  const handleSpacingTokenUpdate = useCallback(async (path: string, value: string) => {
-    try {
-      await updateModelToken(path, value, bridgeUrl);
-    } catch (err) {
-      console.error('[Popmelt] Failed to update token:', err);
-    }
-  }, [bridgeUrl]);
-
-  const handleSpacingTokenDelete = useCallback(async (tokenPath: string) => {
-    try {
-      await removeModelToken(tokenPath, bridgeUrl);
-    } catch (err) {
-      console.error('[Popmelt] Failed to delete token:', err);
-    }
-  }, [bridgeUrl]);
-
-  const handleSpacingTokenChange = useCallback((change: SpacingTokenChange) => {
+  // Undo-tracked spacing token modification: dispatches to reducer so Cmd+Z works
+  const handleModifySpacingToken = useCallback((mod: SpacingTokenMod, change: SpacingTokenChange) => {
+    dispatch({ type: 'MODIFY_SPACING_TOKEN', payload: mod });
     dispatch({ type: 'ADD_SPACING_TOKEN_CHANGE', payload: change });
   }, [dispatch]);
+
+  // Undo-tracked spacing token deletion
+  const handleDeleteSpacingToken = useCallback((tokenPath: string, originalValue: string) => {
+    dispatch({ type: 'DELETE_SPACING_TOKEN', payload: { tokenPath, originalValue } });
+  }, [dispatch]);
+
+  // Sync effect: when spacingTokenMods change (including via undo/redo), reconcile bridge + DOM
+  const [modelRefreshKey, setModelRefreshKey] = useState(0);
+  const prevTokenModsRef = useRef<SpacingTokenMod[]>([]);
+  useEffect(() => {
+    const prev = prevTokenModsRef.current;
+    const curr = state.spacingTokenMods;
+    prevTokenModsRef.current = curr;
+
+    // Build maps for diffing
+    const prevMap = new Map(prev.map(m => [m.tokenPath, m]));
+    const currMap = new Map(curr.map(m => [m.tokenPath, m]));
+
+    let needsRefresh = false;
+
+    // Handle mods that changed or appeared
+    for (const [path, mod] of currMap) {
+      const prevMod = prevMap.get(path);
+      if (prevMod && prevMod.currentValue === mod.currentValue) continue; // unchanged
+
+      needsRefresh = true;
+
+      if (mod.currentValue === '__deleted__') {
+        // Token was deleted (or redo'd to deleted state) — remove from bridge
+        removeModelToken(path, bridgeUrl).catch(err =>
+          console.error('[Popmelt] Failed to sync token delete:', err)
+        );
+      } else {
+        // Token was modified (or undo restored a value) — update on bridge
+        updateModelToken(path, mod.currentValue, bridgeUrl).catch(err =>
+          console.error('[Popmelt] Failed to sync token update:', err)
+        );
+      }
+
+      // Sync DOM inline styles for all targets
+      for (const target of mod.targets) {
+        const el = document.querySelector(target.selector) as HTMLElement | null;
+        if (!el) continue;
+        if (mod.currentValue === '__deleted__') {
+          // Revert to original
+          el.style.removeProperty(target.property);
+        } else {
+          const px = mod.currentPx;
+          if (px > 0) {
+            el.style.setProperty(target.property, `${px}px`, 'important');
+          }
+        }
+      }
+    }
+
+    // Handle mods that disappeared (undo removed them entirely → restore original)
+    for (const [path, prevMod] of prevMap) {
+      if (currMap.has(path)) continue; // still present
+      needsRefresh = true;
+
+      // Restore original value on bridge
+      updateModelToken(path, prevMod.originalValue, bridgeUrl).catch(err =>
+        console.error('[Popmelt] Failed to restore token on undo:', err)
+      );
+
+      // Revert DOM inline styles
+      for (const target of prevMod.targets) {
+        const el = document.querySelector(target.selector) as HTMLElement | null;
+        if (!el) continue;
+        el.style.removeProperty(target.property);
+      }
+    }
+
+    if (needsRefresh) {
+      setModelRefreshKey(k => k + 1);
+    }
+  }, [state.spacingTokenMods, bridgeUrl]);
 
   // Thread panel state (declared early so callbacks can reference setOpenThreadId)
   const [openThreadId, setOpenThreadId] = useState<string | null>(() => {
@@ -1106,10 +1169,10 @@ export function PopmeltProvider({
         modelCanvasHoveredComponent={modelCanvasHoveredComponent}
         onModelComponentHover={setModelPanelHoveredComponent}
         onSpacingTokenHover={setModelSpacingTokenHover}
-        onSpacingTokenUpdate={bridge.isConnected ? handleSpacingTokenUpdate : undefined}
-        onSpacingTokenChange={handleSpacingTokenChange}
+        onModifySpacingToken={bridge.isConnected ? handleModifySpacingToken : undefined}
+        onDeleteSpacingToken={bridge.isConnected ? handleDeleteSpacingToken : undefined}
+        modelRefreshKey={modelRefreshKey}
         onModelComponentAdded={handleModelComponentAdded}
-        onSpacingTokenDelete={bridge.isConnected ? handleSpacingTokenDelete : undefined}
         onModelComponentRemoved={handleModelComponentRemoved}
       />
 

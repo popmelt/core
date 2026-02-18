@@ -1,6 +1,6 @@
 import { domToCanvas } from 'modern-screenshot';
 
-import type { Annotation, ElementInfo, StyleModification } from '../tools/types';
+import type { Annotation, ElementInfo, SpacingTokenChange, StyleModification } from '../tools/types';
 
 /** Convert any CSS color (including OKLCH) to a #rrggbb hex string via canvas. */
 export function cssColorToHex(color: string): string {
@@ -34,6 +34,7 @@ export type FeedbackData = {
   annotations: AnnotationData[];
   styleModifications: StyleModification[];
   inspectedElement?: ElementInfo;
+  spacingTokenChanges?: SpacingTokenChange[];
 };
 
 // Build structured feedback data from annotations
@@ -41,6 +42,7 @@ export function buildFeedbackData(
   annotations: Annotation[],
   styleModifications: StyleModification[] = [],
   inspectedElement?: ElementInfo,
+  spacingTokenChanges?: SpacingTokenChange[],
 ): FeedbackData {
   // Group annotations by groupId to find linked text instructions
   const groupedAnnotations = new Map<string, Annotation[]>();
@@ -99,6 +101,7 @@ export function buildFeedbackData(
     annotations: annotationDataList,
     styleModifications,
     ...(inspectedElement ? { inspectedElement } : {}),
+    ...(spacingTokenChanges && spacingTokenChanges.length > 0 ? { spacingTokenChanges } : {}),
   };
 }
 

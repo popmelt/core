@@ -8,6 +8,8 @@ import type {
   AnnotationState,
   ElementInfo,
   InspectedElement,
+  SpacingTokenChange,
+  SpacingTokenMod,
   StyleModification,
   ToolType,
 } from '../tools/types';
@@ -26,6 +28,8 @@ const initialState: AnnotationState = {
   // Inspector state
   inspectedElement: null,
   styleModifications: [],
+  spacingTokenChanges: [],
+  spacingTokenMods: [],
 };
 
 function generateId(): string {
@@ -46,6 +50,7 @@ function pushToUndoStack(state: AnnotationState): AnnotationState {
     undoStack: [...state.undoStack, {
       annotations: state.annotations,
       styleModifications: state.styleModifications,
+      spacingTokenMods: state.spacingTokenMods,
     }],
     redoStack: [], // Clear redo stack on new action
   };
@@ -286,10 +291,12 @@ function handleUndo(state: AnnotationState): AnnotationState {
     ...state,
     annotations: previousEntry?.annotations || [],
     styleModifications: previousEntry?.styleModifications || [],
+    spacingTokenMods: previousEntry?.spacingTokenMods || [],
     undoStack: state.undoStack.slice(0, -1),
     redoStack: [...state.redoStack, {
       annotations: state.annotations,
       styleModifications: state.styleModifications,
+      spacingTokenMods: state.spacingTokenMods,
     }],
   };
 }
@@ -302,10 +309,12 @@ function handleRedo(state: AnnotationState): AnnotationState {
     ...state,
     annotations: nextEntry?.annotations || [],
     styleModifications: nextEntry?.styleModifications || [],
+    spacingTokenMods: nextEntry?.spacingTokenMods || [],
     redoStack: state.redoStack.slice(0, -1),
     undoStack: [...state.undoStack, {
       annotations: state.annotations,
       styleModifications: state.styleModifications,
+      spacingTokenMods: state.spacingTokenMods,
     }],
   };
 }
@@ -383,6 +392,7 @@ function handleMarkCaptured(state: AnnotationState): AnnotationState {
       status: (a.status === 'pending' || !a.status) ? 'in_flight' as AnnotationLifecycleStatus : a.status,
     })),
     styleModifications: state.styleModifications.map(m => ({ ...m, captured: true })),
+    spacingTokenChanges: state.spacingTokenChanges.map(c => ({ ...c, captured: true })),
   };
 }
 
@@ -395,6 +405,8 @@ function handleClear(state: AnnotationState): AnnotationState {
     currentPath: [],
     selectedAnnotationIds: [],
     lastSelectedId: null,
+    spacingTokenChanges: [],
+    spacingTokenMods: [],
   };
 }
 
@@ -680,6 +692,7 @@ function handleApplyResolutions(state: AnnotationState, payload: { resolutions: 
         ...a,
         status: resolution.status as AnnotationLifecycleStatus,
         resolutionSummary: resolution.summary,
+        scope: resolution.finalScope ?? resolution.inferredScope ?? null,
         replyCount: (a.replyCount ?? 0) + 1,
         question: undefined,
         threadId: a.threadId || payload.threadId,
@@ -799,6 +812,83 @@ function handleCleanupOrphaned(state: AnnotationState, payload: { linkedSelector
   };
 }
 
+function handleAddSpacingTokenChange(state: AnnotationState, payload: SpacingTokenChange): AnnotationState {
+  // Replace if same tokenPath already exists (user re-dragged the same token)
+  const existingIdx = state.spacingTokenChanges.findIndex(c => c.tokenPath === payload.tokenPath);
+  if (existingIdx >= 0) {
+    return {
+      ...state,
+      spacingTokenChanges: state.spacingTokenChanges.map((c, i) => i === existingIdx ? payload : c),
+    };
+  }
+  return {
+    ...state,
+    spacingTokenChanges: [...state.spacingTokenChanges, payload],
+  };
+}
+
+function handleRestoreSpacingTokenChanges(state: AnnotationState, payload: SpacingTokenChange[]): AnnotationState {
+  return {
+    ...state,
+    spacingTokenChanges: payload,
+  };
+}
+
+function handleModifySpacingToken(state: AnnotationState, payload: SpacingTokenMod): AnnotationState {
+  const stateWithUndo = pushToUndoStack(state);
+  // Upsert: replace existing mod for the same tokenPath, or append
+  const existingIdx = state.spacingTokenMods.findIndex(m => m.tokenPath === payload.tokenPath);
+  let newMods: SpacingTokenMod[];
+  if (existingIdx >= 0) {
+    // Keep the original originalValue from the first modification
+    const existing = state.spacingTokenMods[existingIdx]!;
+    const merged: SpacingTokenMod = {
+      ...payload,
+      originalValue: existing.originalValue,
+      originalPx: existing.originalPx,
+    };
+    newMods = state.spacingTokenMods.map((m, i) => i === existingIdx ? merged : m);
+  } else {
+    newMods = [...state.spacingTokenMods, payload];
+  }
+  return {
+    ...stateWithUndo,
+    spacingTokenMods: newMods,
+  };
+}
+
+function handleDeleteSpacingToken(state: AnnotationState, payload: { tokenPath: string; originalValue: string }): AnnotationState {
+  const stateWithUndo = pushToUndoStack(state);
+  // Check if there's an existing mod for this path (user dragged then deleted)
+  const existingIdx = state.spacingTokenMods.findIndex(m => m.tokenPath === payload.tokenPath);
+  const originalValue = existingIdx >= 0
+    ? state.spacingTokenMods[existingIdx]!.originalValue
+    : payload.originalValue;
+  const originalPx = existingIdx >= 0
+    ? state.spacingTokenMods[existingIdx]!.originalPx
+    : (parseFloat(payload.originalValue) || 0);
+
+  const deleteMod: SpacingTokenMod = {
+    tokenPath: payload.tokenPath,
+    originalValue,
+    currentValue: '__deleted__',
+    targets: existingIdx >= 0 ? state.spacingTokenMods[existingIdx]!.targets : [],
+    originalPx,
+    currentPx: 0,
+  };
+
+  let newMods: SpacingTokenMod[];
+  if (existingIdx >= 0) {
+    newMods = state.spacingTokenMods.map((m, i) => i === existingIdx ? deleteMod : m);
+  } else {
+    newMods = [...state.spacingTokenMods, deleteMod];
+  }
+  return {
+    ...stateWithUndo,
+    spacingTokenMods: newMods,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Handler map — maps action type strings to handler functions
 // ---------------------------------------------------------------------------
@@ -841,6 +931,10 @@ const handlers: Record<string, Handler> = {
   SET_ANNOTATION_QUESTION: handleSetAnnotationQuestion,
   APPLY_RESOLUTIONS: handleApplyResolutions,
   ADD_PLAN_ANNOTATION: handleAddPlanAnnotation,
+  ADD_SPACING_TOKEN_CHANGE: handleAddSpacingTokenChange,
+  RESTORE_SPACING_TOKEN_CHANGES: handleRestoreSpacingTokenChanges,
+  MODIFY_SPACING_TOKEN: handleModifySpacingToken,
+  DELETE_SPACING_TOKEN: handleDeleteSpacingToken,
 };
 
 // ---------------------------------------------------------------------------

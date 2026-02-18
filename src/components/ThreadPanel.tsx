@@ -17,7 +17,15 @@ type ThreadMessage = {
   question?: string;
   replyToQuestion?: string;
   toolsUsed?: string[];
-  resolutions?: { annotationId: string; status: string; summary: string; filesModified?: string[] }[];
+  resolutions?: {
+    annotationId: string;
+    status: string;
+    summary: string;
+    filesModified?: string[];
+    declaredScope?: { breadth: string; target: string } | null;
+    inferredScope?: { breadth: string; target: string } | null;
+    finalScope?: { breadth: string; target: string } | null;
+  }[];
 };
 
 type PlanAnnotation = {
@@ -60,6 +68,7 @@ const panelStyle: CSSProperties = {
   zIndex: 10000,
   display: 'flex',
   flexDirection: 'column',
+  overflow: 'hidden',
   fontFamily: FONT_FAMILY,
   fontSize: 12,
   color: '#1f2937',
@@ -70,6 +79,7 @@ const baseHeaderStyle: CSSProperties = {
   alignItems: 'center',
   justifyContent: 'space-between',
   padding: '4px 5px 4px 10px',
+  margin: '3px 3px 0',
   fontWeight: 600,
   fontSize: 12,
 };
@@ -284,10 +294,14 @@ export function ThreadPanel({
     }
   }, [messages, streamSegments.length, isStreaming]);
 
-  // Close on Escape
+  // Close on Escape — stopPropagation prevents the AnnotationCanvas handler
+  // (which listens on window) from also clearing the annotation selection.
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
     };
     document.addEventListener('keydown', handleEscape);
     return () => document.removeEventListener('keydown', handleEscape);
@@ -465,14 +479,29 @@ export function ThreadPanel({
                       ))}
                     </div>
                   )}
-                  {hasResolutions && msg.resolutions!.map((r, j) => (
-                    <div key={j} style={{ marginTop: hasToolsUsed ? 4 : 0 }}>
-                      <span style={{ color: r.status === 'resolved' ? '#10b981' : '#f59e0b' }}>
-                        {r.status === 'resolved' ? 'Done' : 'Needs review'}
-                      </span>
-                      {r.summary ? ` \u2014 ${r.summary}` : ''}
-                    </div>
-                  ))}
+                  {hasResolutions && msg.resolutions!.map((r, j) => {
+                    const scope = r.finalScope ?? r.inferredScope;
+                    const scopeLabel = scope ? `${scope.breadth} \u00b7 ${scope.target}` : null;
+                    return (
+                      <div key={j} style={{ marginTop: hasToolsUsed ? 4 : 0 }}>
+                        <span style={{ color: r.status === 'resolved' ? '#10b981' : '#f59e0b' }}>
+                          {r.status === 'resolved' ? 'Done' : 'Needs review'}
+                        </span>
+                        {scopeLabel && (
+                          <span style={{
+                            marginLeft: 6,
+                            padding: '1px 5px',
+                            backgroundColor: 'rgba(0, 0, 0, 0.06)',
+                            fontSize: 10,
+                            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                          }}>
+                            {scopeLabel}
+                          </span>
+                        )}
+                        {r.summary ? ` \u2014 ${r.summary}` : ''}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

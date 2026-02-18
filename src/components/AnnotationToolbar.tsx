@@ -59,9 +59,9 @@ type AnnotationToolbarProps = {
   modelCanvasHoveredComponent?: string | null;
   onModelComponentHover?: (info: ComponentHoverInfo) => void;
   onSpacingTokenHover?: (info: SpacingTokenHover) => void;
-  onSpacingTokenUpdate?: (path: string, value: string) => void;
-  onSpacingTokenChange?: (change: SpacingTokenChange) => void;
-  onSpacingTokenDelete?: (tokenPath: string) => void;
+  onModifySpacingToken?: (mod: import('../tools/types').SpacingTokenMod, change: SpacingTokenChange) => void;
+  onDeleteSpacingToken?: (tokenPath: string, originalValue: string) => void;
+  modelRefreshKey?: number;
   onModelComponentAdded?: () => void;
   onModelComponentRemoved?: (name: string) => void;
 };
@@ -353,9 +353,9 @@ export function AnnotationToolbar({
   modelCanvasHoveredComponent,
   onModelComponentHover,
   onSpacingTokenHover,
-  onSpacingTokenUpdate,
-  onSpacingTokenChange,
-  onSpacingTokenDelete,
+  onModifySpacingToken,
+  onDeleteSpacingToken,
+  modelRefreshKey,
   onModelComponentAdded,
   onModelComponentRemoved,
 }: AnnotationToolbarProps) {
@@ -1157,9 +1157,9 @@ export function AnnotationToolbar({
           hoveredComponent={modelCanvasHoveredComponent}
           onComponentHover={onModelComponentHover}
           onSpacingTokenHover={onSpacingTokenHover}
-          onSpacingTokenUpdate={onSpacingTokenUpdate}
-          onSpacingTokenChange={onSpacingTokenChange}
-          onSpacingTokenDelete={onSpacingTokenDelete}
+          onModifySpacingToken={onModifySpacingToken}
+          onDeleteSpacingToken={onDeleteSpacingToken}
+          modelRefreshKey={modelRefreshKey}
           onComponentAdded={onModelComponentAdded}
           onComponentRemoved={onModelComponentRemoved}
           onMouseEnter={() => {

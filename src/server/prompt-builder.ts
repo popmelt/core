@@ -1,5 +1,5 @@
 import type { AnnotationResolution } from '../tools/types';
-import type { FeedbackPayload, PlanTask, Provider, ThreadMessage } from './types';
+import type { FeedbackPayload, NovelPattern, PlanTask, Provider, ThreadMessage } from './types';
 
 /** Format feedback annotations and style modifications into prompt-ready text */
 export function formatFeedbackContext(feedback: FeedbackPayload, imagePaths?: Record<string, string[]>): string {
@@ -45,6 +45,24 @@ export function formatFeedbackContext(feedback: FeedbackPayload, imagePaths?: Re
     }
   }
 
+  if (feedback.spacingTokenChanges?.length) {
+    lines.push('');
+    lines.push('## Spacing Token Changes');
+    lines.push('The developer adjusted these spacing tokens. Apply each change to the source code:');
+    for (const change of feedback.spacingTokenChanges) {
+      lines.push(`\n### ${change.tokenName}: ${change.originalPx}px → ${change.newPx}px`);
+      for (const el of change.affectedElements) {
+        const comp = el.reactComponent ? ` (${el.reactComponent})` : '';
+        if (el.matchedClass && el.suggestedClass) {
+          lines.push(`- ${el.selector}${comp}: \`${el.matchedClass}\` → \`${el.suggestedClass}\``);
+        } else {
+          lines.push(`- ${el.selector}${comp}: ${el.property} ${change.originalPx}px → ${change.newPx}px`);
+        }
+        lines.push(`  class="${el.className}"`);
+      }
+    }
+  }
+
   if (feedback.inspectedElement) {
     const el = feedback.inspectedElement;
     lines.push('');
@@ -67,6 +85,7 @@ export function buildPrompt(
     threadHistory?: ThreadMessage[];
     provider?: Provider;
     imagePaths?: Record<string, string[]>;
+    designModel?: Record<string, unknown>;
   },
 ): string {
   const lines: string[] = [];
@@ -112,7 +131,9 @@ export function buildPrompt(
           }
           if (msg.resolutions && msg.resolutions.length > 0) {
             for (const r of msg.resolutions) {
-              lines.push(`- ${r.annotationId}: ${r.status} — ${r.summary}`);
+              const scope = r.finalScope ?? r.inferredScope;
+              const scopeLabel = scope ? ` [${scope.breadth} ${scope.target}]` : '';
+              lines.push(`- ${r.annotationId}: ${r.status}${scopeLabel} — ${r.summary}`);
               if (r.filesModified && r.filesModified.length > 0) {
                 lines.push(`  Files: ${r.filesModified.join(', ')}`);
               }
@@ -126,6 +147,55 @@ export function buildPrompt(
     }
     lines.push('');
     lines.push('The current round is shown in full below.');
+  }
+
+  // Design model enforcement
+  if (options?.designModel) {
+    lines.push('');
+    lines.push('## Established Design Policies');
+    lines.push('This project has an established design model (stored in .popmelt/model.json), extracted from the developer\'s previous design decisions. When making changes, follow these patterns unless the developer explicitly overrides them. When asked about design tokens, component patterns, or design decisions, reference this model as the authoritative source.');
+    const rules = options.designModel.rules;
+    if (Array.isArray(rules) && rules.length > 0) {
+      lines.push('');
+      lines.push('Rules:');
+      for (const rule of rules) {
+        if (typeof rule === 'string') lines.push(`- ${rule}`);
+      }
+    }
+    const tokens = options.designModel.tokens;
+    if (tokens && typeof tokens === 'object') {
+      lines.push('');
+      lines.push('Design tokens:');
+      lines.push('```json');
+      lines.push(JSON.stringify(tokens, null, 2));
+      lines.push('```');
+    }
+    const components = options.designModel.components;
+    if (components && typeof components === 'object') {
+      lines.push('');
+      lines.push('Component patterns:');
+      lines.push('```json');
+      lines.push(JSON.stringify(components, null, 2));
+      lines.push('```');
+    }
+    lines.push('');
+    lines.push('### Novel Pattern Detection');
+    lines.push('When you make a design decision that has no matching policy in the model above (e.g., styling a component type not yet in the model, choosing a color with no token, picking spacing with no rule), flag it:');
+    lines.push('<novel>');
+    lines.push('[{"category":"component","element":"button","decision":"Used 8px border-radius, 12px 24px padding","reason":"No button pattern in design model"}]');
+    lines.push('</novel>');
+    lines.push('- `category`: "token" (color, spacing, typography), "component" (UI component pattern), or "element" (specific element style)');
+    lines.push('- `element`: What you are styling or creating');
+    lines.push('- `decision`: What you decided to do (specific values)');
+    lines.push('- `reason`: Why this is novel (what is missing from the model)');
+    lines.push('Still do the work — just flag it so the developer can review and set policy.');
+  }
+
+  // Always mention the decision store — even without a model, Claude should know it exists
+  if (!options?.designModel) {
+    lines.push('');
+    lines.push('## Design Context');
+    lines.push('This project uses Popmelt for design governance. Design decisions are stored in .popmelt/decisions/ (JSON files). A materialized design model may exist at .popmelt/model.json. When the developer asks about design tokens, patterns, or past decisions, check these files first before searching source code.');
   }
 
   const feedbackContext = formatFeedbackContext(feedback, options?.imagePaths);
@@ -148,9 +218,19 @@ export function buildPrompt(
   lines.push('## Resolution');
   lines.push('After completing all work, output a resolution block listing what you did for each annotation:');
   lines.push('<resolution>');
-  lines.push('[{"annotationId":"<id>","status":"resolved","summary":"<what you did>","filesModified":["<file>"]}]');
+  lines.push('[{"annotationId":"<id>","status":"resolved","summary":"<what you did>","filesModified":["<file>"],"declaredScope":{"breadth":"...","target":"..."},"inferredScope":{"breadth":"...","target":"..."}}]');
   lines.push('</resolution>');
   lines.push('Use status "resolved" when the change is complete, or "needs_review" if you\'re unsure about the result.');
+  lines.push('');
+  lines.push('### Scope classification');
+  lines.push('Each resolution MUST include scope fields:');
+  lines.push('- `declaredScope`: What scope the user\'s instruction text implies. null if no signal.');
+  lines.push('- `inferredScope`: What scope the change actually has, based on what you modified.');
+  lines.push('Scope has two dimensions:');
+  lines.push('- `breadth`: "instance" (just this occurrence) or "pattern" (all similar occurrences)');
+  lines.push('- `target`: "element" (a specific DOM element), "component" (a React/UI component), or "token" (a design token — color, spacing, typography)');
+  lines.push('Note: "instance" + "token" is invalid — tokens are inherently patterns.');
+  lines.push('If you cannot confidently determine scope, set it to null.');
 
   // Question instruction
   lines.push('');
@@ -243,9 +323,20 @@ export function buildReplyPrompt(
   lines.push('## Resolution');
   lines.push('After completing all work, output a resolution block listing what you did for each annotation:');
   lines.push('<resolution>');
-  lines.push('[{"annotationId":"<id>","status":"resolved","summary":"<what you did>","filesModified":["<file>"]}]');
+  lines.push('[{"annotationId":"<id>","status":"resolved","summary":"<what you did>","filesModified":["<file>"],"declaredScope":{"breadth":"...","target":"..."},"inferredScope":{"breadth":"...","target":"..."}}]');
   lines.push('</resolution>');
   lines.push('Use status "resolved" when the change is complete, or "needs_review" if you\'re unsure about the result.');
+  lines.push('');
+  lines.push('### Scope classification');
+  lines.push('Each resolution MUST include scope fields:');
+  lines.push('- `declaredScope`: What scope the user\'s instruction text implies. null if no signal.');
+  lines.push('- `inferredScope`: What scope the change actually has, based on what you modified.');
+  lines.push('Scope has two dimensions:');
+  lines.push('- `breadth`: "instance" (just this occurrence) or "pattern" (all similar occurrences)');
+  lines.push('- `target`: "element" (a specific DOM element), "component" (a React/UI component), or "token" (a design token — color, spacing, typography)');
+  lines.push('Note: "instance" + "token" is invalid — tokens are inherently patterns.');
+  lines.push('If you cannot confidently determine scope, set it to null.');
+  lines.push('If the developer\'s reply corrects a prior scope classification (e.g., "this should apply everywhere" or "only fix this one"), set `finalScope` on your resolution to reflect their correction and apply the change at the corrected scope.');
 
   // Question instruction
   lines.push('');
@@ -257,14 +348,32 @@ export function buildReplyPrompt(
   return lines.join('\n');
 }
 
-function isValidResolution(r: unknown): r is AnnotationResolution {
+function isValidScope(s: unknown): boolean {
+  if (typeof s !== 'object' || s === null) return false;
+  const obj = s as Record<string, unknown>;
   return (
-    typeof r === 'object' &&
-    r !== null &&
-    typeof (r as Record<string, unknown>).annotationId === 'string' &&
-    ((r as Record<string, unknown>).status === 'resolved' || (r as Record<string, unknown>).status === 'needs_review') &&
-    typeof (r as Record<string, unknown>).summary === 'string'
+    (obj.breadth === 'instance' || obj.breadth === 'pattern') &&
+    (obj.target === 'element' || obj.target === 'component' || obj.target === 'token')
   );
+}
+
+function isValidResolution(r: unknown): r is AnnotationResolution {
+  if (
+    typeof r !== 'object' ||
+    r === null ||
+    typeof (r as Record<string, unknown>).annotationId !== 'string' ||
+    ((r as Record<string, unknown>).status !== 'resolved' && (r as Record<string, unknown>).status !== 'needs_review') ||
+    typeof (r as Record<string, unknown>).summary !== 'string'
+  ) {
+    return false;
+  }
+  const obj = r as Record<string, unknown>;
+  for (const field of ['declaredScope', 'inferredScope', 'finalScope']) {
+    if (obj[field] !== undefined && obj[field] !== null && !isValidScope(obj[field])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Parse the first resolution block from Claude's response text */
@@ -300,6 +409,29 @@ export function parseAllResolutions(responseText: string): AnnotationResolution[
   }
 
   return results;
+}
+
+/** Parse novel pattern flags from Claude's response text */
+export function parseNovelPatterns(responseText: string): NovelPattern[] {
+  const match = responseText.match(/<novel>\s*([\s\S]*?)\s*<\/novel>/);
+  if (!match?.[1]) return [];
+
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((p: unknown): p is NovelPattern => {
+      if (typeof p !== 'object' || p === null) return false;
+      const obj = p as Record<string, unknown>;
+      return (
+        (obj.category === 'token' || obj.category === 'component' || obj.category === 'element') &&
+        typeof obj.element === 'string' &&
+        typeof obj.decision === 'string' &&
+        typeof obj.reason === 'string'
+      );
+    });
+  } catch {
+    return [];
+  }
 }
 
 // ============================
@@ -506,9 +638,19 @@ export function buildPlanExecutorPrompt(
   lines.push('CRITICAL: After completing EACH task, immediately output a <resolution> block for that task.');
   lines.push('Do NOT wait until all tasks are done — output each resolution as soon as that task is finished.');
   lines.push('<resolution>');
-  lines.push('[{"annotationId":"<annotationId>","status":"resolved","summary":"<what you did>","filesModified":["<file>"]}]');
+  lines.push('[{"annotationId":"<annotationId>","status":"resolved","summary":"<what you did>","filesModified":["<file>"],"declaredScope":{"breadth":"...","target":"..."},"inferredScope":{"breadth":"...","target":"..."}}]');
   lines.push('</resolution>');
   lines.push('Use status "resolved" when the change is complete, or "needs_review" if you\'re unsure about the result.');
+  lines.push('');
+  lines.push('### Scope classification');
+  lines.push('Each resolution MUST include scope fields:');
+  lines.push('- `declaredScope`: What scope the task instruction implies. null if no signal.');
+  lines.push('- `inferredScope`: What scope the change actually has, based on what you modified.');
+  lines.push('Scope has two dimensions:');
+  lines.push('- `breadth`: "instance" (just this occurrence) or "pattern" (all similar occurrences)');
+  lines.push('- `target`: "element" (a specific DOM element), "component" (a React/UI component), or "token" (a design token — color, spacing, typography)');
+  lines.push('Note: "instance" + "token" is invalid — tokens are inherently patterns.');
+  lines.push('If you cannot confidently determine scope, set it to null.');
 
   return lines.join('\n');
 }

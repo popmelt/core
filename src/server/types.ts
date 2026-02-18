@@ -2,6 +2,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { AnnotationResolution } from '../tools/types';
 
+export type McpDetection = {
+  found: boolean;
+  name: string | null;
+  scope: 'user' | 'project' | 'mcp.json' | null;
+  disabled: boolean;
+};
+
 export type Provider = 'claude' | 'codex';
 
 export type PopmeltOptions = {
@@ -63,6 +70,20 @@ export type FeedbackPayload = {
     reactComponent?: string;
     context?: string;
   };
+  spacingTokenChanges?: {
+    tokenPath: string;
+    tokenName: string;
+    originalPx: number;
+    newPx: number;
+    affectedElements: {
+      selector: string;
+      reactComponent?: string;
+      className: string;
+      property: string;
+      matchedClass?: string;
+      suggestedClass?: string;
+    }[];
+  }[];
 };
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'error';
@@ -97,7 +118,17 @@ export type SSEEvent =
   | { type: 'plan_ready'; jobId: string; planId: string; tasks: PlanTask[]; threadId?: string }
   | { type: 'plan_review'; planId: string; verdict: 'pass' | 'fail'; summary: string; issues?: string[] }
   | { type: 'task_resolved'; jobId: string; planId: string; resolutions: AnnotationResolution[]; threadId?: string }
-  | { type: 'queue_drained' };
+  | { type: 'queue_drained' }
+  | { type: 'materialize_started'; decisionIds: string[] }
+  | { type: 'materialize_done'; decisionIds: string[]; success: boolean; error?: string }
+  | { type: 'novel_patterns'; jobId: string; patterns: NovelPattern[]; threadId?: string };
+
+export type NovelPattern = {
+  category: 'token' | 'component' | 'element';
+  element: string;
+  decision: string;
+  reason: string;
+};
 
 export type SSEClient = {
   id: string;
@@ -133,6 +164,44 @@ export type Thread = {
 
 export type ThreadStore = { version: 1; threads: Record<string, Thread> };
 
+// File edit types (used by claude-spawner and decision-store)
+export type FileEdit = {
+  tool: 'Edit' | 'Write';
+  file_path: string;
+  old_string?: string;  // Edit tool: text that was replaced
+  new_string?: string;  // Edit tool: replacement text
+  replace_all?: boolean;
+  content?: string;     // Write tool: full file content written
+};
+
+// Decision record — persisted for every completed job
+export type DecisionRecord = {
+  version: 1;
+  id: string;
+  createdAt: number;
+  completedAt: number;
+  durationMs: number;
+  url: string;
+  viewport: { width: number; height: number };
+  screenshotPath: string;
+  pastedImagePaths: string[];
+  annotations: FeedbackPayload['annotations'];
+  styleModifications: FeedbackPayload['styleModifications'];
+  inspectedElement?: FeedbackPayload['inspectedElement'];
+  provider: Provider | undefined;
+  model: string | undefined;
+  sessionId: string | undefined;
+  threadId: string | undefined;
+  planId?: string;
+  planTaskId?: string;
+  responseText: string;
+  resolutions: AnnotationResolution[];
+  question: string | undefined;
+  fileEdits: FileEdit[];
+  toolsUsed: string[] | undefined;
+  gitDiff: string | null;
+};
+
 // Planner types
 export type PlanTask = {
   id: string;
@@ -156,4 +225,18 @@ export type JobGroup = {
   pageUrl: string;
   viewport: { width: number; height: number };
   createdAt: number;
+};
+
+export type MaterializationIndex = {
+  version: 1;
+  materializedIds: string[];
+  lastRunAt: number | null;
+  lastRunDecisionIds: string[];
+  lastRunError: string | null;
+};
+
+export type MaterializationResult = {
+  processedIds: string[];
+  success: boolean;
+  error?: string;
 };

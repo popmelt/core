@@ -1,10 +1,17 @@
 export type AnnotationLifecycleStatus = 'pending' | 'in_flight' | 'resolved' | 'needs_review' | 'dismissed' | 'waiting_input';
 
+export type ScopeBreadth = 'instance' | 'pattern';
+export type ScopeTarget = 'element' | 'component' | 'token';
+export type Scope = { breadth: ScopeBreadth; target: ScopeTarget };
+
 export type AnnotationResolution = {
   annotationId: string;
   status: 'resolved' | 'needs_review';
   summary: string;
   filesModified?: string[];
+  declaredScope?: Scope | null;
+  inferredScope?: Scope | null;
+  finalScope?: Scope | null;
 };
 
 export type ManifestEntry = {
@@ -20,7 +27,7 @@ export type ManifestEntry = {
   alt?: string;
 };
 
-export type ToolType = 'freehand' | 'line' | 'rectangle' | 'circle' | 'text' | 'inspector' | 'hand';
+export type ToolType = 'freehand' | 'line' | 'rectangle' | 'circle' | 'text' | 'inspector' | 'hand' | 'model';
 
 export type Point = {
   x: number;
@@ -57,6 +64,25 @@ export type InspectedElement = {
   info: ElementInfo;
 };
 
+export type SpacingElementEvidence = {
+  selector: string;          // unique CSS selector
+  reactComponent?: string;   // "ContentLayout"
+  className: string;         // full className string
+  property: string;          // "gap", "padding-top", etc.
+  matchedClass?: string;     // "gap-6" (Tailwind class producing old value)
+  suggestedClass?: string;   // "gap-8" (Tailwind class for new value)
+};
+
+export type SpacingTokenChange = {
+  id: string;
+  tokenPath: string;         // "tokens.spacing.section-gap"
+  tokenName: string;         // "section-gap"
+  originalPx: number;
+  newPx: number;
+  captured?: boolean;
+  affectedElements: SpacingElementEvidence[];
+};
+
 export type Annotation = {
   id: string;
   type: ToolType;
@@ -71,6 +97,7 @@ export type Annotation = {
   status?: AnnotationLifecycleStatus; // Lifecycle state (default: 'pending')
   question?: string; // Pending question from Claude (when status === 'waiting_input')
   resolutionSummary?: string; // What Claude did (when status === 'resolved' or 'needs_review')
+  scope?: Scope | null; // Effective scope (finalScope ?? inferredScope)
   replyCount?: number; // Number of Claude responses for this annotation
   threadId?: string; // Thread this annotation belongs to
   elements?: ElementInfo[]; // DOM elements captured at creation time
@@ -82,10 +109,22 @@ export type Annotation = {
   planTaskId?: string;
 };
 
-// Undo stack entry stores both annotations and style modifications
+/** A token modification tracked for undo/redo. Stores enough to revert both
+ *  the model.json value and DOM inline style overrides. */
+export type SpacingTokenMod = {
+  tokenPath: string;            // "tokens.spacing.section-gap"
+  originalValue: string;        // Serialized original value (JSON string for enriched, or plain "8px")
+  currentValue: string;         // Serialized new value, or '__deleted__' sentinel
+  targets: Array<{ selector: string; property: string }>;  // For inline style sync
+  originalPx: number;
+  currentPx: number;            // 0 for deleted
+};
+
+// Undo stack entry stores annotations, style modifications, and spacing token modifications
 export type UndoEntry = {
   annotations: Annotation[];
   styleModifications: StyleModification[];
+  spacingTokenMods: SpacingTokenMod[];
 };
 
 export type AnnotationState = {
@@ -102,6 +141,8 @@ export type AnnotationState = {
   // Inspector state
   inspectedElement: InspectedElement | null;
   styleModifications: StyleModification[];
+  spacingTokenChanges: SpacingTokenChange[];
+  spacingTokenMods: SpacingTokenMod[];
 };
 
 // Bridge types (client-side)
@@ -172,6 +213,10 @@ export type AnnotationAction =
   | { type: 'SET_ANNOTATION_THREAD'; payload: { ids: string[]; threadId: string } }
   | { type: 'SET_ANNOTATION_QUESTION'; payload: { ids: string[]; question: string; threadId: string } }
   | { type: 'APPLY_RESOLUTIONS'; payload: { resolutions: AnnotationResolution[]; threadId?: string } }
+  | { type: 'ADD_SPACING_TOKEN_CHANGE'; payload: SpacingTokenChange }
+  | { type: 'RESTORE_SPACING_TOKEN_CHANGES'; payload: SpacingTokenChange[] }
+  | { type: 'MODIFY_SPACING_TOKEN'; payload: SpacingTokenMod }
+  | { type: 'DELETE_SPACING_TOKEN'; payload: { tokenPath: string; originalValue: string } }
   | { type: 'ADD_PLAN_ANNOTATION'; payload: {
       groupId: string;
       planId: string;

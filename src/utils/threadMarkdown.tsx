@@ -2,24 +2,55 @@ import type { ReactNode } from 'react';
 
 const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
 
+// Color swatch helpers
+const HEX_RE = /^#[0-9a-fA-F]{3,8}$/;
+const FN_COLOR_RE = /^(?:rgba?|hsla?|oklch)\([^)]+\)$/;
+const NAMED_COLORS = new Set([
+  'black', 'white', 'red', 'blue', 'green', 'yellow', 'orange', 'purple',
+  'pink', 'gray', 'grey', 'cyan', 'magenta', 'brown', 'navy', 'teal',
+  'maroon', 'olive', 'silver', 'aqua', 'fuchsia', 'lime',
+]);
+
+function isColor(s: string): boolean {
+  const t = s.trim();
+  return HEX_RE.test(t) || FN_COLOR_RE.test(t) || NAMED_COLORS.has(t.toLowerCase());
+}
+
+function swatch(color: string, key: number | string): ReactNode {
+  return (
+    <span key={key} style={{
+      display: 'inline-block',
+      width: 10,
+      height: 10,
+      backgroundColor: color,
+      border: '1px solid rgba(0,0,0,0.15)',
+      borderRadius: 2,
+      verticalAlign: 'middle',
+      marginRight: 3,
+    }} />
+  );
+}
+
 /** Parse inline markdown (bold, italic, code, links) into React nodes */
 export function parseInline(text: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   // Order matters — longer/greedier patterns first
-  const re = /(`[^`]+`)|(\*\*\*(.+?)\*\*\*)|(\*\*(.+?)\*\*)|(\*(.+?)\*)|(_([^_]+?)_)|(\[([^\]]+)\]\(([^)]+)\))/g;
+  const re = /(`[^`]+`)|(\*\*\*(.+?)\*\*\*)|(\*\*(.+?)\*\*)|(\*(.+?)\*)|(_([^_]+?)_)|(\[([^\]]+)\]\(([^)]+)\))|(#[0-9a-fA-F]{3,8})(?![0-9a-fA-F])|((?:rgba?|hsla?|oklch)\([^)]+\))/g;
   let last = 0;
   let match: RegExpExecArray | null;
 
   while ((match = re.exec(text)) !== null) {
     if (match.index > last) nodes.push(text.slice(last, match.index));
     if (match[1]) {
-      // inline code
+      // inline code — with color swatch if content is a color value
+      const codeText = match[1].slice(1, -1);
+      if (isColor(codeText)) nodes.push(swatch(codeText, `sw-${match.index}`));
       nodes.push(
         <code key={match.index} style={{
           fontFamily: MONO, fontSize: '0.9em',
           backgroundColor: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 2,
         }}>
-          {match[1].slice(1, -1)}
+          {codeText}
         </code>,
       );
     } else if (match[3] !== undefined) {
@@ -42,6 +73,14 @@ export function parseInline(text: string): ReactNode[] {
           {match[11]}
         </a>,
       );
+    } else if (match[13] !== undefined) {
+      // hex color
+      nodes.push(swatch(match[13], `sw-${match.index}`));
+      nodes.push(match[13]);
+    } else if (match[14] !== undefined) {
+      // functional color (rgb, hsl, oklch)
+      nodes.push(swatch(match[14], `sw-${match.index}`));
+      nodes.push(match[14]);
     }
     last = match.index + match[0].length;
   }
