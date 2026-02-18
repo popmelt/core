@@ -25,4 +25,15 @@ export default defineConfig([
     clean: false,
     tsconfig: 'tsconfig.build.json',
   },
+  {
+    entry: { cli: 'src/cli.ts' },
+    format: 'esm',
+    dts: false,
+    minify: true,
+    platform: 'node',
+    outDir: 'dist',
+    clean: false,
+    banner: { js: '#!/usr/bin/env node' },
+    tsconfig: 'tsconfig.build.json',
+  },
 ]);

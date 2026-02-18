@@ -1,6 +1,6 @@
 {
   "name": "@popmelt.com/core",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "The design collaboration layer for AI coding agents",
   "license": "PolyForm-Shield-1.0.0",
   "author": "Popmelt <hello@popmelt.com> (https://popmelt.com)",
@@ -20,6 +20,9 @@
     "react",
     "visual-feedback"
   ],
+  "bin": {
+    "popmelt": "./dist/cli.mjs"
+  },
   "sideEffects": false,
   "engines": {
     "node": ">=18.0.0"
