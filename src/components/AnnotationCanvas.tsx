@@ -1512,6 +1512,16 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           if (existingAnnotation.color) {
             dispatch({ type: 'SET_COLOR', payload: existingAnnotation.color });
           }
+          // Open thread panel if this annotation (or a group mate) has a thread
+          if (onViewThread) {
+            const threadId = existingAnnotation.threadId
+              || (existingAnnotation.groupId
+                ? state.annotations.find(a => a.groupId === existingAnnotation.groupId && a.threadId)?.threadId
+                : undefined);
+            if (threadId) {
+              onViewThread(threadId);
+            }
+          }
         } else if (!isShiftClick) {
           clearSelection();
         }
@@ -1551,7 +1561,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       setIsDrawing(true);
       dispatch({ type: 'START_PATH', payload: point });
     },
-    [state.isAnnotating, state.activeTool, state.inspectedElement, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, modelHoveredComponent, modelFocusedComponents, modelComponentNames, onModelComponentsAdd, onModelComponentFocus, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
+    [state.isAnnotating, state.activeTool, state.inspectedElement, state.annotations, activeText, selectedAnnotationIds, hoveredElement, handHoveredElement, handHoveredSide, radiusHoveredElement, radiusHoveredCorner, gapHoveredElement, gapHoveredAxis, gapIsAuto, textHoveredElement, textHoveredProperty, modelHoveredComponent, modelFocusedComponents, modelComponentNames, onModelComponentsAdd, onModelComponentFocus, onViewThread, getPoint, findAnnotationAtPoint, findHandleAtPoint, dispatch, selectAnnotation, clearSelection, commitActiveText]
   );
 
   const handlePointerMove = useCallback(
