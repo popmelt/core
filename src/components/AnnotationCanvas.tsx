@@ -89,6 +89,7 @@ const HANDLE_SIZE = 8;
 const PADDING_SNAP_STEPS = [0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32] as const;
 
 const BADGE_HEIGHT = 22; // Matches ElementHighlight tooltip height
+const BADGE_HIT_PAD = 12; // Invisible expanded hit area around badges
 const ACTIVE_TEXT_STORAGE_KEY = 'devtools-active-text';
 
 function calculateLinkedPosition(
@@ -832,9 +833,13 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     }
   }, [pendingLinkedText]);
 
-  // Focus input when active text changes
+  // Track cursor position so we can restore it after HMR remounts
+  const cursorPosRef = useRef<number | null>(null);
+
+  // Focus input when a text editing session starts (new ID) — NOT on every keystroke
+  const activeTextId = activeText?.id ?? null;
   useEffect(() => {
-    if (activeText && inputRef.current) {
+    if (activeTextId && inputRef.current) {
       // Delay focus to let the click event finish processing
       // Otherwise the textarea immediately loses focus
       requestAnimationFrame(() => {
@@ -844,27 +849,37 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         input.focus();
 
         // Only position cursor once per text editing session
-        if (lastPositionedTextId.current === activeText.id) return;
-        lastPositionedTextId.current = activeText.id;
+        if (lastPositionedTextId.current === activeTextId) return;
+        lastPositionedTextId.current = activeTextId;
+
+        const currentActiveText = activeTextRef.current;
+        if (!currentActiveText) return;
+
+        // Restore cursor position from ref (HMR recovery)
+        if (cursorPosRef.current !== null) {
+          const pos = Math.min(cursorPosRef.current, input.value.length);
+          input.setSelectionRange(pos, pos);
+          return;
+        }
 
         // If clicking on existing text, position cursor at click point
-        if (!activeText.isNew && activeText.clickPoint) {
+        if (!currentActiveText.isNew && currentActiveText.clickPoint) {
           const canvas = canvasRef.current;
           if (!canvas) return;
 
           const ctx = canvas.getContext('2d');
           if (!ctx) return;
 
-          ctx.font = `${activeText.fontSize}px ${FONT_FAMILY}`;
-          const lineHeightPx = activeText.fontSize * LINE_HEIGHT;
-          const lines = activeText.text.split('\n');
+          ctx.font = `${currentActiveText.fontSize}px ${FONT_FAMILY}`;
+          const lineHeightPx = currentActiveText.fontSize * LINE_HEIGHT;
+          const lines = currentActiveText.text.split('\n');
 
           // Find which line was clicked
-          const yOffset = activeText.clickPoint.y - activeText.point.y;
+          const yOffset = currentActiveText.clickPoint.y - currentActiveText.point.y;
           const lineIndex = Math.max(0, Math.min(lines.length - 1, Math.floor(yOffset / lineHeightPx)));
 
           // Find character position on that line
-          const xOffset = activeText.clickPoint.x - activeText.point.x;
+          const xOffset = currentActiveText.clickPoint.x - currentActiveText.point.x;
           const line = lines[lineIndex] || '';
           let charIndex = 0;
 
@@ -891,8 +906,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     } else {
       // Reset when exiting edit mode
       lastPositionedTextId.current = null;
+      cursorPosRef.current = null;
     }
-  }, [activeText, canvasRef]);
+  }, [activeTextId, canvasRef]);
 
   // Get point in document coordinates (accounts for scroll)
   const getPoint = useCallback((e: React.MouseEvent | React.TouchEvent): Point => {
@@ -2576,9 +2592,10 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
 
   const handleTextChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    if (!activeText) return;
-    setActiveText({ ...activeText, text: e.target.value });
-  }, [activeText]);
+    const newValue = e.target.value;
+    cursorPosRef.current = e.target.selectionStart;
+    setActiveText(prev => prev ? { ...prev, text: newValue } : prev);
+  }, []);
 
   const handleTextKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
@@ -3302,69 +3319,76 @@ function AnnotationBadges({
       {badges.map((pos) => (
         <div
           key={pos.id}
-          data-devtools="annotation-badge"
+          data-devtools="badge-hit-area"
           onClick={clickable && pos.threadId ? () => {
             onSelectAnnotation?.(pos.id);
             onViewThread!(pos.threadId!);
           } : undefined}
           style={{
             position: 'fixed',
-            left: pos.x - scrollX,
-            top: pos.y - scrollY,
-            height: pos.size,
-            display: 'flex',
-            alignItems: 'center',
+            left: pos.x - scrollX - BADGE_HIT_PAD,
+            top: pos.y - scrollY - BADGE_HIT_PAD,
+            padding: BADGE_HIT_PAD,
             pointerEvents: clickable ? 'auto' : 'none',
             cursor: clickable && pos.threadId ? 'pointer' : undefined,
             zIndex: 9999,
-            backgroundColor: pos.color,
-            fontFamily: FONT_FAMILY,
-            fontSize: 12,
-            color: '#ffffff',
-            userSelect: 'none',
-            padding: `0 ${PADDING}px`,
-            gap: 4,
-            whiteSpace: 'nowrap',
           }}
         >
-          {pos.isInFlight ? (
-            <>
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
-                {charIndex === 1 ? (
-                  <>
-                    <circle cx="7" cy="7" r="2" />
-                    <circle cx="17" cy="7" r="2" />
-                    <circle cx="7" cy="17" r="2" />
-                    <circle cx="17" cy="17" r="2" />
-                  </>
-                ) : (
-                  <>
-                    <circle cx="12" cy="6" r="2" />
-                    <circle cx="6" cy="12" r="2" />
-                    <circle cx="18" cy="12" r="2" />
-                    <circle cx="12" cy="18" r="2" />
-                  </>
-                )}
-              </svg>
-              <span style={{ opacity: 0.7 }}>{THINKING_WORDS[wordIndex]}</span>
-            </>
-          ) : (
-            <>
-              {pos.isNeedsReview ? (
-                <span style={{ fontWeight: 700 }}>?</span>
-              ) : (
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                  <line x1="12" y1="3" x2="12" y2="9" />
-                  <line x1="12" y1="15" x2="12" y2="21" />
-                  <line x1="3" y1="12" x2="9" y2="12" />
-                  <line x1="15" y1="12" x2="21" y2="12" />
+          <div
+            data-devtools="annotation-badge"
+            style={{
+              height: pos.size,
+              display: 'flex',
+              alignItems: 'center',
+              backgroundColor: pos.color,
+              fontFamily: FONT_FAMILY,
+              fontSize: 12,
+              color: '#ffffff',
+              userSelect: 'none',
+              padding: `0 ${PADDING}px`,
+              gap: 4,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {pos.isInFlight ? (
+              <>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
+                  {charIndex === 1 ? (
+                    <>
+                      <circle cx="7" cy="7" r="2" />
+                      <circle cx="17" cy="7" r="2" />
+                      <circle cx="7" cy="17" r="2" />
+                      <circle cx="17" cy="17" r="2" />
+                    </>
+                  ) : (
+                    <>
+                      <circle cx="12" cy="6" r="2" />
+                      <circle cx="6" cy="12" r="2" />
+                      <circle cx="18" cy="12" r="2" />
+                      <circle cx="12" cy="18" r="2" />
+                    </>
+                  )}
                 </svg>
-              )}
-              <span style={{ opacity: 0.7 }}>
-                {pos.replyCount} {pos.replyCount === 1 ? 'reply' : 'replies'}
-              </span>
-            </>
-          )}
+                <span style={{ opacity: 0.7 }}>{THINKING_WORDS[wordIndex]}</span>
+              </>
+            ) : (
+              <>
+                {pos.isNeedsReview ? (
+                  <span style={{ fontWeight: 700 }}>?</span>
+                ) : (
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <line x1="12" y1="3" x2="12" y2="9" />
+                    <line x1="12" y1="15" x2="12" y2="21" />
+                    <line x1="3" y1="12" x2="9" y2="12" />
+                    <line x1="15" y1="12" x2="21" y2="12" />
+                  </svg>
+                )}
+                <span style={{ opacity: 0.7 }}>
+                  {pos.replyCount} {pos.replyCount === 1 ? 'reply' : 'replies'}
+                </span>
+              </>
+            )}
+          </div>
         </div>
       ))}
     </>
@@ -3466,39 +3490,46 @@ function PlanWaitingBadges({
             />
           : <div
               key={`plan-waiting-${annotation.id}`}
-              data-devtools="plan-waiting-badge"
+              data-devtools="badge-hit-area"
               onClick={() => {
                 onSelectAnnotation?.(annotation.id);
                 onViewThread(planThreadId);
               }}
               style={{
                 position: 'fixed',
-                left: x - scrollX,
-                top: y - scrollY,
-                height: size,
-                display: 'flex',
-                alignItems: 'center',
+                left: x - scrollX - BADGE_HIT_PAD,
+                top: y - scrollY - BADGE_HIT_PAD,
+                padding: BADGE_HIT_PAD,
                 cursor: 'pointer',
-                backgroundColor: annotation.color,
-                fontFamily: FONT_FAMILY,
-                fontSize: 12,
-                color: '#ffffff',
-                userSelect: 'none',
-                padding: `0 ${PADDING}px`,
-                gap: 4,
-                whiteSpace: 'nowrap',
                 zIndex: 9999,
                 pointerEvents: 'auto',
               }}
             >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
-                <line x1="12" y1="17" x2="12.01" y2="17" />
-              </svg>
-              <span style={{ opacity: 0.7 }}>
-                {taskCount} task{taskCount !== 1 ? 's' : ''} — approve?
-              </span>
+              <div
+                data-devtools="plan-waiting-badge"
+                style={{
+                  height: size,
+                  display: 'flex',
+                  alignItems: 'center',
+                  backgroundColor: annotation.color,
+                  fontFamily: FONT_FAMILY,
+                  fontSize: 12,
+                  color: '#ffffff',
+                  userSelect: 'none',
+                  padding: `0 ${PADDING}px`,
+                  gap: 4,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
+                  <line x1="12" y1="17" x2="12.01" y2="17" />
+                </svg>
+                <span style={{ opacity: 0.7 }}>
+                  {taskCount} task{taskCount !== 1 ? 's' : ''} — approve?
+                </span>
+              </div>
             </div>
       ))}
     </>
@@ -3524,46 +3555,53 @@ function PlanningSpinner({ x, y, size, color, onClick }: { x: number; y: number;
 
   return (
     <div
-      data-devtools="plan-thinking-badge"
+      data-devtools="badge-hit-area"
       onClick={onClick}
       style={{
         position: 'fixed',
-        left: x,
-        top: y,
-        height: size,
-        display: 'flex',
-        alignItems: 'center',
+        left: x - BADGE_HIT_PAD,
+        top: y - BADGE_HIT_PAD,
+        padding: BADGE_HIT_PAD,
         pointerEvents: onClick ? 'auto' : 'none',
         cursor: onClick ? 'pointer' : undefined,
         zIndex: 9999,
-        backgroundColor: color,
-        fontFamily: FONT_FAMILY,
-        fontSize: 12,
-        color: '#ffffff',
-        userSelect: 'none',
-        padding: `0 ${PADDING}px`,
-        gap: 4,
-        whiteSpace: 'nowrap',
       }}
     >
-      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
-        {charIndex === 1 ? (
-          <>
-            <circle cx="7" cy="7" r="2" />
-            <circle cx="17" cy="7" r="2" />
-            <circle cx="7" cy="17" r="2" />
-            <circle cx="17" cy="17" r="2" />
-          </>
-        ) : (
-          <>
-            <circle cx="12" cy="6" r="2" />
-            <circle cx="6" cy="12" r="2" />
-            <circle cx="18" cy="12" r="2" />
-            <circle cx="12" cy="18" r="2" />
-          </>
-        )}
-      </svg>
-      <span style={{ opacity: 0.7 }}>{PLANNING_WORDS[wordIndex]}</span>
+      <div
+        data-devtools="plan-thinking-badge"
+        style={{
+          height: size,
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: color,
+          fontFamily: FONT_FAMILY,
+          fontSize: 12,
+          color: '#ffffff',
+          userSelect: 'none',
+          padding: `0 ${PADDING}px`,
+          gap: 4,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
+          {charIndex === 1 ? (
+            <>
+              <circle cx="7" cy="7" r="2" />
+              <circle cx="17" cy="7" r="2" />
+              <circle cx="7" cy="17" r="2" />
+              <circle cx="17" cy="17" r="2" />
+            </>
+          ) : (
+            <>
+              <circle cx="12" cy="6" r="2" />
+              <circle cx="6" cy="12" r="2" />
+              <circle cx="18" cy="12" r="2" />
+              <circle cx="12" cy="18" r="2" />
+            </>
+          )}
+        </svg>
+        <span style={{ opacity: 0.7 }}>{PLANNING_WORDS[wordIndex]}</span>
+      </div>
     </div>
   );
 }
@@ -3836,10 +3874,12 @@ function QuestionBadge({
       data-devtools="question-badge"
       style={{
         position: 'fixed',
-        left: x,
-        top: y,
+        left: expanded ? x : x - BADGE_HIT_PAD,
+        top: expanded ? y : y - BADGE_HIT_PAD,
+        padding: expanded ? 0 : BADGE_HIT_PAD,
         zIndex: expanded ? 10002 : 9999,
         pointerEvents: 'auto',
+        cursor: expanded ? undefined : 'pointer',
       }}
     >
       {/* Collapsed: crosshair icon + reply? label */}
@@ -3851,7 +3891,6 @@ function QuestionBadge({
             display: 'flex',
             alignItems: 'center',
             backgroundColor: annotation.color,
-            cursor: 'pointer',
             padding: `0 ${PADDING}px`,
             gap: 4,
             fontFamily: FONT_FAMILY,

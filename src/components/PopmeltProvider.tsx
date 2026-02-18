@@ -1094,6 +1094,24 @@ export function PopmeltProvider({
     }
   }, [state.activeTool]);
 
+  // Close thread panel when toolbar collapses; restore when it expands
+  const stashedThreadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!state.isAnnotating) {
+      // Toolbar collapsed — stash the open thread and close the panel
+      if (openThreadId) {
+        stashedThreadIdRef.current = openThreadId;
+        setOpenThreadId(null);
+      }
+    } else {
+      // Toolbar expanded — restore the stashed thread
+      if (stashedThreadIdRef.current) {
+        setOpenThreadId(stashedThreadIdRef.current);
+        stashedThreadIdRef.current = null;
+      }
+    }
+  }, [state.isAnnotating]);
+
   // Find the active jobId for the open thread (for per-job streaming data)
   // Only matches jobs belonging to this thread — no fallback to avoid cross-thread leaking
   const threadActiveJobId = useMemo(() => {

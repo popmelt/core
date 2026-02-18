@@ -42,6 +42,7 @@ function buildElementLabel(mod: StyleModification): string {
 }
 
 const TOOLTIP_HEIGHT = 22;
+const BADGE_HIT_PAD = 12;
 
 export function ModifiedElementBadges({
   styleModifications,
@@ -146,8 +147,6 @@ export function ModifiedElementBadges({
   if (badges.length === 0) return null;
 
   const tooltipStyle: CSSProperties = {
-    position: 'fixed',
-    zIndex: 10000, // Above canvas (9998) and toolbar (9999)
     display: 'flex',
     alignItems: 'center',
     gap: 6,
@@ -157,7 +156,6 @@ export function ModifiedElementBadges({
     fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
     padding: '4px 8px',
     borderRadius: 0,
-    cursor: 'pointer',
     whiteSpace: 'nowrap',
     maxWidth: 400,
   };
@@ -176,42 +174,53 @@ export function ModifiedElementBadges({
         return (
           <div
             key={badge.selector}
-            data-devtools="badge"
-            style={{
-              ...tooltipStyle,
-              top: badge.top,
-              left: badge.left,
-              backgroundColor: isInFlight ? '#999999' : accentColor,
-            }}
+            data-devtools="badge-hit-area"
             onClick={() => handleBadgeClick(badge.modIndex)}
+            style={{
+              position: 'fixed',
+              top: badge.top - BADGE_HIT_PAD,
+              left: badge.left - BADGE_HIT_PAD,
+              padding: BADGE_HIT_PAD,
+              zIndex: 10000,
+              cursor: 'pointer',
+              pointerEvents: 'auto',
+            }}
           >
-            <span>{badge.annotationNumber}.</span>
-            <span style={labelStyle}>{badge.label}</span>
-            <span style={{ opacity: 0.8 }}>
-              ({badge.changeCount} {badge.changeCount === 1 ? 'change' : 'changes'})
-            </span>
-            {isInFlight && (
-              <span style={{ opacity: 0.8, marginLeft: 4, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
-                  {charIndex === 1 ? (
-                    <>
-                      <circle cx="7" cy="7" r="2" />
-                      <circle cx="17" cy="7" r="2" />
-                      <circle cx="7" cy="17" r="2" />
-                      <circle cx="17" cy="17" r="2" />
-                    </>
-                  ) : (
-                    <>
-                      <circle cx="12" cy="6" r="2" />
-                      <circle cx="6" cy="12" r="2" />
-                      <circle cx="18" cy="12" r="2" />
-                      <circle cx="12" cy="18" r="2" />
-                    </>
-                  )}
-                </svg>
-                {thinkingWord}
+            <div
+              data-devtools="badge"
+              style={{
+                ...tooltipStyle,
+                backgroundColor: isInFlight ? '#999999' : accentColor,
+              }}
+            >
+              <span>{badge.annotationNumber}.</span>
+              <span style={labelStyle}>{badge.label}</span>
+              <span style={{ opacity: 0.8 }}>
+                ({badge.changeCount} {badge.changeCount === 1 ? 'change' : 'changes'})
               </span>
-            )}
+              {isInFlight && (
+                <span style={{ opacity: 0.8, marginLeft: 4, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
+                    {charIndex === 1 ? (
+                      <>
+                        <circle cx="7" cy="7" r="2" />
+                        <circle cx="17" cy="7" r="2" />
+                        <circle cx="7" cy="17" r="2" />
+                        <circle cx="17" cy="17" r="2" />
+                      </>
+                    ) : (
+                      <>
+                        <circle cx="12" cy="6" r="2" />
+                        <circle cx="6" cy="12" r="2" />
+                        <circle cx="18" cy="12" r="2" />
+                        <circle cx="12" cy="18" r="2" />
+                      </>
+                    )}
+                  </svg>
+                  {thinkingWord}
+                </span>
+              )}
+            </div>
           </div>
         );
       })}
