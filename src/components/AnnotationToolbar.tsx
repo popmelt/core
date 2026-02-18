@@ -1149,8 +1149,8 @@ export function AnnotationToolbar({
           pointerEvents: 'none',
         }}
       />
-      {/* Model panel (active tool or hover-triggered) */}
-      {(guidanceTool === 'model' || state.activeTool === 'model') && (
+      {/* Model panel (active tool or hover-triggered) — hidden when thread panel is open */}
+      {!isThreadPanelOpen && (guidanceTool === 'model' || state.activeTool === 'model') && (
         <LibraryPanel
           bridgeUrl={bridgeUrl}
           selectedComponent={modelSelectedComponent}

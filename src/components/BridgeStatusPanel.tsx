@@ -235,7 +235,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     }
   }, [clearSignal]);
 
-  // Add new jobs from inFlightJobs
+  // Add new jobs from inFlightJobs + fallback from bridge.activeJobIds after HMR remount
   useEffect(() => {
     setEntries((prev) => {
       const existingIds = new Set(prev.map((e) => e.jobId));
@@ -245,9 +245,16 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
           newEntries.push({ jobId, color: job.color, status: 'queued' });
         }
       }
+      // Safety net: if bridge reports active jobs not tracked by inFlightJobs
+      // (e.g. sessionStorage unavailable), create fallback entries
+      for (const jobId of bridge.activeJobIds) {
+        if (!existingIds.has(jobId) && !inFlightJobs[jobId]) {
+          newEntries.push({ jobId, color: '#888', status: 'working' });
+        }
+      }
       return newEntries.length !== prev.length ? newEntries : prev;
     });
-  }, [inFlightJobs]);
+  }, [inFlightJobs, bridge.activeJobIds]);
 
   // Update active job statuses (supports concurrent jobs)
   useEffect(() => {

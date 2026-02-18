@@ -338,7 +338,27 @@ export function PopmeltProvider({
   }, [activePlan]);
 
   // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors, color, threadId }
-  const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string; planId?: string }>>({});
+  // Persisted in sessionStorage so state survives HMR remounts (Astro/Vite tear down React islands).
+  const IN_FLIGHT_STORAGE_KEY = 'popmelt-in-flight-jobs';
+  const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string; planId?: string }>>(() => {
+    try {
+      const stored = sessionStorage.getItem(IN_FLIGHT_STORAGE_KEY);
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  // Sync inFlightJobs to sessionStorage
+  useEffect(() => {
+    try {
+      if (Object.keys(inFlightJobs).length > 0) {
+        sessionStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(inFlightJobs));
+      } else {
+        sessionStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
+      }
+    } catch {}
+  }, [inFlightJobs]);
 
   // Recovery: annotations hydrate from localStorage via PASTE_ANNOTATIONS (after mount).
   // Any annotation stuck in 'in_flight' with no matching active job is a ghost — reset it.
@@ -1066,6 +1086,13 @@ export function PopmeltProvider({
   const handleViewThread = useCallback((threadId: string) => {
     setOpenThreadId(threadId);
   }, []);
+
+  // Mutual exclusion: close thread panel when model/library panel opens
+  useEffect(() => {
+    if (state.activeTool === 'model' && openThreadId) {
+      setOpenThreadId(null);
+    }
+  }, [state.activeTool]);
 
   // Find the active jobId for the open thread (for per-job streaming data)
   // Only matches jobs belonging to this thread — no fallback to avoid cross-thread leaking
