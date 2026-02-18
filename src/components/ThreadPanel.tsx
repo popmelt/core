@@ -55,23 +55,42 @@ type ThreadPanelProps = {
   onDismissPlan?: () => void;
 };
 
-// Match the toolbar's 16px inset, leave room for the 48px toolbar + gap at bottom
-const panelStyle: CSSProperties = {
-  position: 'fixed',
-  top: 16,
-  right: 16,
-  bottom: 88, // 16px inset + 56px toolbar (48 + 4px border x2) + 16px gap
-  width: 400,
+const PANEL_WIDTH = 400;
+const EDGE_PAD = 16;
+const BORDER = 3; // POPMELT_BORDER borderWidth
+const TOOLBAR_GAP = 16;
+const THREAD_POS_KEY = 'devtools-thread-panel-position';
+
+/** Right-aligned with the toolbar (right: 16), top: 16 */
+function getDefaultPosition() {
+  return {
+    top: EDGE_PAD,
+    left: window.innerWidth - PANEL_WIDTH - 2 * BORDER - EDGE_PAD,
+  };
+}
+
+function getMaxHeight(top: number, left: number) {
+  const toolbar = document.getElementById('devtools-toolbar');
+  const toolbarRect = toolbar?.getBoundingClientRect();
+  let bottomLimit = window.innerHeight - EDGE_PAD;
+  if (toolbarRect && left + PANEL_WIDTH + 2 * BORDER > toolbarRect.left) {
+    bottomLimit = toolbarRect.top - TOOLBAR_GAP;
+  }
+  return Math.max(200, bottomLimit - Math.max(0, top));
+}
+
+const basePanelStyle: CSSProperties = {
+  width: PANEL_WIDTH,
   backgroundColor: '#ffffff',
   ...POPMELT_BORDER,
   boxSizing: 'content-box',
-  zIndex: 10000,
   display: 'flex',
   flexDirection: 'column',
   overflow: 'hidden',
   fontFamily: FONT_FAMILY,
   fontSize: 12,
   color: '#1f2937',
+  pointerEvents: 'auto',
 };
 
 const baseHeaderStyle: CSSProperties = {
@@ -258,7 +277,114 @@ export function ThreadPanel({
   const [replyImages, setReplyImages] = useState<Blob[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef(isStreaming);
+
+  // Draggable position — persisted to localStorage
+  const positionRef = useRef(getDefaultPosition());
+  const dragOffset = useRef({ x: 0, y: 0 });
+  const dragging = useRef(false);
+  const dragStart = useRef({ x: 0, y: 0, offsetX: 0, offsetY: 0 });
+  const hasSavedPosition = useRef(false);
+  const [, forceUpdate] = useState(0);
+
+  // On mount, restore saved position
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(THREAD_POS_KEY);
+      if (stored) {
+        const pos = JSON.parse(stored);
+        if (typeof pos.top === 'number' && typeof pos.left === 'number') {
+          hasSavedPosition.current = true;
+          positionRef.current = { top: pos.top, left: pos.left };
+          forceUpdate(n => n + 1);
+        }
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Recalculate on resize
+  useEffect(() => {
+    const onResize = () => {
+      if (!hasSavedPosition.current) {
+        positionRef.current = getDefaultPosition();
+      }
+      forceUpdate(n => n + 1);
+    };
+    window.addEventListener('resize', onResize, { passive: true });
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // All drag handling via native listeners — bypasses React event delegation
+  useEffect(() => {
+    const header = headerRef.current;
+    if (!header) return;
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragging.current = true;
+      dragStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        offsetX: dragOffset.current.x,
+        offsetY: dragOffset.current.y,
+      };
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!dragging.current) return;
+      const ds = dragStart.current;
+      const rawX = ds.offsetX + (e.clientX - ds.x);
+      const rawY = ds.offsetY + (e.clientY - ds.y);
+
+      const clampedLeft = Math.max(EDGE_PAD, Math.min(window.innerWidth - PANEL_WIDTH - 2 * BORDER - EDGE_PAD, positionRef.current.left + rawX));
+      const clampedTop = Math.max(EDGE_PAD, positionRef.current.top + rawY);
+
+      dragOffset.current = {
+        x: clampedLeft - positionRef.current.left,
+        y: clampedTop - positionRef.current.top,
+      };
+
+      const panel = panelRef.current;
+      if (!panel) return;
+      panel.style.top = `${clampedTop}px`;
+      panel.style.left = `${clampedLeft}px`;
+      panel.style.height = `${getMaxHeight(clampedTop, clampedLeft)}px`;
+    };
+
+    const onMouseUp = () => {
+      if (!dragging.current) return;
+      const finalTop = positionRef.current.top + dragOffset.current.y;
+      const finalLeft = positionRef.current.left + dragOffset.current.x;
+      positionRef.current = { top: finalTop, left: finalLeft };
+      dragOffset.current = { x: 0, y: 0 };
+      hasSavedPosition.current = true;
+      try { localStorage.setItem(THREAD_POS_KEY, JSON.stringify({ top: finalTop, left: finalLeft })); } catch { /* ignore */ }
+      dragging.current = false;
+    };
+
+    const onDoubleClick = () => {
+      positionRef.current = getDefaultPosition();
+      dragOffset.current = { x: 0, y: 0 };
+      hasSavedPosition.current = false;
+      try { localStorage.removeItem(THREAD_POS_KEY); } catch { /* ignore */ }
+      forceUpdate(n => n + 1);
+    };
+
+    header.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    header.addEventListener('dblclick', onDoubleClick);
+
+    return () => {
+      header.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      header.removeEventListener('dblclick', onDoubleClick);
+    };
+  }, []);
 
   // Fetch thread data
   const fetchThread = useCallback(() => {
@@ -348,25 +474,34 @@ export function ThreadPanel({
     }
   }, [handleSubmit]);
 
+  const currentTop = positionRef.current.top + dragOffset.current.y;
+  const currentLeft = positionRef.current.left + dragOffset.current.x;
+  const maxHeight = getMaxHeight(currentTop, currentLeft);
+
   return (
     <>
     {/* Invisible backdrop to catch clicks outside the panel */}
     <div
       data-devtools="thread-panel-backdrop"
-      onMouseDown={onClose}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
       style={{
         position: 'fixed',
         inset: 0,
-        zIndex: panelStyle.zIndex as number - 1,
+        zIndex: 9999,
       }}
     />
     <div
       ref={panelRef}
-      style={panelStyle}
+      style={{ ...basePanelStyle, height: maxHeight, position: 'fixed', top: currentTop, left: currentLeft, zIndex: 10000 }}
       data-devtools="thread-panel"
     >
-      {/* Header */}
-      <div style={{ ...baseHeaderStyle, backgroundColor: accentColor, color: '#ffffff' }}>
+      {/* Header — draggable via native listeners */}
+      <div
+        ref={headerRef}
+        style={{ ...baseHeaderStyle, backgroundColor: accentColor, color: '#ffffff', cursor: 'grab', userSelect: 'none', WebkitUserSelect: 'none' } as CSSProperties}
+      >
         <span>Conversation</span>
         <button
           onClick={onClose}

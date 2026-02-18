@@ -99,28 +99,51 @@ export function ElementHighlight({ element, isSelected = false, elementInfo, col
     : `${tagName}${id}${classes}`;
 
   const tooltipHeight = 22;
-  // Place above the element; if element is near the top of the viewport, place below instead
-  const tooltipTop = bounds.top >= tooltipHeight
-    ? bounds.top - tooltipHeight
-    : bounds.bottom;
-  const tooltipStyle: CSSProperties = {
-    position: 'fixed',
-    top: tooltipTop,
-    left: bounds.left,
-    zIndex: 9997,
-    display: 'flex',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: color,
-    color: '#fff',
-    fontSize: 11,
-    fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
-    padding: '4px 8px',
-    borderRadius: 0,
-    pointerEvents: 'none',
-    whiteSpace: 'nowrap',
-    maxWidth: 400,
-  };
+  // If the element fills the viewport (body, html, full-height wrappers),
+  // render the tooltip inside the overlay instead of outside it.
+  const isFullHeight = bounds.height >= window.innerHeight;
+  const tooltipTop = isFullHeight
+    ? 0 // rendered inside the overlay via absolute positioning
+    : bounds.top >= tooltipHeight
+      ? bounds.top - tooltipHeight
+      : bounds.bottom;
+  const tooltipStyle: CSSProperties = isFullHeight
+    ? {
+        position: 'absolute' as const,
+        top: 8,
+        left: 8,
+        zIndex: 9997,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        backgroundColor: color,
+        color: '#fff',
+        fontSize: 11,
+        fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
+        padding: '4px 8px',
+        borderRadius: 0,
+        pointerEvents: 'none',
+        whiteSpace: 'nowrap',
+        maxWidth: 400,
+      }
+    : {
+        position: 'fixed' as const,
+        top: tooltipTop,
+        left: bounds.left,
+        zIndex: 9997,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        backgroundColor: color,
+        color: '#fff',
+        fontSize: 11,
+        fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
+        padding: '4px 8px',
+        borderRadius: 0,
+        pointerEvents: 'none',
+        whiteSpace: 'nowrap',
+        maxWidth: 400,
+      };
 
   const labelStyle: CSSProperties = {
     overflow: 'hidden',
@@ -128,6 +151,18 @@ export function ElementHighlight({ element, isSelected = false, elementInfo, col
     flex: 1,
     minWidth: 0,
   };
+
+  const tooltipJsx = !hideTooltip && (
+    <div data-devtools="tooltip" style={tooltipStyle}>
+      {annotationNumber !== undefined && (
+        <span>{annotationNumber}.</span>
+      )}
+      <span style={labelStyle}>{elementLabel}</span>
+      {changeCount !== undefined && changeCount > 0 && (
+        <span style={{ opacity: 0.8 }}>({changeCount} {changeCount === 1 ? 'change' : 'changes'})</span>
+      )}
+    </div>
+  );
 
   return (
     <>
@@ -148,18 +183,9 @@ export function ElementHighlight({ element, isSelected = false, elementInfo, col
         <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
         <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
         <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
+        {isFullHeight && tooltipJsx}
       </div>
-      {!hideTooltip && (
-        <div data-devtools="tooltip" style={tooltipStyle}>
-          {annotationNumber !== undefined && (
-            <span>{annotationNumber}.</span>
-          )}
-          <span style={labelStyle}>{elementLabel}</span>
-          {changeCount !== undefined && changeCount > 0 && (
-            <span style={{ opacity: 0.8 }}>({changeCount} {changeCount === 1 ? 'change' : 'changes'})</span>
-          )}
-        </div>
-      )}
+      {!isFullHeight && tooltipJsx}
     </>
   );
 }

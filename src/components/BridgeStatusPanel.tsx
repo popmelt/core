@@ -10,6 +10,7 @@ type InFlightJob = {
   annotationIds: string[];
   styleSelectors: string[];
   color: string;
+  threadId?: string;
 };
 
 type BridgeEventStackProps = {
@@ -20,6 +21,7 @@ type BridgeEventStackProps = {
   onHover: (hovering: boolean) => void;
   clearSignal: number;
   onReply?: (threadId: string, reply: string) => void;
+  onViewThread?: (threadId: string) => void;
 };
 
 type StreamEntry = {
@@ -27,6 +29,7 @@ type StreamEntry = {
   color: string;
   status: 'working' | 'queued' | 'done' | 'error';
   doneLabel?: string;
+  threadId?: string;
 };
 
 const stackContainerStyle: CSSProperties = {
@@ -225,7 +228,7 @@ function SwipeDismiss({ onDismiss, children }: { onDismiss: () => void; children
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
 
   // Clear on signal
@@ -242,7 +245,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       const newEntries = [...prev];
       for (const [jobId, job] of Object.entries(inFlightJobs)) {
         if (!existingIds.has(jobId)) {
-          newEntries.push({ jobId, color: job.color, status: 'queued' });
+          newEntries.push({ jobId, color: job.color, status: 'queued', threadId: job.threadId });
         }
       }
       // Safety net: if bridge reports active jobs not tracked by inFlightJobs
@@ -312,7 +315,10 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
 
         return (
           <SwipeDismiss key={entry.jobId} onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
-            <div style={rowStyle}>
+            <div
+              style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
+              onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
+            >
               {entry.status === 'working' && <DotSpinner color={entry.color} />}
               {entry.status === 'queued' && <ColorSquare color={entry.color} />}
               {entry.status === 'done' && <Checkmark color={entry.color} />}

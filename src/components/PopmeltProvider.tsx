@@ -1250,6 +1250,7 @@ export function PopmeltProvider({
           onHover={handleEventStreamHover}
           clearSignal={clearSignal}
           onReply={handleReply}
+          onViewThread={handleViewThread}
         />
       )}
     </PopmeltContext.Provider>

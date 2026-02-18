@@ -1,7 +1,7 @@
 'use client';
 
 import type { CSSProperties } from 'react';
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 
 import { useSpinner } from '../hooks/useSpinner';
 import type { AnnotationAction, StyleModification } from '../tools/types';
@@ -43,6 +43,27 @@ function buildElementLabel(mod: StyleModification): string {
 
 const TOOLTIP_HEIGHT = 22;
 const BADGE_HIT_PAD = 12;
+
+/** Fixed-position badge wrapper that stays within the viewport via CSS clamping. */
+function BadgeHitArea({ left, top, style, children, ...props }: {
+  left: number;
+  top: number;
+  style?: CSSProperties;
+  children: React.ReactNode;
+} & Omit<React.HTMLAttributes<HTMLDivElement>, 'style'>) {
+  return (
+    <div data-devtools="badge-hit-area" {...props} style={{
+      position: 'fixed',
+      left: `max(0px, ${left}px)`,
+      top: `max(0px, ${top}px)`,
+      padding: BADGE_HIT_PAD,
+      transform: `translate(min(0px, calc(100vw - max(0px, ${left}px) - 100%)), min(0px, calc(100vh - max(0px, ${top}px) - 100%)))`,
+      ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
 
 export function ModifiedElementBadges({
   styleModifications,
@@ -172,15 +193,12 @@ export function ModifiedElementBadges({
       {badges.map((badge) => {
         const isInFlight = inFlightSelectors?.has(badge.selector);
         return (
-          <div
+          <BadgeHitArea
             key={badge.selector}
-            data-devtools="badge-hit-area"
+            left={badge.left - BADGE_HIT_PAD}
+            top={badge.top - BADGE_HIT_PAD}
             onClick={() => handleBadgeClick(badge.modIndex)}
             style={{
-              position: 'fixed',
-              top: badge.top - BADGE_HIT_PAD,
-              left: badge.left - BADGE_HIT_PAD,
-              padding: BADGE_HIT_PAD,
               zIndex: 10000,
               cursor: 'pointer',
               pointerEvents: 'auto',
@@ -221,7 +239,7 @@ export function ModifiedElementBadges({
                 </span>
               )}
             </div>
-          </div>
+          </BadgeHitArea>
         );
       })}
     </>

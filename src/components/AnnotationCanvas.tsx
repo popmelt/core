@@ -90,6 +90,32 @@ const PADDING_SNAP_STEPS = [0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32] as const;
 
 const BADGE_HEIGHT = 22; // Matches ElementHighlight tooltip height
 const BADGE_HIT_PAD = 12; // Invisible expanded hit area around badges
+
+/**
+ * Fixed-position badge wrapper that stays within the viewport via CSS clamping.
+ * left/top are clamped to ≥0, and translate() pulls the badge back if it
+ * overflows the right or bottom edge. 100% inside translate refers to the
+ * element's own rendered size, so no JS measurement is needed.
+ */
+function BadgeHitArea({ left, top, style, children, ...props }: {
+  left: number;
+  top: number;
+  style?: CSSProperties;
+  children: React.ReactNode;
+} & Omit<React.HTMLAttributes<HTMLDivElement>, 'style'>) {
+  return (
+    <div data-devtools="badge-hit-area" {...props} style={{
+      position: 'fixed',
+      left: `max(0px, ${left}px)`,
+      top: `max(0px, ${top}px)`,
+      padding: BADGE_HIT_PAD,
+      transform: `translate(min(0px, calc(100vw - max(0px, ${left}px) - 100%)), min(0px, calc(100vh - max(0px, ${top}px) - 100%)))`,
+      ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
 const ACTIVE_TEXT_STORAGE_KEY = 'devtools-active-text';
 
 function calculateLinkedPosition(
@@ -108,6 +134,28 @@ function calculateLinkedPosition(
 
 export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, activePlan, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
+
+  // Right-click passthrough (two-step): for non-hand tools, the first right-click
+  // suppresses the native menu and drops pointer-events on the canvas. The user's
+  // follow-up right-click then lands on the underlying element with the real native
+  // context menu (so "Inspect Element" targets the correct node). Pointer-events
+  // restore on any left-click or after a 4s timeout.
+  const inspectPassthroughRef = useRef(false);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const restore = () => {
+      if (!inspectPassthroughRef.current) return;
+      inspectPassthroughRef.current = false;
+      canvas.style.pointerEvents = '';
+    };
+    const onLeftClick = (e: MouseEvent) => {
+      if (e.button === 0 && inspectPassthroughRef.current) restore();
+    };
+    window.addEventListener('mousedown', onLeftClick);
+    return () => window.removeEventListener('mousedown', onLeftClick);
+  }, [canvasRef]);
+
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeText, setActiveText] = useState<ActiveTextInput | null>(() => {
     if (typeof window === 'undefined') return null;
@@ -704,6 +752,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       // Only handle delete if shapes are selected and not editing text
       const currentSelectedIds = selectedIdsRef.current;
       if (currentSelectedIds.length === 0 || activeTextRef.current) return;
+      // Don't delete annotations while typing in an input/textarea (e.g. thread panel)
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return;
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
@@ -2630,19 +2681,41 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   }, [activeText]);
 
   // Hand tool right-click: open style panel
+  // Other tools: pass right-click through to the underlying page element so browser "Inspect" works
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
-    if (state.activeTool !== 'hand' || !state.isAnnotating) return;
-    e.preventDefault();
-    const target = handHoveredElement || gapHoveredElement || radiusHoveredElement || textHoveredElement;
-    if (target && !isElementInFlight(target)) {
-      const info = extractElementInfo(target);
-      const selector = getUniqueSelector(target);
-      dispatch({
-        type: 'SELECT_ELEMENT',
-        payload: { el: target, info: { ...info, selector } },
-      });
+    if (!state.isAnnotating) return;
+
+    // Hand tool: right-click opens the style panel
+    if (state.activeTool === 'hand') {
+      e.preventDefault();
+      const target = handHoveredElement || gapHoveredElement || radiusHoveredElement || textHoveredElement;
+      if (target && !isElementInFlight(target)) {
+        const info = extractElementInfo(target);
+        const selector = getUniqueSelector(target);
+        dispatch({
+          type: 'SELECT_ELEMENT',
+          payload: { el: target, info: { ...info, selector } },
+        });
+      }
+      return;
     }
-  }, [state.activeTool, state.isAnnotating, handHoveredElement, gapHoveredElement, radiusHoveredElement, textHoveredElement, dispatch, isElementInFlight]);
+
+    // All other tools: suppress this menu and drop canvas pointer-events so the
+    // user's next right-click lands on the underlying element with the real native menu.
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (canvas) {
+      inspectPassthroughRef.current = true;
+      canvas.style.pointerEvents = 'none';
+      // Auto-restore after 4s if user doesn't click
+      setTimeout(() => {
+        if (inspectPassthroughRef.current) {
+          inspectPassthroughRef.current = false;
+          canvas.style.pointerEvents = '';
+        }
+      }, 4000);
+    }
+  }, [state.activeTool, state.isAnnotating, handHoveredElement, gapHoveredElement, radiusHoveredElement, textHoveredElement, dispatch, isElementInFlight, canvasRef]);
 
   // Position tracking: linked annotations follow their elements
   useEffect(() => {
@@ -3317,18 +3390,15 @@ function AnnotationBadges({
   return (
     <>
       {badges.map((pos) => (
-        <div
+        <BadgeHitArea
           key={pos.id}
-          data-devtools="badge-hit-area"
+          left={pos.x - scrollX - BADGE_HIT_PAD}
+          top={pos.y - scrollY - BADGE_HIT_PAD}
           onClick={clickable && pos.threadId ? () => {
             onSelectAnnotation?.(pos.id);
             onViewThread!(pos.threadId!);
           } : undefined}
           style={{
-            position: 'fixed',
-            left: pos.x - scrollX - BADGE_HIT_PAD,
-            top: pos.y - scrollY - BADGE_HIT_PAD,
-            padding: BADGE_HIT_PAD,
             pointerEvents: clickable ? 'auto' : 'none',
             cursor: clickable && pos.threadId ? 'pointer' : undefined,
             zIndex: 9999,
@@ -3389,7 +3459,7 @@ function AnnotationBadges({
               </>
             )}
           </div>
-        </div>
+        </BadgeHitArea>
       ))}
     </>
   );
@@ -3488,18 +3558,15 @@ function PlanWaitingBadges({
                 onViewThread(planThreadId);
               }}
             />
-          : <div
+          : <BadgeHitArea
               key={`plan-waiting-${annotation.id}`}
-              data-devtools="badge-hit-area"
+              left={x - scrollX - BADGE_HIT_PAD}
+              top={y - scrollY - BADGE_HIT_PAD}
               onClick={() => {
                 onSelectAnnotation?.(annotation.id);
                 onViewThread(planThreadId);
               }}
               style={{
-                position: 'fixed',
-                left: x - scrollX - BADGE_HIT_PAD,
-                top: y - scrollY - BADGE_HIT_PAD,
-                padding: BADGE_HIT_PAD,
                 cursor: 'pointer',
                 zIndex: 9999,
                 pointerEvents: 'auto',
@@ -3530,7 +3597,7 @@ function PlanWaitingBadges({
                   {taskCount} task{taskCount !== 1 ? 's' : ''} — approve?
                 </span>
               </div>
-            </div>
+            </BadgeHitArea>
       ))}
     </>
   );
@@ -3554,14 +3621,11 @@ function PlanningSpinner({ x, y, size, color, onClick }: { x: number; y: number;
   }, []);
 
   return (
-    <div
-      data-devtools="badge-hit-area"
+    <BadgeHitArea
+      left={x - BADGE_HIT_PAD}
+      top={y - BADGE_HIT_PAD}
       onClick={onClick}
       style={{
-        position: 'fixed',
-        left: x - BADGE_HIT_PAD,
-        top: y - BADGE_HIT_PAD,
-        padding: BADGE_HIT_PAD,
         pointerEvents: onClick ? 'auto' : 'none',
         cursor: onClick ? 'pointer' : undefined,
         zIndex: 9999,
@@ -3602,7 +3666,7 @@ function PlanningSpinner({ x, y, size, color, onClick }: { x: number; y: number;
         </svg>
         <span style={{ opacity: 0.7 }}>{PLANNING_WORDS[wordIndex]}</span>
       </div>
-    </div>
+    </BadgeHitArea>
   );
 }
 
@@ -3868,15 +3932,19 @@ function QuestionBadge({
     }
   }, [handleSubmit]);
 
+  const badgeLeft = expanded ? x : x - BADGE_HIT_PAD;
+  const badgeTop = expanded ? y : y - BADGE_HIT_PAD;
+
   return (
     <div
       ref={panelRef}
       data-devtools="question-badge"
       style={{
         position: 'fixed',
-        left: expanded ? x : x - BADGE_HIT_PAD,
-        top: expanded ? y : y - BADGE_HIT_PAD,
+        left: `max(0px, ${badgeLeft}px)`,
+        top: `max(0px, ${badgeTop}px)`,
         padding: expanded ? 0 : BADGE_HIT_PAD,
+        transform: `translate(min(0px, calc(100vw - max(0px, ${badgeLeft}px) - 100%)), min(0px, calc(100vh - max(0px, ${badgeTop}px) - 100%)))`,
         zIndex: expanded ? 10002 : 9999,
         pointerEvents: 'auto',
         cursor: expanded ? undefined : 'pointer',
