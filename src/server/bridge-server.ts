@@ -125,6 +125,7 @@ export async function createPopmelt(
   queue.setProcessor(async (job: Job) => {
     // Use pre-built reply prompt if available (from POST /reply)
     const replyPrompt = (job as Job & { _replyPrompt?: string })._replyPrompt;
+    const replyImagePaths = (job as Job & { _replyImagePaths?: string[] })._replyImagePaths;
     const provider = job.provider ?? defaultProvider;
 
     // Look up the last session ID from the thread for resume mode
@@ -149,8 +150,14 @@ export async function createPopmelt(
       const lastReply = (await threadStore.getThread(job.threadId!))
         ?.messages.filter(m => m.role === 'human').pop();
       const replyText = lastReply?.replyToQuestion || lastReply?.feedbackSummary || '';
-      prompt = replyText
-        + '\n\nAfter completing work, output a <resolution> block with declaredScope and inferredScope. If the developer corrected scope, set finalScope. If unclear, output a <question> block.';
+      prompt = replyText;
+      if (replyImagePaths && replyImagePaths.length > 0) {
+        prompt += '\n\nThe developer attached reference images with their reply:';
+        for (const imgPath of replyImagePaths) {
+          prompt += `\nAttached image: use the Read tool to view the image at: ${imgPath}`;
+        }
+      }
+      prompt += '\n\nAfter completing work, output a <resolution> block with declaredScope and inferredScope. If the developer corrected scope, set finalScope. If unclear, output a <question> block.';
     } else if (resumeSessionId) {
       // Resuming with new annotations: send the new feedback context
       prompt = formatFeedbackContext(job.feedback, job.imagePaths)
@@ -685,7 +692,10 @@ export async function createPopmelt(
     };
 
     // Override the job processor prompt for this job by storing it
-    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
+    (job as Job & { _replyPrompt?: string; _replyImagePaths?: string[] })._replyPrompt = prompt;
+    if (replyImagePaths.length > 0) {
+      (job as Job & { _replyImagePaths?: string[] })._replyImagePaths = replyImagePaths;
+    }
 
     const position = queue.enqueue(job);
     sendJson(res, 200, { jobId, position, threadId });
