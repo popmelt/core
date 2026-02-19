@@ -42,8 +42,6 @@ type ThreadPanelProps = {
   bridgeUrl: string;
   accentColor: string;
   isStreaming?: boolean;
-  streamingResponse?: string;
-  streamingThinking?: string;
   streamingEvents?: BridgeEvent[];
   onClose: () => void;
   onReply?: (threadId: string, reply: string, images?: Blob[]) => void;
@@ -217,6 +215,24 @@ function formatToolEvent(event: BridgeEvent): string | null {
   }
 }
 
+const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+const MUTATING_TOOLS = new Set(['Edit', 'Write', 'Bash']);
+
+/** Derive a phase label from the tool stream — null until there's a clear signal */
+function getStreamPhase(events: BridgeEvent[]): string | null {
+  let readOnlyCount = 0;
+  let hasMutation = false;
+  for (const e of events) {
+    if (e.type !== 'tool_use') continue;
+    const tool = String(e.data.tool || '');
+    if (MUTATING_TOOLS.has(tool)) hasMutation = true;
+    else if (READ_ONLY_TOOLS.has(tool)) readOnlyCount++;
+  }
+  if (!hasMutation && readOnlyCount >= 3) return 'researching';
+  if (hasMutation) return 'applying changes';
+  return null;
+}
+
 type StreamSegment =
   | { kind: 'tool'; label: string }
   | { kind: 'text'; text: string }
@@ -259,8 +275,6 @@ export function ThreadPanel({
   bridgeUrl,
   accentColor,
   isStreaming,
-  streamingResponse,
-  streamingThinking,
   streamingEvents,
   onClose,
   onReply,
@@ -412,6 +426,7 @@ export function ThreadPanel({
 
   // Build a unified chronological timeline interleaving tool events and text
   const streamSegments = streamingEvents ? buildStreamSegments(streamingEvents) : [];
+  const streamPhase = streamingEvents ? getStreamPhase(streamingEvents) : null;
 
   // Auto-scroll to bottom on new content
   useEffect(() => {
@@ -743,6 +758,11 @@ export function ThreadPanel({
               <span style={{ fontWeight: 600, fontSize: 11, color: '#6b7280' }}>
                 Claude Code
               </span>
+              {streamPhase && (
+                <span style={{ fontSize: 10, color: '#b0b7c3', fontStyle: 'italic' }}>
+                  {streamPhase}
+                </span>
+              )}
               <span style={{ marginLeft: 'auto' }}>
                 <ThinkingBadge color={accentColor} />
               </span>

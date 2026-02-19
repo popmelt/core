@@ -68,7 +68,7 @@ export async function createPopmelt(
   const port = options.port ?? DEFAULT_PORT;
   const projectRoot = options.projectRoot ?? process.cwd();
   const tempDir = options.tempDir ?? join(tmpdir(), 'popmelt-bridge');
-  const maxTurns = options.maxTurns ?? 10;
+  const maxTurns = options.maxTurns ?? 40;
   const maxBudgetUsd = options.maxBudgetUsd ?? 1.0;
   const allowedTools = options.allowedTools ?? DEFAULT_ALLOWED_TOOLS;
   const claudePath = options.claudePath ?? 'claude';

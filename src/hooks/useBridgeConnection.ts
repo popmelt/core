@@ -136,6 +136,10 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
         currentResponse: (!jobId || jobId === prev.activeJobId)
           ? prev.currentResponse + text
           : prev.currentResponse,
+        events: [
+          ...prev.events,
+          { type: 'delta', data, timestamp: Date.now() },
+        ],
       }));
     });
 
@@ -151,6 +155,10 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
         currentThinking: (!jobId || jobId === prev.activeJobId)
           ? prev.currentThinking + text
           : prev.currentThinking,
+        events: [
+          ...prev.events,
+          { type: 'thinking', data, timestamp: Date.now() },
+        ],
       }));
     });
 

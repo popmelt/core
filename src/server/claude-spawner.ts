@@ -32,7 +32,7 @@ export function spawnClaude(
   const {
     prompt,
     projectRoot,
-    maxTurns = 10,
+    maxTurns = 40,
     maxBudgetUsd = 1.0,
     allowedTools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'],
     claudePath = 'claude',

@@ -1227,8 +1227,6 @@ export function PopmeltProvider({
           bridgeUrl={bridgeUrl}
           accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
           isStreaming={threadActiveJobId !== null}
-          streamingResponse={threadActiveJobId ? (bridge.jobResponses[threadActiveJobId] ?? '') : ''}
-          streamingThinking={threadActiveJobId ? (bridge.jobThinking[threadActiveJobId] ?? '') : ''}
           streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
           onClose={() => setOpenThreadId(null)}
           onReply={handleReply}
