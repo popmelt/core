@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import type { AnnotationResolution } from '../tools/types';
 import { checkBridgeHealth } from '../utils/bridge-client';
@@ -56,329 +56,338 @@ export type BridgeConnectionState = {
   incrementalResolutions: AnnotationResolution[];
 };
 
-export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
-  const [state, setState] = useState<BridgeConnectionState>({
-    isConnected: false,
-    status: 'disconnected',
-    jobResponses: {},
-    jobThinking: {},
-    activeJobIds: [],
-    currentResponse: '',
-    currentThinking: '',
-    events: [],
-    activeJobId: null,
-    lastCompletedJobId: null,
-    lastResponseText: null,
-    lastThreadId: null,
-    pendingQuestions: [],
-    pendingPlans: [],
-    planReviews: [],
-    incrementalResolutions: [],
+// ---------------------------------------------------------------------------
+// Module-level singleton store — survives React remounts (HMR, Astro refresh)
+// ---------------------------------------------------------------------------
+
+const INITIAL_STATE: BridgeConnectionState = {
+  isConnected: false,
+  status: 'disconnected',
+  jobResponses: {},
+  jobThinking: {},
+  activeJobIds: [],
+  currentResponse: '',
+  currentThinking: '',
+  events: [],
+  activeJobId: null,
+  lastCompletedJobId: null,
+  lastResponseText: null,
+  lastThreadId: null,
+  pendingQuestions: [],
+  pendingPlans: [],
+  planReviews: [],
+  incrementalResolutions: [],
+};
+
+let store: BridgeConnectionState = { ...INITIAL_STATE };
+const listeners = new Set<() => void>();
+let activeEs: EventSource | null = null;
+let activeBridgeUrl: string | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+function getSnapshot(): BridgeConnectionState {
+  return store;
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+function update(updater: (prev: BridgeConnectionState) => BridgeConnectionState) {
+  store = updater(store);
+  for (const l of listeners) l();
+}
+
+function connectBridge(bridgeUrl: string) {
+  // Already connected to this URL
+  if (activeEs && activeEs.readyState !== EventSource.CLOSED && activeBridgeUrl === bridgeUrl) return;
+
+  // Clean up previous
+  if (activeEs) { activeEs.close(); activeEs = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  activeBridgeUrl = bridgeUrl;
+  const es = new EventSource(`${bridgeUrl}/events`);
+  activeEs = es;
+
+  es.addEventListener('connected', () => {
+    checkBridgeHealth(bridgeUrl).then((health) => {
+      const activeJobs = health?.activeJobs ?? (health?.activeJob ? [health.activeJob] : []);
+      const hasActiveJobs = activeJobs.length > 0;
+      update((prev) => ({
+        ...prev,
+        isConnected: true,
+        status: hasActiveJobs ? 'streaming' : 'idle',
+        activeJobId: hasActiveJobs ? activeJobs[activeJobs.length - 1]!.id : prev.activeJobId,
+        activeJobIds: activeJobs.map((j: { id: string }) => j.id),
+      }));
+    });
   });
 
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  es.addEventListener('job_started', (e) => {
+    const data = JSON.parse(e.data);
+    const jobId = data.jobId as string;
+    update((prev) => ({
+      ...prev,
+      status: 'streaming',
+      activeJobId: jobId,
+      activeJobIds: [...prev.activeJobIds, jobId],
+      jobResponses: { ...prev.jobResponses, [jobId]: '' },
+      jobThinking: { ...prev.jobThinking, [jobId]: '' },
+      currentResponse: '',
+      currentThinking: '',
+      lastResponseText: null,
+      lastThreadId: null,
+      events: [
+        ...prev.events,
+        { type: 'job_started', data, timestamp: Date.now() },
+      ],
+    }));
+  });
 
-  const connect = useCallback(() => {
-    // Close existing connection
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+  es.addEventListener('delta', (e) => {
+    const data = JSON.parse(e.data);
+    const jobId = data.jobId as string | undefined;
+    const text = (data.text || '') as string;
+    update((prev) => ({
+      ...prev,
+      jobResponses: jobId
+        ? { ...prev.jobResponses, [jobId]: (prev.jobResponses[jobId] || '') + text }
+        : prev.jobResponses,
+      currentResponse: (!jobId || jobId === prev.activeJobId)
+        ? prev.currentResponse + text
+        : prev.currentResponse,
+      events: [
+        ...prev.events,
+        { type: 'delta', data, timestamp: Date.now() },
+      ],
+    }));
+  });
 
-    const es = new EventSource(`${bridgeUrl}/events`);
-    eventSourceRef.current = es;
+  es.addEventListener('thinking', (e) => {
+    const data = JSON.parse(e.data);
+    const jobId = data.jobId as string | undefined;
+    const text = (data.text || '') as string;
+    update((prev) => ({
+      ...prev,
+      jobThinking: jobId
+        ? { ...prev.jobThinking, [jobId]: (prev.jobThinking[jobId] || '') + text }
+        : prev.jobThinking,
+      currentThinking: (!jobId || jobId === prev.activeJobId)
+        ? prev.currentThinking + text
+        : prev.currentThinking,
+      events: [
+        ...prev.events,
+        { type: 'thinking', data, timestamp: Date.now() },
+      ],
+    }));
+  });
 
-    es.addEventListener('connected', () => {
-      checkBridgeHealth(bridgeUrl).then((health) => {
-        const activeJobs = health?.activeJobs ?? (health?.activeJob ? [health.activeJob] : []);
-        const hasActiveJobs = activeJobs.length > 0;
-        setState((prev) => ({
-          ...prev,
-          isConnected: true,
-          status: hasActiveJobs ? 'streaming' : 'idle',
-          activeJobId: hasActiveJobs ? activeJobs[activeJobs.length - 1]!.id : prev.activeJobId,
-          activeJobIds: activeJobs.map(j => j.id),
-        }));
-      });
-    });
+  es.addEventListener('tool_use', (e) => {
+    const data = JSON.parse(e.data);
+    update((prev) => ({
+      ...prev,
+      events: [
+        ...prev.events,
+        { type: 'tool_use', data, timestamp: Date.now() },
+      ],
+    }));
+  });
 
-    es.addEventListener('job_started', (e) => {
-      const data = JSON.parse(e.data);
-      const jobId = data.jobId as string;
-      setState((prev) => ({
+  es.addEventListener('done', (e) => {
+    const data = JSON.parse(e.data);
+    const completedJobId = data.jobId as string | undefined;
+    update((prev) => {
+      const newActiveJobIds = completedJobId
+        ? prev.activeJobIds.filter(id => id !== completedJobId)
+        : prev.activeJobIds;
+
+      const newJobResponses = { ...prev.jobResponses };
+      const newJobThinking = { ...prev.jobThinking };
+      const completedResponse = completedJobId ? newJobResponses[completedJobId] : undefined;
+      if (completedJobId) {
+        delete newJobResponses[completedJobId];
+        delete newJobThinking[completedJobId];
+      }
+
+      const newActiveJobId = completedJobId === prev.activeJobId
+        ? (newActiveJobIds.length > 0 ? newActiveJobIds[newActiveJobIds.length - 1]! : null)
+        : prev.activeJobId;
+
+      return {
         ...prev,
-        status: 'streaming',
-        activeJobId: jobId,
-        activeJobIds: [...prev.activeJobIds, jobId],
-        jobResponses: { ...prev.jobResponses, [jobId]: '' },
-        jobThinking: { ...prev.jobThinking, [jobId]: '' },
-        currentResponse: '',
-        currentThinking: '',
-        lastResponseText: null,
-        lastThreadId: null,
+        activeJobIds: newActiveJobIds,
+        activeJobId: newActiveJobId,
+        jobResponses: newJobResponses,
+        jobThinking: newJobThinking,
+        lastCompletedJobId: completedJobId ?? prev.activeJobId,
+        lastResponseText: completedResponse || prev.currentResponse || data.responseText || null,
+        lastThreadId: data.threadId ?? null,
+        ...(completedJobId === prev.activeJobId ? {
+          currentResponse: newActiveJobId ? (newJobResponses[newActiveJobId] || '') : '',
+          currentThinking: newActiveJobId ? (newJobThinking[newActiveJobId] || '') : '',
+        } : {}),
         events: [
           ...prev.events,
-          { type: 'job_started', data, timestamp: Date.now() },
+          { type: 'done', data, timestamp: Date.now() },
         ],
-      }));
+      };
     });
+  });
 
-    es.addEventListener('delta', (e) => {
-      const data = JSON.parse(e.data);
-      const jobId = data.jobId as string | undefined;
-      const text = (data.text || '') as string;
-      setState((prev) => ({
+  es.addEventListener('question', (e) => {
+    const data = JSON.parse(e.data);
+    update((prev) => ({
+      ...prev,
+      pendingQuestions: [
+        ...prev.pendingQuestions,
+        {
+          jobId: data.jobId,
+          threadId: data.threadId,
+          question: data.question,
+          annotationIds: data.annotationIds,
+          timestamp: Date.now(),
+        },
+      ],
+      events: [
+        ...prev.events,
+        { type: 'question', data, timestamp: Date.now() },
+      ],
+    }));
+  });
+
+  es.addEventListener('plan_ready', (e) => {
+    const data = JSON.parse(e.data);
+    update((prev) => ({
+      ...prev,
+      pendingPlans: [
+        ...prev.pendingPlans,
+        {
+          jobId: data.jobId,
+          planId: data.planId,
+          tasks: data.tasks,
+          threadId: data.threadId,
+          timestamp: Date.now(),
+        },
+      ],
+      events: [
+        ...prev.events,
+        { type: 'plan_ready', data, timestamp: Date.now() },
+      ],
+    }));
+  });
+
+  es.addEventListener('plan_review', (e) => {
+    const data = JSON.parse(e.data);
+    update((prev) => ({
+      ...prev,
+      planReviews: [
+        ...prev.planReviews,
+        {
+          planId: data.planId,
+          verdict: data.verdict,
+          summary: data.summary,
+          issues: data.issues,
+          timestamp: Date.now(),
+        },
+      ],
+      events: [
+        ...prev.events,
+        { type: 'plan_review', data, timestamp: Date.now() },
+      ],
+    }));
+  });
+
+  es.addEventListener('task_resolved', (e) => {
+    const data = JSON.parse(e.data);
+    const resolutions = (data.resolutions ?? []) as AnnotationResolution[];
+    update((prev) => ({
+      ...prev,
+      incrementalResolutions: [...prev.incrementalResolutions, ...resolutions],
+      events: [
+        ...prev.events,
+        { type: 'task_resolved', data, timestamp: Date.now() },
+      ],
+    }));
+  });
+
+  es.addEventListener('queue_drained', () => {
+    update((prev) => ({
+      ...prev,
+      status: prev.status === 'error' ? 'error' : 'idle',
+      activeJobId: null,
+      activeJobIds: [],
+      currentResponse: '',
+      currentThinking: '',
+      jobResponses: {},
+      jobThinking: {},
+      incrementalResolutions: [],
+    }));
+  });
+
+  es.addEventListener('error', (e) => {
+    if (es.readyState === EventSource.CLOSED) {
+      update((prev) => ({
         ...prev,
-        jobResponses: jobId
-          ? { ...prev.jobResponses, [jobId]: (prev.jobResponses[jobId] || '') + text }
-          : prev.jobResponses,
-        currentResponse: (!jobId || jobId === prev.activeJobId)
-          ? prev.currentResponse + text
-          : prev.currentResponse,
-        events: [
-          ...prev.events,
-          { type: 'delta', data, timestamp: Date.now() },
-        ],
+        isConnected: false,
+        status: 'disconnected',
       }));
-    });
-
-    es.addEventListener('thinking', (e) => {
+      reconnectTimer = setTimeout(() => {
+        checkBridgeHealth(bridgeUrl).then((status) => {
+          if (status) connectBridge(bridgeUrl);
+        });
+      }, 5000);
+    } else if (e instanceof MessageEvent) {
       const data = JSON.parse(e.data);
-      const jobId = data.jobId as string | undefined;
-      const text = (data.text || '') as string;
-      setState((prev) => ({
-        ...prev,
-        jobThinking: jobId
-          ? { ...prev.jobThinking, [jobId]: (prev.jobThinking[jobId] || '') + text }
-          : prev.jobThinking,
-        currentThinking: (!jobId || jobId === prev.activeJobId)
-          ? prev.currentThinking + text
-          : prev.currentThinking,
-        events: [
-          ...prev.events,
-          { type: 'thinking', data, timestamp: Date.now() },
-        ],
-      }));
-    });
-
-    es.addEventListener('tool_use', (e) => {
-      const data = JSON.parse(e.data);
-      setState((prev) => ({
-        ...prev,
-        events: [
-          ...prev.events,
-          { type: 'tool_use', data, timestamp: Date.now() },
-        ],
-      }));
-    });
-
-    es.addEventListener('done', (e) => {
-      const data = JSON.parse(e.data);
-      const completedJobId = data.jobId as string | undefined;
-      setState((prev) => {
-        const newActiveJobIds = completedJobId
-          ? prev.activeJobIds.filter(id => id !== completedJobId)
+      const errorJobId = (data.jobId ?? null) as string | null;
+      update((prev) => {
+        const newActiveJobIds = errorJobId
+          ? prev.activeJobIds.filter(id => id !== errorJobId)
           : prev.activeJobIds;
-
-        // Clean up per-job accumulators
-        const newJobResponses = { ...prev.jobResponses };
-        const newJobThinking = { ...prev.jobThinking };
-        const completedResponse = completedJobId ? newJobResponses[completedJobId] : undefined;
-        if (completedJobId) {
-          delete newJobResponses[completedJobId];
-          delete newJobThinking[completedJobId];
-        }
-
-        // Update compat activeJobId if the completed job was the tracked one
-        const newActiveJobId = completedJobId === prev.activeJobId
-          ? (newActiveJobIds.length > 0 ? newActiveJobIds[newActiveJobIds.length - 1]! : null)
-          : prev.activeJobId;
-
+        const newStatus = newActiveJobIds.length > 0 ? prev.status : 'error';
         return {
           ...prev,
+          status: newStatus,
           activeJobIds: newActiveJobIds,
-          activeJobId: newActiveJobId,
-          jobResponses: newJobResponses,
-          jobThinking: newJobThinking,
-          lastCompletedJobId: completedJobId ?? prev.activeJobId,
-          lastResponseText: completedResponse || prev.currentResponse || data.responseText || null,
-          lastThreadId: data.threadId ?? null,
-          // Reset compat response if the completed job was the active one
-          ...(completedJobId === prev.activeJobId ? {
-            currentResponse: newActiveJobId ? (newJobResponses[newActiveJobId] || '') : '',
-            currentThinking: newActiveJobId ? (newJobThinking[newActiveJobId] || '') : '',
-          } : {}),
+          lastCompletedJobId: errorJobId ?? prev.activeJobId,
           events: [
             ...prev.events,
-            { type: 'done', data, timestamp: Date.now() },
+            { type: 'error', data, timestamp: Date.now() },
           ],
         };
       });
-    });
+    }
+  });
 
-    es.addEventListener('question', (e) => {
-      const data = JSON.parse(e.data);
-      setState((prev) => ({
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) {
+      update((prev) => ({
         ...prev,
-        pendingQuestions: [
-          ...prev.pendingQuestions,
-          {
-            jobId: data.jobId,
-            threadId: data.threadId,
-            question: data.question,
-            annotationIds: data.annotationIds,
-            timestamp: Date.now(),
-          },
-        ],
-        events: [
-          ...prev.events,
-          { type: 'question', data, timestamp: Date.now() },
-        ],
+        isConnected: false,
+        status: 'disconnected',
       }));
-    });
+    }
+  };
+}
 
-    es.addEventListener('plan_ready', (e) => {
-      const data = JSON.parse(e.data);
-      setState((prev) => ({
-        ...prev,
-        pendingPlans: [
-          ...prev.pendingPlans,
-          {
-            jobId: data.jobId,
-            planId: data.planId,
-            tasks: data.tasks,
-            threadId: data.threadId,
-            timestamp: Date.now(),
-          },
-        ],
-        events: [
-          ...prev.events,
-          { type: 'plan_ready', data, timestamp: Date.now() },
-        ],
-      }));
-    });
+// ---------------------------------------------------------------------------
+// React hook — thin wrapper over module-level store
+// ---------------------------------------------------------------------------
 
-    es.addEventListener('plan_review', (e) => {
-      const data = JSON.parse(e.data);
-      setState((prev) => ({
-        ...prev,
-        planReviews: [
-          ...prev.planReviews,
-          {
-            planId: data.planId,
-            verdict: data.verdict,
-            summary: data.summary,
-            issues: data.issues,
-            timestamp: Date.now(),
-          },
-        ],
-        events: [
-          ...prev.events,
-          { type: 'plan_review', data, timestamp: Date.now() },
-        ],
-      }));
-    });
+export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-    es.addEventListener('task_resolved', (e) => {
-      const data = JSON.parse(e.data);
-      const resolutions = (data.resolutions ?? []) as AnnotationResolution[];
-      setState((prev) => ({
-        ...prev,
-        incrementalResolutions: [...prev.incrementalResolutions, ...resolutions],
-        events: [
-          ...prev.events,
-          { type: 'task_resolved', data, timestamp: Date.now() },
-        ],
-      }));
-    });
-
-    es.addEventListener('queue_drained', () => {
-      setState((prev) => ({
-        ...prev,
-        status: prev.status === 'error' ? 'error' : 'idle',
-        activeJobId: null,
-        activeJobIds: [],
-        currentResponse: '',
-        currentThinking: '',
-        jobResponses: {},
-        jobThinking: {},
-        incrementalResolutions: [],
-      }));
-    });
-
-    es.addEventListener('error', (e) => {
-      // SSE errors can be reconnection attempts or actual errors
-      if (es.readyState === EventSource.CLOSED) {
-        setState((prev) => ({
-          ...prev,
-          isConnected: false,
-          status: 'disconnected',
-        }));
-        // Try to reconnect after a delay
-        reconnectTimerRef.current = setTimeout(() => {
-          checkBridgeHealth(bridgeUrl).then((status) => {
-            if (status) connect();
-          });
-        }, 5000);
-      } else if (e instanceof MessageEvent) {
-        const data = JSON.parse(e.data);
-        const errorJobId = (data.jobId ?? null) as string | null;
-        setState((prev) => {
-          const newActiveJobIds = errorJobId
-            ? prev.activeJobIds.filter(id => id !== errorJobId)
-            : prev.activeJobIds;
-
-          // Only set status to error if no other jobs are running
-          const newStatus = newActiveJobIds.length > 0 ? prev.status : 'error';
-
-          return {
-            ...prev,
-            status: newStatus,
-            activeJobIds: newActiveJobIds,
-            lastCompletedJobId: errorJobId ?? prev.activeJobId,
-            events: [
-              ...prev.events,
-              { type: 'error', data, timestamp: Date.now() },
-            ],
-          };
-        });
-      }
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        setState((prev) => ({
-          ...prev,
-          isConnected: false,
-          status: 'disconnected',
-        }));
-      }
-    };
-  }, [bridgeUrl]);
-
-  // Check health on mount, connect if available
+  // Connect on mount (idempotent — won't reconnect if already connected)
   useEffect(() => {
     checkBridgeHealth(bridgeUrl).then((status) => {
-      if (status) {
-        connect();
-      }
+      if (status) connectBridge(bridgeUrl);
     });
-
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-      }
-    };
-  }, [bridgeUrl, connect]);
+  }, [bridgeUrl]);
 
   const clearEvents = useCallback(() => {
-    setState((prev) => ({
-      ...prev,
+    update(() => ({
+      ...store,
       events: [],
       currentResponse: '',
       currentThinking: '',
@@ -391,14 +400,14 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
   }, []);
 
   const dismissQuestion = useCallback((threadId: string) => {
-    setState((prev) => ({
+    update((prev) => ({
       ...prev,
       pendingQuestions: prev.pendingQuestions.filter(q => q.threadId !== threadId),
     }));
   }, []);
 
   const dismissPlan = useCallback((planId: string) => {
-    setState((prev) => ({
+    update((prev) => ({
       ...prev,
       pendingPlans: prev.pendingPlans.filter(p => p.planId !== planId),
     }));
