@@ -1,5 +1,5 @@
 import type { StyleModification } from '../tools/types';
-import { findElementBySelector } from './domQuery';
+import { findElementBySelector } from './cssSelector';
 
 // Apply an inline style to an element
 export function applyInlineStyle(el: Element, property: string, value: string): void {

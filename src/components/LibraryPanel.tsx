@@ -6,7 +6,8 @@ import { POPMELT_BORDER } from '../styles/border';
 import type { SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { fetchModel, type DesignModel } from '../utils/bridge-client';
 import { findAllComponentBoundariesByName, getComponentPositions } from '../utils/dom';
-import { buildSpacingChangeContext, captureBindingsFromTargets, findElementsByTokenBinding, inferPropertyScope, resolveSpacingToken, updateBindingClasses, getUniqueSelector, type SpacingElement, type TokenBinding } from '../utils/domQuery';
+import { buildSpacingChangeContext, captureBindingsFromTargets, findElementsByTokenBinding, inferPropertyScope, resolveSpacingToken, updateBindingClasses, type SpacingElement, type TokenBinding } from '../utils/spacingAnalysis';
+import { getUniqueSelector } from '../utils/cssSelector';
 
 export type ComponentHoverInfo = { name: string; instanceIndex: number } | null;
 export type SpacingTokenHover = { name: string; px: number; token?: TokenBinding } | null;

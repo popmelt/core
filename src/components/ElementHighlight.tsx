@@ -4,6 +4,7 @@ import type { CSSProperties } from 'react';
 import { useEffect, useState } from 'react';
 
 import type { ElementInfo } from '../tools/types';
+import { colorWithAlpha } from '../utils/color';
 
 type ElementHighlightProps = {
   element: Element | null;
@@ -14,27 +15,6 @@ type ElementHighlightProps = {
   changeCount?: number;
   hideTooltip?: boolean;
 };
-
-// Convert color to rgba/oklch with alpha
-function colorWithAlpha(color: string, alpha: number): string {
-  // Handle OKLCH colors: oklch(L C H) -> oklch(L C H / alpha)
-  const oklchMatch = color.match(/^oklch\(([^)]+)\)$/i);
-  if (oklchMatch) {
-    return `oklch(${oklchMatch[1]} / ${alpha})`;
-  }
-
-  // Handle hex colors
-  const hexResult = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(color);
-  if (hexResult) {
-    const r = parseInt(hexResult[1]!, 16);
-    const g = parseInt(hexResult[2]!, 16);
-    const b = parseInt(hexResult[3]!, 16);
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  }
-
-  // Handle rgb/rgba - just use color-mix
-  return `color-mix(in srgb, ${color} ${Math.round(alpha * 100)}%, transparent)`;
-}
 
 export function ElementHighlight({ element, isSelected = false, elementInfo, color = '#3b82f6', annotationNumber, changeCount, hideTooltip = false }: ElementHighlightProps) {
   const [bounds, setBounds] = useState<DOMRect | null>(null);

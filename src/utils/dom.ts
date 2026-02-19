@@ -1,23 +1,35 @@
 export {
-  extractElementInfo,
-  getDirectTextContent,
-  getTopmostElementAtPoint,
   getReactComponentInfo,
-  captureElementsAtBounds,
-  captureElementsAtPoints,
+} from './reactFiber';
+
+export {
   getUniqueSelector,
   findElementBySelector,
-  resolveRegionToElement,
+} from './cssSelector';
+
+export {
   getComponentBoundary,
   findComponentBoundaryByName,
   findAllComponentBoundariesByName,
   getComponentPositions,
+  type ComponentBoundary,
+} from './componentBoundary';
+
+export {
+  extractElementInfo,
+  getDirectTextContent,
+  getTopmostElementAtPoint,
+  captureElementsAtBounds,
+  captureElementsAtPoints,
+  resolveRegionToElement,
+} from './elementExtraction';
+
+export {
   findSpacingUsages,
   findSpacingUsagesByBinding,
-  type ComponentBoundary,
   type SpacingRect,
   type TokenBinding,
-} from './domQuery';
+} from './spacingAnalysis';
 
 export {
   getComputedStyleValue,

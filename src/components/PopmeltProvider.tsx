@@ -154,7 +154,7 @@ export function PopmeltProvider({
   // Bidirectional hover: canvas tells us what's hovered, panel tells us what's hovered
   const [modelCanvasHoveredComponent, setModelCanvasHoveredComponent] = useState<string | null>(null);
   const [modelPanelHoveredComponent, setModelPanelHoveredComponent] = useState<{ name: string; instanceIndex: number } | null>(null);
-  const [modelSpacingTokenHover, setModelSpacingTokenHover] = useState<{ name: string; px: number; token?: import('../utils/domQuery').TokenBinding } | null>(null);
+  const [modelSpacingTokenHover, setModelSpacingTokenHover] = useState<{ name: string; px: number; token?: import('../utils/spacingAnalysis').TokenBinding } | null>(null);
 
   // Fetch model component names on mount and when bridge connects
   useEffect(() => {
