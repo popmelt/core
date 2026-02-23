@@ -98,9 +98,20 @@ function calculateLinkedPosition(
   // Position so the textarea background (which starts at point - PADDING)
   // is flush above the badge/modification tooltip stack
   const x = rect.left + window.scrollX + PADDING;
-  const y = anchor === 'top-left'
+  let y = anchor === 'top-left'
     ? rect.top + window.scrollY - BADGE_HEIGHT - (stackOffset * BADGE_HEIGHT) + PADDING
     : rect.bottom + window.scrollY + PADDING - 1 + (stackOffset * BADGE_HEIGHT);
+
+  // Clamp inside the element when the annotation would fall outside the viewport
+  // (e.g. when the element is flush with or larger than the viewport)
+  const viewportTop = window.scrollY + PADDING;
+  const viewportBottom = window.scrollY + window.innerHeight - BADGE_HEIGHT - PADDING;
+  if (y < viewportTop) {
+    y = rect.top + window.scrollY + PADDING;
+  } else if (y > viewportBottom) {
+    y = Math.max(rect.top + window.scrollY + PADDING, viewportBottom);
+  }
+
   return { x, y };
 }
 
@@ -1551,18 +1562,19 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           if (existingAnnotation.color) {
             dispatch({ type: 'SET_COLOR', payload: existingAnnotation.color });
           }
-          // Open thread panel if this annotation (or a group mate) has a thread
-          if (onViewThread) {
-            const threadId = existingAnnotation.threadId
-              || (existingAnnotation.groupId
-                ? state.annotations.find(a => a.groupId === existingAnnotation.groupId && a.threadId)?.threadId
-                : undefined);
-            if (threadId) {
-              onViewThread(threadId);
-            }
-          }
         } else if (!isShiftClick) {
           clearSelection();
+        }
+
+        // Open thread panel for ANY annotation type that has a thread
+        if (onViewThread) {
+          const threadId = existingAnnotation.threadId
+            || (existingAnnotation.groupId
+              ? state.annotations.find(a => a.groupId === existingAnnotation.groupId && a.threadId)?.threadId
+              : undefined);
+          if (threadId) {
+            onViewThread(threadId);
+          }
         }
 
         // Start drag tracking (will enter edit mode on mouseup if no drag and it's text)
