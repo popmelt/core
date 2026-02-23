@@ -20,6 +20,7 @@ export type PopmeltOptions = {
   allowedTools?: string[];
   claudePath?: string;
   provider?: Provider;
+  timeoutMs?: number;
 };
 
 export type PopmeltHandle = {
@@ -102,6 +103,7 @@ export type Job = {
   provider?: Provider;
   model?: string;
   imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
+  sourceId?: string; // SSE scoping — only the originating client sees job events
   // Planner fields
   planId?: string;
   planTaskId?: string;
@@ -113,7 +115,7 @@ export type SSEEvent =
   | { type: 'thinking'; jobId: string; text: string }
   | { type: 'tool_use'; jobId: string; tool: string; file?: string }
   | { type: 'done'; jobId: string; success: boolean; resolutions?: AnnotationResolution[]; responseText?: string; threadId?: string }
-  | { type: 'error'; jobId: string; message: string }
+  | { type: 'error'; jobId: string; message: string; cancelled?: boolean }
   | { type: 'question'; jobId: string; threadId: string; question: string; annotationIds?: string[] }
   | { type: 'plan_ready'; jobId: string; planId: string; tasks: PlanTask[]; threadId?: string }
   | { type: 'plan_review'; planId: string; verdict: 'pass' | 'fail'; summary: string; issues?: string[] }
@@ -133,6 +135,7 @@ export type NovelPattern = {
 export type SSEClient = {
   id: string;
   res: ServerResponse<IncomingMessage>;
+  sourceId?: string;
 };
 
 // Thread model types

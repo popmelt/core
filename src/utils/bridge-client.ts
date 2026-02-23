@@ -1,10 +1,21 @@
 const DEFAULT_BRIDGE_URL = 'http://localhost:1111';
 
+function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+  const controller = new AbortController();
+  if (init.signal) {
+    // Chain the existing signal
+    init.signal.addEventListener('abort', () => controller.abort());
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
 export type BridgeStatus = {
   ok: boolean;
   activeJob: { id: string; status: string } | null;
   activeJobs?: { id: string; status: string }[];
   queueDepth: number;
+  recentJobs?: { id: string; status: string; completedAt: number; error?: string; threadId?: string }[];
 };
 
 export type McpDetectionResult = {
@@ -33,7 +44,7 @@ export async function fetchCapabilities(
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<ProviderCapabilities | null> {
   try {
-    const res = await fetch(`${bridgeUrl}/capabilities`);
+    const res = await fetchWithTimeout(`${bridgeUrl}/capabilities`, {}, 5000);
     if (!res.ok) return null;
     return (await res.json()) as ProviderCapabilities;
   } catch {
@@ -68,6 +79,7 @@ export async function sendToBridge(
   provider?: string,
   model?: string,
   pastedImages?: Map<string, Blob[]>,
+  sourceId?: string,
 ): Promise<{ jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
@@ -75,6 +87,7 @@ export async function sendToBridge(
   if (color) formData.append('color', color);
   if (provider) formData.append('provider', provider);
   if (model) formData.append('model', model);
+  if (sourceId) formData.append('sourceId', sourceId);
   if (pastedImages) {
     for (const [annotationId, blobs] of pastedImages) {
       for (let i = 0; i < blobs.length; i++) {
@@ -83,10 +96,10 @@ export async function sendToBridge(
     }
   }
 
-  const res = await fetch(`${bridgeUrl}/send`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/send`, {
     method: 'POST',
     body: formData,
-  });
+  }, 30000);
 
   if (!res.ok) {
     const body = await res.text();
@@ -99,7 +112,7 @@ export async function sendToBridge(
 export async function cancelBridgeJob(
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<{ cancelled: boolean }> {
-  const res = await fetch(`${bridgeUrl}/cancel`, { method: 'POST' });
+  const res = await fetchWithTimeout(`${bridgeUrl}/cancel`, { method: 'POST' }, 5000);
   if (!res.ok) throw new Error(`Bridge returned ${res.status}`);
   return res.json();
 }
@@ -114,6 +127,7 @@ export async function sendPlanToBridge(
   viewport?: { width: number; height: number },
   manifest?: import('../tools/types').ManifestEntry[],
   feedbackJson?: string,
+  sourceId?: string,
 ): Promise<{ planId: string; jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
@@ -124,11 +138,12 @@ export async function sendPlanToBridge(
   if (model) formData.append('model', model);
   if (manifest) formData.append('manifest', JSON.stringify(manifest));
   if (feedbackJson) formData.append('feedback', feedbackJson);
+  if (sourceId) formData.append('sourceId', sourceId);
 
-  const res = await fetch(`${bridgeUrl}/plan`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/plan`, {
     method: 'POST',
     body: formData,
-  });
+  }, 30000);
 
   if (!res.ok) {
     const body = await res.text();
@@ -143,11 +158,11 @@ export async function approvePlan(
   bridgeUrl = DEFAULT_BRIDGE_URL,
   approvedTaskIds?: string[],
 ): Promise<{ planId: string; tasks: unknown[]; status: string }> {
-  const res = await fetch(`${bridgeUrl}/plan/approve`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/plan/approve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ planId, approvedTaskIds }),
-  });
+  }, 10000);
 
   if (!res.ok) {
     const body = await res.text();
@@ -163,17 +178,19 @@ export async function sendPlanReview(
   bridgeUrl = DEFAULT_BRIDGE_URL,
   provider?: string,
   model?: string,
+  sourceId?: string,
 ): Promise<{ jobId: string; planId: string; position: number }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
   formData.append('planId', planId);
   if (provider) formData.append('provider', provider);
   if (model) formData.append('model', model);
+  if (sourceId) formData.append('sourceId', sourceId);
 
-  const res = await fetch(`${bridgeUrl}/plan/review`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/plan/review`, {
     method: 'POST',
     body: formData,
-  });
+  }, 30000);
 
   if (!res.ok) {
     const body = await res.text();
@@ -197,6 +214,7 @@ export async function sendPlanExecution(
   bridgeUrl = DEFAULT_BRIDGE_URL,
   provider?: string,
   model?: string,
+  sourceId?: string,
 ): Promise<{ jobId: string; planId: string; position: number }> {
   const formData = new FormData();
   formData.append('screenshot', screenshotBlob, 'screenshot.png');
@@ -204,11 +222,12 @@ export async function sendPlanExecution(
   formData.append('tasks', JSON.stringify(tasks));
   if (provider) formData.append('provider', provider);
   if (model) formData.append('model', model);
+  if (sourceId) formData.append('sourceId', sourceId);
 
-  const res = await fetch(`${bridgeUrl}/plan/execute`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/plan/execute`, {
     method: 'POST',
     body: formData,
-  });
+  }, 30000);
 
   if (!res.ok) {
     const body = await res.text();
@@ -223,11 +242,11 @@ export async function installMcp(
   serverUrl?: string,
 ): Promise<{ results: InstallResult[]; capabilities: ProviderCapabilities } | null> {
   try {
-    const res = await fetch(`${bridgeUrl}/mcp/install`, {
+    const res = await fetchWithTimeout(`${bridgeUrl}/mcp/install`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(serverUrl ? { serverUrl } : {}),
-    });
+    }, 15000);
     if (!res.ok) return null;
     return (await res.json()) as { results: InstallResult[]; capabilities: ProviderCapabilities };
   } catch {
@@ -245,11 +264,11 @@ export async function addComponentToModel(
   name: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<{ added: boolean; alreadyExists: boolean }> {
-  const res = await fetch(`${bridgeUrl}/model/component`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/model/component`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
-  });
+  }, 10000);
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Bridge returned ${res.status}: ${body}`);
@@ -261,11 +280,11 @@ export async function removeComponentFromModel(
   name: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<{ removed: boolean }> {
-  const res = await fetch(`${bridgeUrl}/model/component`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/model/component`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
-  });
+  }, 10000);
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Bridge returned ${res.status}: ${body}`);
@@ -278,11 +297,11 @@ export async function updateModelToken(
   value: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<{ updated: boolean }> {
-  const res = await fetch(`${bridgeUrl}/model/token`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/model/token`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, value }),
-  });
+  }, 10000);
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Bridge returned ${res.status}: ${body}`);
@@ -294,11 +313,11 @@ export async function removeModelToken(
   path: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<{ removed: boolean }> {
-  const res = await fetch(`${bridgeUrl}/model/token`, {
+  const res = await fetchWithTimeout(`${bridgeUrl}/model/token`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
-  });
+  }, 10000);
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Bridge returned ${res.status}: ${body}`);
@@ -310,7 +329,7 @@ export async function fetchModel(
   bridgeUrl = DEFAULT_BRIDGE_URL,
 ): Promise<DesignModel> {
   try {
-    const res = await fetch(`${bridgeUrl}/model`);
+    const res = await fetchWithTimeout(`${bridgeUrl}/model`, {}, 5000);
     if (!res.ok) return null;
     const data = await res.json();
     return data.model ?? null;
@@ -327,6 +346,7 @@ export async function sendReplyToBridge(
   provider?: string,
   model?: string,
   images?: Blob[],
+  sourceId?: string,
 ): Promise<{ jobId: string; position: number; threadId?: string }> {
   let res: Response;
 
@@ -343,21 +363,21 @@ export async function sendReplyToBridge(
       0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ])], { type: 'image/png' });
     formData.append('screenshot', placeholder, 'screenshot.png');
-    formData.append('feedback', JSON.stringify({ threadId, reply, color, provider, model }));
+    formData.append('feedback', JSON.stringify({ threadId, reply, color, provider, model, sourceId }));
     for (let i = 0; i < images.length; i++) {
       formData.append(`image-reply-${i}`, images[i]!, `reply-image-${i}.png`);
     }
-    res = await fetch(`${bridgeUrl}/reply`, {
+    res = await fetchWithTimeout(`${bridgeUrl}/reply`, {
       method: 'POST',
       body: formData,
-    });
+    }, 30000);
   } else {
     // JSON: no images
-    res = await fetch(`${bridgeUrl}/reply`, {
+    res = await fetchWithTimeout(`${bridgeUrl}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ threadId, reply, color, provider, model }),
-    });
+      body: JSON.stringify({ threadId, reply, color, provider, model, sourceId }),
+    }, 30000);
   }
 
   if (!res.ok) {

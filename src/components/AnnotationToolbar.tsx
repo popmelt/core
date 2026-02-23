@@ -55,6 +55,7 @@ type AnnotationToolbarProps = {
   onInstallMcp?: () => Promise<void>;
   mcpJustInstalled?: boolean;
   bridgeUrl?: string;
+  isBridgeConnected?: boolean;
   modelSelectedComponent?: string | null;
   modelCanvasHoveredComponent?: string | null;
   onModelComponentHover?: (info: ComponentHoverInfo) => void;
@@ -349,6 +350,7 @@ export function AnnotationToolbar({
   onInstallMcp,
   mcpJustInstalled,
   bridgeUrl,
+  isBridgeConnected,
   modelSelectedComponent,
   modelCanvasHoveredComponent,
   onModelComponentHover,
@@ -1065,7 +1067,9 @@ export function AnnotationToolbar({
   };
 
   // Crosshair icon color based on job state
-  const crosshairColor = hasActiveJobs && activeJobColor ? activeJobColor : colors.iconActive;
+  const crosshairColor = isBridgeConnected === false
+    ? 'rgba(239, 68, 68, 0.4)'
+    : hasActiveJobs && activeJobColor ? activeJobColor : colors.iconActive;
 
   // Collapsed state content
   if (!isExpanded) {

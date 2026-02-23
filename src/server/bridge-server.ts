@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+import { buildCanvasHtml } from './canvas-html';
 import { spawnClaude } from './claude-spawner';
 import { spawnCodex } from './codex-spawner';
 import { DecisionStore } from './decision-store';
@@ -73,6 +75,7 @@ export async function createPopmelt(
   const allowedTools = options.allowedTools ?? DEFAULT_ALLOWED_TOOLS;
   const claudePath = options.claudePath ?? 'claude';
   const defaultProvider: Provider = options.provider ?? 'claude';
+  const timeoutMs = options.timeoutMs;
 
   // Probe for installed CLI providers
   type ProviderCapability = { available: boolean; path: string | null; mcp?: McpDetection };
@@ -107,6 +110,7 @@ export async function createPopmelt(
   const materializer = new Materializer(projectRoot, decisionStore, {
     claudePath,
     onEvent: (event) => {
+      // Materializer events are global — send to all clients
       for (const client of sseClients) {
         sendSSE(client, event);
       }
@@ -114,10 +118,25 @@ export async function createPopmelt(
   });
   const jobGroups = new Map<string, JobGroup>();
 
-  // Wire up SSE broadcasting from queue
-  queue.addListener((event: SSEEvent, _jobId: string) => {
+  // Recent completed jobs (for reconnect state recovery)
+  const RECENT_JOBS_MAX = 20;
+  const RECENT_JOBS_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  type RecentJob = { id: string; status: 'done' | 'error'; completedAt: number; error?: string; threadId?: string };
+  const recentJobs: RecentJob[] = [];
+
+  // Canvas manifest cache (5-second TTL)
+  let manifestCache: { data: unknown; expires: number } | null = null;
+  let renderHash: string | undefined;
+
+  // Wire up SSE broadcasting from queue (sourceId filtering)
+  queue.addListener((event: SSEEvent, _jobId: string, sourceId?: string) => {
     for (const client of sseClients) {
-      sendSSE(client, event);
+      // No sourceId on event → global event, send to all
+      // No sourceId on client → legacy client, send all
+      // Both present → must match
+      if (!sourceId || !client.sourceId || client.sourceId === sourceId) {
+        sendSSE(client, event);
+      }
     }
   });
 
@@ -190,7 +209,7 @@ export async function createPopmelt(
     let lastResolutionCount = 0;
 
     const onEvent = (event: SSEEvent, jobId: string) => {
-      queue.broadcast(event, jobId);
+      queue.broadcast(event, jobId, job.sourceId);
 
       // For plan executor jobs, accumulate delta text and check for new resolutions
       if (isPlanExecutor && event.type === 'delta' && 'text' in event) {
@@ -202,6 +221,7 @@ export async function createPopmelt(
           queue.broadcast(
             { type: 'task_resolved', jobId, planId: job.planId!, resolutions: newResolutions, threadId: job.threadId },
             jobId,
+            job.sourceId,
           );
         }
       }
@@ -228,6 +248,7 @@ export async function createPopmelt(
           claudePath,
           resumeSessionId,
           model: job.model,
+          timeoutMs,
           onEvent,
         });
 
@@ -350,6 +371,7 @@ export async function createPopmelt(
             queue.broadcast(
               { type: 'plan_ready', jobId: job.id, planId: job.planId, tasks: plan, threadId: job.threadId },
               job.id,
+              job.sourceId,
             );
           } else if (!question) {
             // Plan parsing failed and no question — error
@@ -370,6 +392,7 @@ export async function createPopmelt(
             queue.broadcast(
               { type: 'plan_review', planId: job.planId, verdict: review.verdict, summary: review.summary, issues: review.issues },
               job.id,
+              job.sourceId,
             );
           }
         }
@@ -381,6 +404,7 @@ export async function createPopmelt(
         queue.broadcast(
           { type: 'question', jobId: job.id, threadId: job.threadId ?? job.id, question, annotationIds: job.annotationIds },
           job.id,
+          job.sourceId,
         );
       }
 
@@ -391,13 +415,18 @@ export async function createPopmelt(
         queue.broadcast(
           { type: 'novel_patterns', jobId: job.id, patterns: novelPatterns, threadId: job.threadId },
           job.id,
+          job.sourceId,
         );
       }
 
       queue.broadcast(
         { type: 'done', jobId: job.id, success: true, resolutions: resolutions.length > 0 ? resolutions : undefined, responseText: spawnResult.text, threadId: job.threadId },
         job.id,
+        job.sourceId,
       );
+
+      // Track for reconnect recovery
+      recentJobs.push({ id: job.id, status: 'done', completedAt: Date.now(), threadId: job.threadId });
     } else {
       console.error(`${tag} Error: ${spawnResult.error}`);
       job.status = 'error';
@@ -409,7 +438,17 @@ export async function createPopmelt(
           message: spawnResult.error || 'Unknown error',
         },
         job.id,
+        job.sourceId,
       );
+
+      // Track for reconnect recovery
+      recentJobs.push({ id: job.id, status: 'error', completedAt: Date.now(), error: spawnResult.error, threadId: job.threadId });
+    }
+
+    // Prune old entries
+    const cutoff = Date.now() - RECENT_JOBS_TTL_MS;
+    while (recentJobs.length > 0 && (recentJobs[0]!.completedAt < cutoff || recentJobs.length > RECENT_JOBS_MAX)) {
+      recentJobs.shift();
     }
   });
 
@@ -467,6 +506,12 @@ export async function createPopmelt(
       } else if (req.method === 'GET' && path.startsWith('/thread/')) {
         const threadId = path.slice('/thread/'.length);
         await handleGetThread(threadId, res);
+      } else if (req.method === 'GET' && (path === '/canvas' || path === '/canvas/')) {
+        handleCanvasPage(req, res);
+      } else if (req.method === 'GET' && path === '/canvas/manifest') {
+        await handleCanvasManifest(res);
+      } else if (req.method === 'GET' && path === '/canvas/app.mjs') {
+        await handleCanvasAsset(res);
       } else {
         sendJson(res, 404, { error: 'Not found' });
       }
@@ -479,7 +524,7 @@ export async function createPopmelt(
   });
 
   async function handleSend(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr, pastedImages } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr, sourceId: sourceIdStr, pastedImages } = await parseMultipart(req);
 
     let feedback: FeedbackPayload;
     try {
@@ -538,6 +583,7 @@ export async function createPopmelt(
       provider: (providerStr === 'claude' || providerStr === 'codex') ? providerStr : undefined,
       model: modelStr || undefined,
       ...(Object.keys(imagePaths).length > 0 ? { imagePaths } : {}),
+      sourceId: sourceIdStr || undefined,
     };
 
     // Append human message to thread
@@ -570,6 +616,7 @@ export async function createPopmelt(
     let color: string | undefined;
     let providerStr: string | undefined;
     let modelStr: string | undefined;
+    let sourceIdStr: string | undefined;
     let replyImageBuffers: Buffer[] = [];
 
     if (contentType.includes('multipart/form-data')) {
@@ -583,6 +630,7 @@ export async function createPopmelt(
       color = meta.color;
       providerStr = meta.provider;
       modelStr = meta.model;
+      sourceIdStr = meta.sourceId || parsed.sourceId;
       // Collect images: the main "screenshot" field is reused as first image if present and non-empty
       // pastedImages carry reply-image-{index} fields
       for (const img of parsed.pastedImages) {
@@ -595,7 +643,7 @@ export async function createPopmelt(
         chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
       }
       const body = Buffer.concat(chunks).toString('utf-8');
-      let parsed: { threadId?: string; reply?: string; color?: string; provider?: string; model?: string };
+      let parsed: { threadId?: string; reply?: string; color?: string; provider?: string; model?: string; sourceId?: string };
       try {
         parsed = JSON.parse(body);
       } catch {
@@ -607,6 +655,7 @@ export async function createPopmelt(
       color = parsed.color;
       providerStr = parsed.provider;
       modelStr = parsed.model;
+      sourceIdStr = parsed.sourceId;
     }
 
     if (!threadId || !reply) {
@@ -689,6 +738,7 @@ export async function createPopmelt(
       annotationIds: annotationIds.length > 0 ? annotationIds : undefined,
       provider: replyProvider,
       model: modelStr || undefined,
+      sourceId: sourceIdStr || undefined,
     };
 
     // Override the job processor prompt for this job by storing it
@@ -711,7 +761,9 @@ export async function createPopmelt(
     // Send initial connection event
     res.write(`event: connected\ndata: {"status":"connected"}\n\n`);
 
-    const client: SSEClient = { id: randomUUID().slice(0, 8), res };
+    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${port}`);
+    const sourceId = reqUrl.searchParams.get('sourceId') || undefined;
+    const client: SSEClient = { id: randomUUID().slice(0, 8), res, sourceId };
     sseClients.add(client);
 
     req.on('close', () => {
@@ -728,6 +780,7 @@ export async function createPopmelt(
         : null,
       activeJobs: allActive.map(j => ({ id: j.id, status: j.status })),
       queueDepth: queue.depth,
+      recentJobs,
     });
   }
 
@@ -753,7 +806,7 @@ export async function createPopmelt(
   }
 
   async function handlePlan(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr, manifest: manifestStr } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr, manifest: manifestStr, sourceId: sourceIdStr } = await parseMultipart(req);
 
     if (!screenshot || !goalStr) {
       sendJson(res, 400, { error: 'Missing screenshot or goal' });
@@ -833,6 +886,7 @@ export async function createPopmelt(
       provider,
       model: modelStr || undefined,
       planId,
+      sourceId: sourceIdStr || undefined,
     };
 
     // Override prompt and tools for planner (vision-only, no code changes)
@@ -886,7 +940,7 @@ export async function createPopmelt(
   }
 
   async function handlePlanExecute(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, planId: planIdStr, tasks: tasksStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+    const { screenshot, planId: planIdStr, tasks: tasksStr, provider: providerStr, model: modelStr, sourceId: sourceIdStr } = await parseMultipart(req);
 
     if (!planIdStr || !tasksStr || !screenshot) {
       sendJson(res, 400, { error: 'Missing planId, tasks, or screenshot' });
@@ -946,6 +1000,7 @@ export async function createPopmelt(
       model: modelStr || undefined,
       planId: planIdStr,
       annotationIds,
+      sourceId: sourceIdStr || undefined,
     };
 
     (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
@@ -958,7 +1013,7 @@ export async function createPopmelt(
   }
 
   async function handlePlanReview(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, planId: planIdStr, provider: providerStr, model: modelStr } = await parseMultipart(req);
+    const { screenshot, planId: planIdStr, provider: providerStr, model: modelStr, sourceId: sourceIdStr } = await parseMultipart(req);
 
     if (!planIdStr) {
       sendJson(res, 400, { error: 'Missing planId' });
@@ -1007,6 +1062,7 @@ export async function createPopmelt(
       provider,
       model: modelStr || undefined,
       planId: planIdStr,
+      sourceId: sourceIdStr || undefined,
     };
 
     (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
@@ -1142,6 +1198,80 @@ export async function createPopmelt(
     sendJson(res, 200, result);
   }
 
+  function handleCanvasPage(req: IncomingMessage, res: ServerResponse) {
+    // Infer dev origin from Referer or Origin header, fallback to localhost:3000
+    let devOrigin = 'http://localhost:3000';
+    const referer = req.headers.referer || req.headers.origin;
+    if (referer) {
+      try {
+        const u = new URL(typeof referer === 'string' ? referer : referer[0] || '');
+        if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+          devOrigin = u.origin;
+        }
+      } catch {}
+    }
+
+    const html = buildCanvasHtml(port, devOrigin);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  }
+
+  async function handleCanvasManifest(res: ServerResponse) {
+    const now = Date.now();
+    if (manifestCache && now < manifestCache.expires) {
+      sendJson(res, 200, manifestCache.data);
+      return;
+    }
+
+    try {
+      // Dynamic import to avoid requiring scanner at module load time
+      const { scanForComponents } = await import('../scanner/react-scanner');
+      const { generateRenderFiles } = await import('../scanner/render-generator');
+      const manifest = await scanForComponents(projectRoot);
+      manifestCache = { data: manifest, expires: now + 5000 };
+
+      // Generate render files for route-less components (fire-and-forget)
+      generateRenderFiles(manifest, projectRoot, renderHash)
+        .then(hash => { renderHash = hash; })
+        .catch(err => console.warn('[Bridge] Render generation failed:', err));
+
+      sendJson(res, 200, manifest);
+    } catch (err) {
+      console.error('[Bridge] Scanner error:', err);
+      sendJson(res, 500, { error: 'Failed to scan components' });
+    }
+  }
+
+  async function handleCanvasAsset(res: ServerResponse) {
+    // Try multiple locations since import.meta.url is unreliable in bundled contexts
+    const candidates = [
+      join(projectRoot, 'node_modules', '@popmelt.com', 'core', 'dist', 'canvas.mjs'),
+      join(projectRoot, 'packages', 'popmelt', 'dist', 'canvas.mjs'),
+    ];
+
+    try {
+      const thisFile = fileURLToPath(import.meta.url);
+      candidates.unshift(join(dirname(thisFile), 'canvas.mjs'));
+    } catch {}
+
+    for (const bundlePath of candidates) {
+      try {
+        const content = await readFile(bundlePath, 'utf-8');
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(content);
+        return;
+      } catch {
+        // Try next candidate
+      }
+    }
+
+    console.error('[Bridge] Canvas bundle not found in:', candidates);
+    sendJson(res, 404, { error: 'Canvas bundle not found' });
+  }
+
   async function handleGetThread(threadId: string, res: ServerResponse) {
     const thread = await threadStore.getThread(threadId);
     if (!thread) {
@@ -1179,7 +1309,7 @@ export async function createPopmelt(
         port,
         close: async () => {
           clearInterval(cleanupTimer);
-          queue.destroy();
+          await queue.destroyAsync();
 
           for (const client of sseClients) {
             try {

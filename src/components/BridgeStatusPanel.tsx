@@ -22,6 +22,8 @@ type BridgeEventStackProps = {
   clearSignal: number;
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
+  onCancel?: (jobId: string) => void;
+  isConnected?: boolean;
 };
 
 type StreamEntry = {
@@ -30,6 +32,8 @@ type StreamEntry = {
   status: 'working' | 'queued' | 'done' | 'error';
   doneLabel?: string;
   threadId?: string;
+  errorMessage?: string;
+  cancelled?: boolean;
 };
 
 const stackContainerStyle: CSSProperties = {
@@ -228,7 +232,7 @@ function SwipeDismiss({ onDismiss, children }: { onDismiss: () => void; children
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, isConnected }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
 
   // Clear on signal
@@ -279,22 +283,25 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     if (!completedId || completedId === prevCompletedRef.current) return;
     prevCompletedRef.current = completedId;
 
-    const isError = bridge.events.some(
+    const errorEvent = bridge.events.find(
       (e) => e.type === 'error' && (e.data.jobId === completedId || bridge.status === 'error'),
     );
+    const isError = !!errorEvent;
 
     const doneLabel = isError ? undefined : deriveDoneLabel(bridge.events, completedId);
+    const errorMessage = errorEvent ? String(errorEvent.data.message || '') : undefined;
+    const cancelled = errorEvent ? !!errorEvent.data.cancelled : undefined;
 
     setEntries((prev) =>
       prev.map((e) =>
         e.jobId === completedId
-          ? { ...e, status: isError ? 'error' : 'done', doneLabel }
+          ? { ...e, status: isError ? 'error' : 'done', doneLabel, errorMessage, cancelled }
           : e,
       ),
     );
   }, [bridge.lastCompletedJobId, bridge.events, bridge.status]);
 
-  if (!isVisible || entries.length === 0) return null;
+  if (!isVisible || (entries.length === 0 && isConnected !== false)) return null;
 
   return (
     <div
@@ -311,23 +318,42 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
               ? 'Queued'
               : entry.status === 'done'
                 ? (entry.doneLabel || 'Done')
-                : 'Error';
+                : entry.cancelled
+                  ? 'Cancelled'
+                  : entry.errorMessage?.includes('Timed out')
+                    ? 'Timed out'
+                    : 'Error';
 
         return (
           <SwipeDismiss key={entry.jobId} onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
             <div
               style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
               onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
+              title={entry.errorMessage || undefined}
             >
               {entry.status === 'working' && <DotSpinner color={entry.color} />}
               {entry.status === 'queued' && <ColorSquare color={entry.color} />}
               {entry.status === 'done' && <Checkmark color={entry.color} />}
               {entry.status === 'error' && <ErrorDot />}
               <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
+              {entry.status === 'working' && onCancel && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onCancel(entry.jobId); }}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer',
+                           color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+                  title="Cancel"
+                >×</button>
+              )}
             </div>
           </SwipeDismiss>
         );
       })}
+      {isConnected === false && entries.length > 0 && (
+        <div style={{ ...rowStyle, color: '#9ca3af' }}>
+          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', backgroundColor: '#f59e0b' }} />
+          <span>Reconnecting…</span>
+        </div>
+      )}
     </div>
   );
 }

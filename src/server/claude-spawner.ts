@@ -14,6 +14,7 @@ export type SpawnOptions = {
   claudePath?: string;
   resumeSessionId?: string;
   model?: string;
+  timeoutMs?: number;
   onEvent?: (event: SSEEvent, jobId: string) => void;
 };
 
@@ -38,6 +39,7 @@ export function spawnClaude(
     claudePath = 'claude',
     resumeSessionId,
     model,
+    timeoutMs: TIMEOUT_MS = 300_000,
     onEvent,
   } = options;
 
@@ -77,6 +79,14 @@ export function spawnClaude(
     const fileEdits: FileEdit[] = [];
     let hadError = false;
     let errorMessage = '';
+
+    // Process timeout — SIGTERM then SIGKILL escalation
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 5000);
+    }, TIMEOUT_MS);
 
     const rl = createInterface({ input: child.stdout! });
     const seenEventTypes = new Set<string>();
@@ -155,9 +165,18 @@ export function spawnClaude(
     });
 
     child.on('close', (code) => {
+      clearTimeout(timer);
       rl.close();
 
-      if (code !== 0 && code !== null) {
+      // Diagnostic: log event types seen and whether text was captured
+      if (textChunks.length === 0 && seenEventTypes.size > 0) {
+        console.warn(`[Claude:${jobId}] No text captured. Event types seen: ${[...seenEventTypes].join(', ')}`);
+      }
+
+      if (timedOut) {
+        hadError = true;
+        errorMessage = `Timed out after ${Math.round(TIMEOUT_MS / 60000)} minutes`;
+      } else if (code !== 0 && code !== null) {
         hadError = true;
         errorMessage = stderrChunks.join('') || `Claude process exited with code ${code}`;
       }
@@ -172,6 +191,7 @@ export function spawnClaude(
     });
 
     child.on('error', (err) => {
+      clearTimeout(timer);
       hadError = true;
       errorMessage = err.message;
       resolve({

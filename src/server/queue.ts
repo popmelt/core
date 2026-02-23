@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 
 import type { Job, SSEEvent } from './types';
 
-export type QueueListener = (event: SSEEvent, jobId: string) => void;
+export type QueueListener = (event: SSEEvent, jobId: string, sourceId?: string) => void;
 
 export class JobQueue {
   private queue: Job[] = [];
@@ -61,9 +61,9 @@ export class JobQueue {
     return () => this.listeners.delete(listener);
   }
 
-  broadcast(event: SSEEvent, jobId: string) {
+  broadcast(event: SSEEvent, jobId: string, sourceId?: string) {
     for (const listener of this.listeners) {
-      listener(event, jobId);
+      listener(event, jobId, sourceId);
     }
   }
 
@@ -78,8 +78,9 @@ export class JobQueue {
     job.status = 'error';
     job.error = 'Cancelled by user';
     this.broadcast(
-      { type: 'error', jobId: job.id, message: 'Cancelled by user' },
+      { type: 'error', jobId: job.id, message: 'Cancelled by user', cancelled: true },
       job.id,
+      job.sourceId,
     );
     this.processNext();
     return true;
@@ -104,6 +105,43 @@ export class JobQueue {
     this.listeners.clear();
   }
 
+  async destroyAsync(timeoutMs = 10_000): Promise<void> {
+    const procs = Array.from(this.activeProcesses.values());
+    this.queue = [];
+    this.listeners.clear();
+
+    if (procs.length === 0) {
+      this.activeProcesses.clear();
+      this.activeJobs.clear();
+      return;
+    }
+
+    // Send SIGTERM to all
+    for (const proc of procs) {
+      try { proc.kill('SIGTERM'); } catch {}
+    }
+
+    // Wait for exit or escalate to SIGKILL
+    await Promise.all(procs.map((proc) =>
+      new Promise<void>((resolve) => {
+        let resolved = false;
+        const done = () => { if (!resolved) { resolved = true; resolve(); } };
+        proc.on('exit', done);
+        proc.on('error', done);
+        setTimeout(() => {
+          if (!resolved) {
+            try { proc.kill('SIGKILL'); } catch {}
+            // Give SIGKILL a moment
+            setTimeout(done, 500);
+          }
+        }, timeoutMs);
+      }),
+    ));
+
+    this.activeProcesses.clear();
+    this.activeJobs.clear();
+  }
+
   private processNext() {
     while (
       this.activeJobs.size < this.maxConcurrency &&
@@ -114,7 +152,7 @@ export class JobQueue {
       this.activeJobs.set(job.id, job);
       job.status = 'running';
 
-      this.broadcast({ type: 'job_started', jobId: job.id, position: 0 }, job.id);
+      this.broadcast({ type: 'job_started', jobId: job.id, position: 0 }, job.id, job.sourceId);
 
       // Fire-and-forget — each job runs independently
       this.processor(job)
@@ -124,6 +162,7 @@ export class JobQueue {
           this.broadcast(
             { type: 'error', jobId: job.id, message: job.error },
             job.id,
+            job.sourceId,
           );
         })
         .finally(() => {

@@ -72,18 +72,18 @@ export function spawnCodex(
         }
 
         // Text delta from agent message streaming
-        if (eventType === 'item/agentMessage/delta' && parsed.delta?.text) {
+        if ((eventType === 'item.agentMessage.delta' || eventType === 'item/agentMessage/delta') && parsed.delta?.text) {
           textChunks.push(parsed.delta.text);
           onEvent?.({ type: 'delta', jobId, text: parsed.delta.text }, jobId);
         }
 
         // Reasoning delta — map to thinking events
-        if (eventType === 'item/reasoning/delta' && parsed.delta?.text) {
+        if ((eventType === 'item.reasoning.delta' || eventType === 'item/reasoning/delta') && parsed.delta?.text) {
           onEvent?.({ type: 'thinking', jobId, text: parsed.delta.text }, jobId);
         }
 
         // Item started — detect tool use
-        if (eventType === 'item/started' && parsed.item) {
+        if ((eventType === 'item.started' || eventType === 'item/started') && parsed.item) {
           const itemType = parsed.item.type;
           if (itemType === 'command_execution') {
             onEvent?.({ type: 'tool_use', jobId, tool: 'Bash' }, jobId);
@@ -102,11 +102,12 @@ export function spawnCodex(
         }
 
         // Item completed — accumulate full text from agent messages and reasoning
-        if (eventType === 'item/completed' && parsed.item) {
+        if ((eventType === 'item.completed' || eventType === 'item/completed') && parsed.item) {
           if (parsed.item.type === 'agent_message') {
             const itemText = parsed.item.text;
             if (typeof itemText === 'string' && itemText) {
               textChunks.push(itemText);
+              onEvent?.({ type: 'delta', jobId, text: itemText }, jobId);
             }
           } else if (parsed.item.type === 'reasoning') {
             const reasoningText = parsed.item.text;
@@ -134,6 +135,11 @@ export function spawnCodex(
 
     child.on('close', (code) => {
       rl.close();
+
+      // Diagnostic: log event types seen and whether text was captured
+      if (textChunks.length === 0 && seenEventTypes.size > 0) {
+        console.warn(`[Codex:${jobId}] No text captured. Event types seen: ${[...seenEventTypes].join(', ')}`);
+      }
 
       if (code !== 0 && code !== null) {
         hadError = true;

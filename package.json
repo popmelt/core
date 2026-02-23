@@ -1,6 +1,6 @@
 {
   "name": "@popmelt.com/core",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "The design collaboration layer for AI coding agents",
   "license": "PolyForm-Shield-1.0.0",
   "author": "Popmelt <hello@popmelt.com> (https://popmelt.com)",
@@ -50,6 +50,27 @@
       "source": "./src/server/index.ts",
       "types": "./dist/server.d.mts",
       "import": "./dist/server.mjs"
+    },
+    "./canvas": {
+      "source": "./src/canvas/index.ts",
+      "import": "./dist/canvas.mjs"
+    },
+    "./next": {
+      "source": "./src/plugins/next.ts",
+      "import": "./dist/plugin-next.mjs",
+      "default": "./dist/plugin-next.mjs"
+    },
+    "./vite": {
+      "source": "./src/plugins/vite.ts",
+      "types": "./dist/plugin-vite.d.mts",
+      "import": "./dist/plugin-vite.mjs",
+      "default": "./dist/plugin-vite.mjs"
+    },
+    "./astro": {
+      "source": "./src/plugins/astro.ts",
+      "types": "./dist/plugin-astro.d.mts",
+      "import": "./dist/plugin-astro.mjs",
+      "default": "./dist/plugin-astro.mjs"
     }
   },
   "files": [

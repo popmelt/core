@@ -50,11 +50,26 @@ export type BridgeConnectionState = {
   lastCompletedJobId: string | null;
   lastResponseText: string | null;
   lastThreadId: string | null;
+  lastErrorByJob: Record<string, string>;
   pendingQuestions: PendingQuestion[];
   pendingPlans: PendingPlan[];
   planReviews: PlanReviewResult[];
   incrementalResolutions: AnnotationResolution[];
 };
+
+// ---------------------------------------------------------------------------
+// Stable client identity — survives React remounts (HMR, Astro refresh)
+// ---------------------------------------------------------------------------
+
+const SOURCE_ID: string =
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+
+/** Return this client's stable sourceId (for tagging bridge requests). */
+export function getSourceId(): string {
+  return SOURCE_ID;
+}
 
 // ---------------------------------------------------------------------------
 // Module-level singleton store — survives React remounts (HMR, Astro refresh)
@@ -73,6 +88,7 @@ const INITIAL_STATE: BridgeConnectionState = {
   lastCompletedJobId: null,
   lastResponseText: null,
   lastThreadId: null,
+  lastErrorByJob: {},
   pendingQuestions: [],
   pendingPlans: [],
   planReviews: [],
@@ -84,6 +100,7 @@ const listeners = new Set<() => void>();
 let activeEs: EventSource | null = null;
 let activeBridgeUrl: string | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let connectionGeneration = 0;
 
 function getSnapshot(): BridgeConnectionState {
   return store;
@@ -108,24 +125,53 @@ function connectBridge(bridgeUrl: string) {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
   activeBridgeUrl = bridgeUrl;
-  const es = new EventSource(`${bridgeUrl}/events`);
+  const gen = ++connectionGeneration;
+  const es = new EventSource(`${bridgeUrl}/events?sourceId=${SOURCE_ID}`);
   activeEs = es;
+  const isStale = () => gen !== connectionGeneration;
 
   es.addEventListener('connected', () => {
+    if (isStale()) return;
     checkBridgeHealth(bridgeUrl).then((health) => {
+      if (isStale()) return;
       const activeJobs = health?.activeJobs ?? (health?.activeJob ? [health.activeJob] : []);
+      const serverActiveIds = new Set(activeJobs.map((j: { id: string }) => j.id));
+      const serverRecentJobs: Array<{ id: string; status: string; error?: string }> =
+        (health as Record<string, unknown>)?.recentJobs as Array<{ id: string; status: string; error?: string }> ?? [];
+      const recentById = new Map(serverRecentJobs.map(j => [j.id, j]));
       const hasActiveJobs = activeJobs.length > 0;
-      update((prev) => ({
-        ...prev,
-        isConnected: true,
-        status: hasActiveJobs ? 'streaming' : 'idle',
-        activeJobId: hasActiveJobs ? activeJobs[activeJobs.length - 1]!.id : prev.activeJobId,
-        activeJobIds: activeJobs.map((j: { id: string }) => j.id),
-      }));
+
+      update((prev) => {
+        // Reconcile: any local active job not in server's active list is stale
+        const reconciledErrors: Record<string, string> = { ...prev.lastErrorByJob };
+        const staleJobIds = prev.activeJobIds.filter(id => !serverActiveIds.has(id));
+        for (const id of staleJobIds) {
+          const recent = recentById.get(id);
+          if (recent?.status === 'error' && recent.error) {
+            reconciledErrors[id] = recent.error;
+          }
+        }
+        const reconciledActiveIds = prev.activeJobIds.filter(id => serverActiveIds.has(id));
+        // Also include server active jobs not tracked locally
+        for (const id of serverActiveIds) {
+          if (!reconciledActiveIds.includes(id)) reconciledActiveIds.push(id);
+        }
+
+        return {
+          ...prev,
+          isConnected: true,
+          status: hasActiveJobs ? 'streaming' : (staleJobIds.length > 0 ? 'idle' : (prev.status === 'disconnected' ? 'idle' : prev.status)),
+          activeJobId: hasActiveJobs ? activeJobs[activeJobs.length - 1]!.id : (reconciledActiveIds.length > 0 ? reconciledActiveIds[reconciledActiveIds.length - 1]! : null),
+          activeJobIds: reconciledActiveIds,
+          lastErrorByJob: reconciledErrors,
+          lastCompletedJobId: staleJobIds.length > 0 ? staleJobIds[staleJobIds.length - 1]! : prev.lastCompletedJobId,
+        };
+      });
     });
   });
 
   es.addEventListener('job_started', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string;
     update((prev) => ({
@@ -147,6 +193,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('delta', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string | undefined;
     const text = (data.text || '') as string;
@@ -166,6 +213,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('thinking', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string | undefined;
     const text = (data.text || '') as string;
@@ -185,6 +233,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('tool_use', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     update((prev) => ({
       ...prev,
@@ -196,6 +245,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('done', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     const completedJobId = data.jobId as string | undefined;
     update((prev) => {
@@ -237,6 +287,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('question', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     update((prev) => ({
       ...prev,
@@ -258,6 +309,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('plan_ready', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     update((prev) => ({
       ...prev,
@@ -279,6 +331,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('plan_review', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     update((prev) => ({
       ...prev,
@@ -300,6 +353,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('task_resolved', (e) => {
+    if (isStale()) return;
     const data = JSON.parse(e.data);
     const resolutions = (data.resolutions ?? []) as AnnotationResolution[];
     update((prev) => ({
@@ -313,6 +367,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.addEventListener('queue_drained', () => {
+    if (isStale()) return;
     update((prev) => ({
       ...prev,
       status: prev.status === 'error' ? 'error' : 'idle',
@@ -322,17 +377,20 @@ function connectBridge(bridgeUrl: string) {
       currentThinking: '',
       jobResponses: {},
       jobThinking: {},
+      lastErrorByJob: {},
       incrementalResolutions: [],
     }));
   });
 
   es.addEventListener('error', (e) => {
+    if (isStale()) return;
     if (es.readyState === EventSource.CLOSED) {
       update((prev) => ({
         ...prev,
         isConnected: false,
         status: 'disconnected',
       }));
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       reconnectTimer = setTimeout(() => {
         checkBridgeHealth(bridgeUrl).then((status) => {
           if (status) connectBridge(bridgeUrl);
@@ -341,6 +399,7 @@ function connectBridge(bridgeUrl: string) {
     } else if (e instanceof MessageEvent) {
       const data = JSON.parse(e.data);
       const errorJobId = (data.jobId ?? null) as string | null;
+      const errorMessage = (data.message ?? '') as string;
       update((prev) => {
         const newActiveJobIds = errorJobId
           ? prev.activeJobIds.filter(id => id !== errorJobId)
@@ -351,6 +410,9 @@ function connectBridge(bridgeUrl: string) {
           status: newStatus,
           activeJobIds: newActiveJobIds,
           lastCompletedJobId: errorJobId ?? prev.activeJobId,
+          lastErrorByJob: errorJobId && errorMessage
+            ? { ...prev.lastErrorByJob, [errorJobId]: errorMessage }
+            : prev.lastErrorByJob,
           events: [
             ...prev.events,
             { type: 'error', data, timestamp: Date.now() },
@@ -361,6 +423,7 @@ function connectBridge(bridgeUrl: string) {
   });
 
   es.onerror = () => {
+    if (isStale()) return;
     if (es.readyState === EventSource.CLOSED) {
       update((prev) => ({
         ...prev,
@@ -395,6 +458,7 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
       jobThinking: {},
       lastResponseText: null,
       lastThreadId: null,
+      lastErrorByJob: {},
       incrementalResolutions: [],
     }));
   }, []);

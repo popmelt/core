@@ -11,7 +11,7 @@ import {
   type PropsWithChildren,
 } from 'react';
 
-import { useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
+import { getSourceId, useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { addComponentToModel, approvePlan, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
@@ -619,6 +619,7 @@ export function PopmeltProvider({
         { width: window.innerWidth, height: window.innerHeight },
         manifest,
         feedbackJson,
+        getSourceId(),
       );
 
       setActivePlan({
@@ -767,6 +768,7 @@ export function PopmeltProvider({
       const { jobId, threadId: assignedThreadId } = await sendToBridge(
         stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id,
         pastedImages.size > 0 ? pastedImages : undefined,
+        getSourceId(),
       );
 
       // Clean up sent image blobs from the side-channel
@@ -811,7 +813,7 @@ export function PopmeltProvider({
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id, images);
+      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id, images, getSourceId());
 
       // Track the new continuation job (no specific annotations — reuses thread context)
       setInFlightJobs(prev => ({
@@ -904,6 +906,7 @@ export function PopmeltProvider({
         bridgeUrl,
         provider,
         currentModel.id,
+        getSourceId(),
       );
 
       // Collect ALL plan annotation IDs (rect + text) for in-flight tracking
@@ -1067,7 +1070,7 @@ export function PopmeltProvider({
         setActivePlan(prev => prev ? { ...prev, status: 'reviewing' } : null);
         const screenshotBlob = await captureFullPage(document.body);
         if (!screenshotBlob) return;
-        await sendPlanReview(activePlan.planId, screenshotBlob, bridgeUrl, provider, currentModel.id);
+        await sendPlanReview(activePlan.planId, screenshotBlob, bridgeUrl, provider, currentModel.id, getSourceId());
       } catch (err) {
         console.error('[Pare] Failed to trigger review:', err);
       }
@@ -1086,6 +1089,17 @@ export function PopmeltProvider({
   const handleViewThread = useCallback((threadId: string) => {
     setOpenThreadId(threadId);
   }, []);
+
+  const handleCancelJob = useCallback(async (jobId?: string) => {
+    try {
+      const url = jobId
+        ? `${bridgeUrl}/cancel?jobId=${jobId}`
+        : `${bridgeUrl}/cancel`;
+      await fetch(url, { method: 'POST' });
+    } catch {
+      // Best-effort
+    }
+  }, [bridgeUrl]);
 
   // Mutual exclusion: close thread panel when model/library panel opens
   useEffect(() => {
@@ -1210,6 +1224,7 @@ export function PopmeltProvider({
         onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
         mcpJustInstalled={mcpJustInstalled}
         bridgeUrl={bridgeUrl}
+        isBridgeConnected={bridge.isConnected}
         modelSelectedComponent={modelSelectedComponent}
         modelCanvasHoveredComponent={modelCanvasHoveredComponent}
         onModelComponentHover={setModelPanelHoveredComponent}
@@ -1230,6 +1245,8 @@ export function PopmeltProvider({
           streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
           onClose={() => setOpenThreadId(null)}
           onReply={handleReply}
+          onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
+          lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
           activePlan={activePlan}
           planAnnotations={activePlan ? state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text') : undefined}
           inFlightJobs={inFlightJobs}
@@ -1239,18 +1256,18 @@ export function PopmeltProvider({
         />
       )}
 
-      {bridge.isConnected && (
-        <BridgeEventStack
-          bridge={bridge}
-          bridgeUrl={bridgeUrl}
-          inFlightJobs={inFlightJobs}
-          isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
-          onHover={handleEventStreamHover}
-          clearSignal={clearSignal}
-          onReply={handleReply}
-          onViewThread={handleViewThread}
-        />
-      )}
+      <BridgeEventStack
+        bridge={bridge}
+        bridgeUrl={bridgeUrl}
+        inFlightJobs={inFlightJobs}
+        isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
+        onHover={handleEventStreamHover}
+        clearSignal={clearSignal}
+        onReply={handleReply}
+        onViewThread={handleViewThread}
+        onCancel={handleCancelJob}
+        isConnected={bridge.isConnected}
+      />
     </PopmeltContext.Provider>
   );
 }

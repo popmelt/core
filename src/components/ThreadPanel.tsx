@@ -45,6 +45,8 @@ type ThreadPanelProps = {
   streamingEvents?: BridgeEvent[];
   onClose: () => void;
   onReply?: (threadId: string, reply: string, images?: Blob[]) => void;
+  onCancel?: () => void;
+  lastError?: string;
   activePlan?: { planId: string; status: string; goal: string; tasks?: { id: string; instruction: string }[] } | null;
   planAnnotations?: PlanAnnotation[];
   inFlightJobs?: Record<string, { annotationIds: string[]; threadId?: string }>;
@@ -278,6 +280,8 @@ export function ThreadPanel({
   streamingEvents,
   onClose,
   onReply,
+  onCancel,
+  lastError,
   activePlan,
   planAnnotations,
   inFlightJobs,
@@ -763,8 +767,15 @@ export function ThreadPanel({
                   {streamPhase}
                 </span>
               )}
-              <span style={{ marginLeft: 'auto' }}>
+              <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
                 <ThinkingBadge color={accentColor} />
+                {onCancel && (
+                  <button onClick={onCancel} style={{
+                    background: 'none', border: '1px solid rgba(0,0,0,0.1)',
+                    color: '#6b7280', fontSize: 10, padding: '2px 8px',
+                    cursor: 'pointer', fontFamily: 'inherit',
+                  }}>Cancel</button>
+                )}
               </span>
             </div>
 
@@ -829,6 +840,17 @@ export function ThreadPanel({
           </div>
         )}
       </div>
+
+      {/* Error banner */}
+      {!isStreaming && lastError && (
+        <div style={{
+          padding: '8px 16px', backgroundColor: 'rgba(239, 68, 68, 0.06)',
+          borderBottom: '1px solid rgba(0,0,0,0.04)',
+          fontSize: 11, color: '#dc2626', lineHeight: 1.4,
+        }}>
+          <span style={{ fontWeight: 600 }}>Error: </span>{lastError}
+        </div>
+      )}
 
       {/* Reply area */}
       {onReply && (
