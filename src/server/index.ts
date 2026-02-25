@@ -12,5 +12,7 @@ export async function startPopmelt(
     );
   }
 
-  return createPopmelt(options);
+  const handle = await createPopmelt(options);
+  process.env.POPMELT_BRIDGE_PORT = String(handle.port);
+  return handle;
 }

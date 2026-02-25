@@ -21,10 +21,12 @@ export type PopmeltOptions = {
   claudePath?: string;
   provider?: Provider;
   timeoutMs?: number;
+  devOrigin?: string;
 };
 
 export type PopmeltHandle = {
   port: number;
+  projectId: string;
   close: () => Promise<void>;
 };
 

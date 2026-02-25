@@ -12,6 +12,8 @@ function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 15000
 
 export type BridgeStatus = {
   ok: boolean;
+  projectId?: string;
+  devOrigin?: string;
   activeJob: { id: string; status: string } | null;
   activeJobs?: { id: string; status: string }[];
   queueDepth: number;
@@ -69,6 +71,89 @@ export async function checkBridgeHealth(
   } catch {
     return null;
   }
+}
+
+/** Quick probe of a single bridge port. Returns BridgeStatus or null. */
+export async function probeBridgePort(port: number): Promise<BridgeStatus | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 500);
+    const res = await fetch(`http://localhost:${port}/status`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return (await res.json()) as BridgeStatus;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Discover the bridge port for this browser tab.
+ * Matches `window.location.origin` against each bridge's `devOrigin`.
+ *
+ * Fast path (single project on :1111) adds ~20ms.
+ * Worst case (9 ports probed): ~550ms (1 serial + 1 parallel batch).
+ */
+export async function discoverBridge(
+  explicitUrl?: string,
+): Promise<{ url: string; port: number } | null> {
+  const DEFAULT_URL = 'http://localhost:1111';
+  const BASE_PORT = 1111;
+  const MAX_PORTS = 9;
+
+  // User override — non-default URL means skip discovery
+  if (explicitUrl && explicitUrl !== DEFAULT_URL) {
+    try {
+      const u = new URL(explicitUrl);
+      return { url: explicitUrl, port: parseInt(u.port, 10) || BASE_PORT };
+    } catch {
+      return null;
+    }
+  }
+
+  const myOrigin = typeof window !== 'undefined' ? window.location.origin : null;
+
+  // Fast path: probe port 1111 first
+  const first = await probeBridgePort(BASE_PORT);
+  if (first) {
+    // If devOrigin matches or is null (not yet set), use it
+    if (!first.devOrigin || !myOrigin || first.devOrigin === myOrigin) {
+      return { url: `http://localhost:${BASE_PORT}`, port: BASE_PORT };
+    }
+  }
+
+  // Parallel probe remaining ports
+  const probes = Array.from({ length: MAX_PORTS - 1 }, (_, i) => {
+    const port = BASE_PORT + 1 + i;
+    return probeBridgePort(port).then(status => status ? { status, port } : null);
+  });
+
+  const results = (await Promise.all(probes)).filter(
+    (r): r is { status: BridgeStatus; port: number } => r !== null,
+  );
+
+  // Find a bridge whose devOrigin matches this tab
+  if (myOrigin) {
+    const match = results.find(r => r.status.devOrigin === myOrigin);
+    if (match) return { url: `http://localhost:${match.port}`, port: match.port };
+  }
+
+  // If exactly one bridge is running total (including :1111), use it (backward compat)
+  const allRunning = [
+    ...(first ? [{ port: BASE_PORT }] : []),
+    ...results.map(r => ({ port: r.port })),
+  ];
+  if (allRunning.length === 1) {
+    return { url: `http://localhost:${allRunning[0]!.port}`, port: allRunning[0]!.port };
+  }
+
+  // Multiple bridges, none match — fall back to first (1111) if available
+  if (first) return { url: `http://localhost:${BASE_PORT}`, port: BASE_PORT };
+  if (allRunning.length > 0) {
+    return { url: `http://localhost:${allRunning[0]!.port}`, port: allRunning[0]!.port };
+  }
+
+  return null;
 }
 
 export async function sendToBridge(

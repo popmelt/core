@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -64,11 +64,38 @@ function sendSSE(client: SSEClient, event: SSEEvent) {
   }
 }
 
+/** Probe a running bridge at the given port. Returns parsed /status JSON or null. */
+async function probeBridge(port: number): Promise<Record<string, unknown> | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 500);
+    const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return (await res.json()) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Try to bind an http.Server to a port. Resolves on success, rejects on error. */
+function listenOnPort(server: import('node:http').Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => { server.removeListener('listening', onListening); reject(err); };
+    const onListening = () => { server.removeListener('error', onError); resolve(); };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, '127.0.0.1');
+  });
+}
+
 export async function createPopmelt(
   options: PopmeltOptions = {},
 ): Promise<PopmeltHandle> {
-  const port = options.port ?? DEFAULT_PORT;
+  const basePort = options.port ?? DEFAULT_PORT;
   const projectRoot = options.projectRoot ?? process.cwd();
+  const projectId = createHash('sha256').update(projectRoot).digest('hex').slice(0, 12);
+  let devOrigin: string | null = options.devOrigin ?? null;
   const tempDir = options.tempDir ?? join(tmpdir(), 'popmelt-bridge');
   const maxTurns = options.maxTurns ?? 40;
   const maxBudgetUsd = options.maxBudgetUsd ?? 1.0;
@@ -76,6 +103,9 @@ export async function createPopmelt(
   const claudePath = options.claudePath ?? 'claude';
   const defaultProvider: Provider = options.provider ?? 'claude';
   const timeoutMs = options.timeoutMs;
+
+  // `port` is set after binding — all closures below capture via `boundPort`
+  let boundPort = basePort;
 
   // Probe for installed CLI providers
   type ProviderCapability = { available: boolean; path: string | null; mcp?: McpDetection };
@@ -200,7 +230,7 @@ export async function createPopmelt(
       });
     }
 
-    const tag = ansiColor(job.color, `[⊹ ${port}:${job.id}]`);
+    const tag = ansiColor(job.color, `[⊹ ${boundPort}:${job.id}]`);
     console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
 
     // Incremental resolution tracking for plan executor jobs
@@ -462,7 +492,7 @@ export async function createPopmelt(
       return;
     }
 
-    const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
+    const url = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const path = url.pathname;
 
     try {
@@ -761,7 +791,12 @@ export async function createPopmelt(
     // Send initial connection event
     res.write(`event: connected\ndata: {"status":"connected"}\n\n`);
 
-    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${port}`);
+    // Infer devOrigin from first SSE connection if not yet set
+    if (!devOrigin && req.headers.origin && isLocalhostOrigin(req.headers.origin)) {
+      devOrigin = req.headers.origin;
+    }
+
+    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const sourceId = reqUrl.searchParams.get('sourceId') || undefined;
     const client: SSEClient = { id: randomUUID().slice(0, 8), res, sourceId };
     sseClients.add(client);
@@ -775,6 +810,8 @@ export async function createPopmelt(
     const allActive = queue.allActive;
     sendJson(res, 200, {
       ok: true,
+      projectId,
+      devOrigin,
       activeJob: allActive[0]
         ? { id: allActive[0].id, status: allActive[0].status }
         : null,
@@ -785,7 +822,7 @@ export async function createPopmelt(
   }
 
   function handleCancel(req: IncomingMessage, res: ServerResponse) {
-    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${port}`);
+    const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const jobId = reqUrl.searchParams.get('jobId');
     const cancelled = jobId ? queue.cancelJob(jobId) : queue.cancelActive();
     sendJson(res, 200, { cancelled });
@@ -1199,19 +1236,21 @@ export async function createPopmelt(
   }
 
   function handleCanvasPage(req: IncomingMessage, res: ServerResponse) {
-    // Infer dev origin from Referer or Origin header, fallback to localhost:3000
-    let devOrigin = 'http://localhost:3000';
-    const referer = req.headers.referer || req.headers.origin;
-    if (referer) {
-      try {
-        const u = new URL(typeof referer === 'string' ? referer : referer[0] || '');
-        if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
-          devOrigin = u.origin;
-        }
-      } catch {}
+    // Use outer devOrigin if available, otherwise infer from Referer/Origin header
+    let canvasDevOrigin = devOrigin ?? 'http://localhost:3000';
+    if (!devOrigin) {
+      const referer = req.headers.referer || req.headers.origin;
+      if (referer) {
+        try {
+          const u = new URL(typeof referer === 'string' ? referer : referer[0] || '');
+          if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+            canvasDevOrigin = u.origin;
+          }
+        } catch {}
+      }
     }
 
-    const html = buildCanvasHtml(port, devOrigin);
+    const html = buildCanvasHtml(boundPort, canvasDevOrigin);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
   }
@@ -1283,48 +1322,62 @@ export async function createPopmelt(
     sendJson(res, 200, { id: thread.id, createdAt: thread.createdAt, messages });
   }
 
-  // Periodic cleanup
+  // Try ports basePort..basePort+8, distinguishing "our bridge" from "another project's bridge"
+  const MAX_PORT_ATTEMPTS = 9;
+  let didBind = false;
+
+  for (let tryPort = basePort; tryPort < basePort + MAX_PORT_ATTEMPTS; tryPort++) {
+    try {
+      await listenOnPort(server, tryPort);
+      boundPort = tryPort;
+      didBind = true;
+      console.log(`[⊹ is watching :${boundPort}]`);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        // Probe the occupant to check if it's our project or another one
+        const occupant = await probeBridge(tryPort);
+        if (occupant && occupant.projectId === projectId) {
+          // Same project already running (HMR restart) — return no-op handle
+          console.log(`[⊹ already watching :${tryPort}]`);
+          return { port: tryPort, projectId, close: async () => {} };
+        }
+        // Another project's bridge — try next port
+        continue;
+      }
+      // Non-EADDRINUSE error — fatal
+      throw err;
+    }
+  }
+
+  if (!didBind) {
+    throw new Error(`[Bridge] All ports ${basePort}–${basePort + MAX_PORT_ATTEMPTS - 1} in use`);
+  }
+
+  // Periodic cleanup (only after successful binding)
   const cleanupTimer = setInterval(() => {
     cleanupTempDir(tempDir).catch(() => {});
   }, CLEANUP_INTERVAL_MS);
 
-  return new Promise<PopmeltHandle>((resolve, reject) => {
-    server.on('error', (err) => {
-      // If port is in use, the server is likely already running — treat as success
-      if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-        console.log(`[⊹ already watching :${port}]`);
-        resolve({
-          port,
-          close: async () => {},
-        });
-        return;
+  return {
+    port: boundPort,
+    projectId,
+    close: async () => {
+      clearInterval(cleanupTimer);
+      await queue.destroyAsync();
+
+      for (const client of sseClients) {
+        try {
+          client.res.end();
+        } catch {}
       }
-      reject(err);
-    });
+      sseClients.clear();
 
-    server.listen(port, '127.0.0.1', () => {
-      console.log(`[⊹ is watching :${port}]`);
-
-      resolve({
-        port,
-        close: async () => {
-          clearInterval(cleanupTimer);
-          await queue.destroyAsync();
-
-          for (const client of sseClients) {
-            try {
-              client.res.end();
-            } catch {}
-          }
-          sseClients.clear();
-
-          return new Promise<void>((res) => {
-            server.close(() => res());
-          });
-        },
+      return new Promise<void>((res) => {
+        server.close(() => res());
       });
-    });
-  });
+    },
+  };
 }
 
 async function cleanupTempDir(tempDir: string) {

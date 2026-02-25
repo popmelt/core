@@ -11,7 +11,7 @@ import {
   type PropsWithChildren,
 } from 'react';
 
-import { getSourceId, useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
+import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { addComponentToModel, approvePlan, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
@@ -34,7 +34,6 @@ type PopmeltProviderProps = PropsWithChildren<{
   bridgeUrl?: string;
 }>;
 
-const DEFAULT_BRIDGE_URL = 'http://localhost:1111';
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
 const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
@@ -64,10 +63,13 @@ function equivalentModelIndex(fromProvider: string, toProvider: string, currentI
 export function PopmeltProvider({
   children,
   enabled = process.env.NODE_ENV === 'development',
-  bridgeUrl = DEFAULT_BRIDGE_URL,
+  bridgeUrl = 'http://localhost:1111',
 }: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
   const bridge = useBridgeConnection(bridgeUrl);
+
+  // Track the resolved bridge URL (after discovery)
+  const resolvedBridgeUrl = getDiscoveredBridgeUrl() ?? bridgeUrl;
   const annotationImagesRef = useRef(new Map<string, Blob[]>());
   const [provider, setProvider] = useState<string>(() => {
     if (typeof window === 'undefined') return 'claude';
@@ -89,7 +91,7 @@ export function PopmeltProvider({
   // Fetch capabilities when bridge connects
   useEffect(() => {
     if (!bridge.isConnected) return;
-    fetchCapabilities(bridgeUrl).then(caps => {
+    fetchCapabilities(resolvedBridgeUrl).then(caps => {
       if (!caps) return;
       const available = Object.entries(caps.providers)
         .filter(([, v]) => v.available)
@@ -106,7 +108,7 @@ export function PopmeltProvider({
       const allConfigured = Object.values(mcp).every(s => s.found);
       if (allConfigured) setMcpJustInstalled(false);
     });
-  }, [bridge.isConnected, bridgeUrl]);
+  }, [bridge.isConnected, resolvedBridgeUrl]);
 
   // Auto-switch provider if current one isn't available
   useEffect(() => {
@@ -136,7 +138,7 @@ export function PopmeltProvider({
   }, []);
 
   const handleInstallMcp = useCallback(async () => {
-    const result = await installMcp(bridgeUrl);
+    const result = await installMcp(resolvedBridgeUrl);
     if (!result) return;
     const mcp: Record<string, McpDetectionResult> = {};
     for (const [name, p] of Object.entries(result.capabilities.providers)) {
@@ -146,7 +148,7 @@ export function PopmeltProvider({
     if (result.results.some(r => r.installed)) {
       setMcpJustInstalled(true);
     }
-  }, [bridgeUrl]);
+  }, [resolvedBridgeUrl]);
 
   // Model tool state: track component names in the local design model
   const [modelComponentNames, setModelComponentNames] = useState<Set<string>>(new Set());
@@ -159,18 +161,18 @@ export function PopmeltProvider({
   // Fetch model component names on mount and when bridge connects
   useEffect(() => {
     if (!bridge.isConnected) return;
-    fetchModel(bridgeUrl).then(model => {
+    fetchModel(resolvedBridgeUrl).then(model => {
       if (model?.components) {
         setModelComponentNames(new Set(Object.keys(model.components)));
       }
     });
-  }, [bridge.isConnected, bridgeUrl]);
+  }, [bridge.isConnected, resolvedBridgeUrl]);
 
   const handleModelComponentsAdd = useCallback(async (names: string[]) => {
     const added: string[] = [];
     for (const name of names) {
       try {
-        const result = await addComponentToModel(name, bridgeUrl);
+        const result = await addComponentToModel(name, resolvedBridgeUrl);
         if (result.added) {
           added.push(name);
         }
@@ -186,7 +188,7 @@ export function PopmeltProvider({
       });
       setModelSelectedComponent(added[added.length - 1]!);
     }
-  }, [bridgeUrl]);
+  }, [resolvedBridgeUrl]);
 
   const handleModelComponentFocus = useCallback((name: string) => {
     setModelSelectedComponent(name);
@@ -194,16 +196,16 @@ export function PopmeltProvider({
 
   const handleModelComponentAdded = useCallback(() => {
     // Re-fetch model to update component names
-    fetchModel(bridgeUrl).then(model => {
+    fetchModel(resolvedBridgeUrl).then(model => {
       if (model?.components) {
         setModelComponentNames(new Set(Object.keys(model.components)));
       }
     });
-  }, [bridgeUrl]);
+  }, [resolvedBridgeUrl]);
 
   const handleModelComponentRemoved = useCallback(async (name: string) => {
     try {
-      const result = await removeComponentFromModel(name, bridgeUrl);
+      const result = await removeComponentFromModel(name, resolvedBridgeUrl);
       if (result.removed) {
         setModelComponentNames(prev => {
           const next = new Set(prev);
@@ -214,7 +216,7 @@ export function PopmeltProvider({
     } catch (err) {
       console.error('[Popmelt] Failed to remove component from model:', err);
     }
-  }, [bridgeUrl]);
+  }, [resolvedBridgeUrl]);
 
   // Undo-tracked spacing token modification: dispatches to reducer so Cmd+Z works
   const handleModifySpacingToken = useCallback((mod: SpacingTokenMod, change: SpacingTokenChange) => {
@@ -250,12 +252,12 @@ export function PopmeltProvider({
 
       if (mod.currentValue === '__deleted__') {
         // Token was deleted (or redo'd to deleted state) — remove from bridge
-        removeModelToken(path, bridgeUrl).catch(err =>
+        removeModelToken(path, resolvedBridgeUrl).catch(err =>
           console.error('[Popmelt] Failed to sync token delete:', err)
         );
       } else {
         // Token was modified (or undo restored a value) — update on bridge
-        updateModelToken(path, mod.currentValue, bridgeUrl).catch(err =>
+        updateModelToken(path, mod.currentValue, resolvedBridgeUrl).catch(err =>
           console.error('[Popmelt] Failed to sync token update:', err)
         );
       }
@@ -282,7 +284,7 @@ export function PopmeltProvider({
       needsRefresh = true;
 
       // Restore original value on bridge
-      updateModelToken(path, prevMod.originalValue, bridgeUrl).catch(err =>
+      updateModelToken(path, prevMod.originalValue, resolvedBridgeUrl).catch(err =>
         console.error('[Popmelt] Failed to restore token on undo:', err)
       );
 
@@ -297,13 +299,16 @@ export function PopmeltProvider({
     if (needsRefresh) {
       setModelRefreshKey(k => k + 1);
     }
-  }, [state.spacingTokenMods, bridgeUrl]);
+  }, [state.spacingTokenMods, resolvedBridgeUrl]);
 
   // Thread panel state (declared early so callbacks can reference setOpenThreadId)
   const [openThreadId, setOpenThreadId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(THREAD_ID_STORAGE_KEY) || null;
   });
+
+  // ThreadIds whose annotations were deleted — BridgeEventStack hides matching entries
+  const [dismissedThreadIds, setDismissedThreadIds] = useState<Set<string>>(new Set());
 
   // Active plan state
   const [activePlan, setActivePlan] = useState<{
@@ -612,7 +617,7 @@ export function PopmeltProvider({
       const { planId, threadId } = await sendPlanToBridge(
         screenshotBlob,
         goal,
-        bridgeUrl,
+        resolvedBridgeUrl,
         provider,
         currentModel.id,
         window.location.href,
@@ -648,7 +653,7 @@ export function PopmeltProvider({
       console.error('[Pare] Failed to send plan:', err);
       return false;
     }
-  }, [bridgeUrl, provider, currentModel.id, state.annotations, state.styleModifications, state.inspectedElement, dispatch]);
+  }, [resolvedBridgeUrl, provider, currentModel.id, state.annotations, state.styleModifications, state.inspectedElement, dispatch]);
 
   // Materialize plan tasks as annotations on the canvas
   const materializePlan = useCallback(async (tasks: PendingPlan['tasks']) => {
@@ -766,7 +771,7 @@ export function PopmeltProvider({
     try {
       const hexColor = cssColorToHex(state.activeColor);
       const { jobId, threadId: assignedThreadId } = await sendToBridge(
-        stitchedBlob, feedbackJson, bridgeUrl, hexColor, provider, currentModel.id,
+        stitchedBlob, feedbackJson, resolvedBridgeUrl, hexColor, provider, currentModel.id,
         pastedImages.size > 0 ? pastedImages : undefined,
         getSourceId(),
       );
@@ -807,13 +812,13 @@ export function PopmeltProvider({
       console.error('[Pare] Failed to send to bridge:', err);
       return false;
     }
-  }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, bridgeUrl, provider, currentModel.id]);
+  }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, resolvedBridgeUrl, provider, currentModel.id]);
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
     try {
       const hexColor = cssColorToHex(state.activeColor);
-      const { jobId } = await sendReplyToBridge(threadId, reply, bridgeUrl, hexColor, provider, currentModel.id, images, getSourceId());
+      const { jobId } = await sendReplyToBridge(threadId, reply, resolvedBridgeUrl, hexColor, provider, currentModel.id, images, getSourceId());
 
       // Track the new continuation job (no specific annotations — reuses thread context)
       setInFlightJobs(prev => ({
@@ -853,7 +858,7 @@ export function PopmeltProvider({
     } catch (err) {
       console.error('[Pare] Failed to send reply:', err);
     }
-  }, [state.activeColor, state.annotations, bridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
+  }, [state.activeColor, state.annotations, resolvedBridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
 
   // Handle plan approval: single-session execution for all tasks
   const handleApprovePlan = useCallback(async () => {
@@ -861,7 +866,7 @@ export function PopmeltProvider({
 
     try {
       // Approve on server side
-      await approvePlan(activePlan.planId, bridgeUrl);
+      await approvePlan(activePlan.planId, resolvedBridgeUrl);
 
       setActivePlan(prev => prev ? { ...prev, status: 'executing' } : null);
 
@@ -903,7 +908,7 @@ export function PopmeltProvider({
         screenshotBlob,
         activePlan.planId,
         tasks,
-        bridgeUrl,
+        resolvedBridgeUrl,
         provider,
         currentModel.id,
         getSourceId(),
@@ -946,7 +951,7 @@ export function PopmeltProvider({
     } catch (err) {
       console.error('[Pare] Failed to approve plan:', err);
     }
-  }, [activePlan, state.annotations, state.activeColor, bridgeUrl, provider, currentModel.id, dispatch]);
+  }, [activePlan, state.annotations, state.activeColor, resolvedBridgeUrl, provider, currentModel.id, dispatch]);
 
   const handleDismissPlan = useCallback(() => {
     setActivePlan(null);
@@ -1070,12 +1075,12 @@ export function PopmeltProvider({
         setActivePlan(prev => prev ? { ...prev, status: 'reviewing' } : null);
         const screenshotBlob = await captureFullPage(document.body);
         if (!screenshotBlob) return;
-        await sendPlanReview(activePlan.planId, screenshotBlob, bridgeUrl, provider, currentModel.id, getSourceId());
+        await sendPlanReview(activePlan.planId, screenshotBlob, resolvedBridgeUrl, provider, currentModel.id, getSourceId());
       } catch (err) {
         console.error('[Pare] Failed to trigger review:', err);
       }
     })();
-  }, [activePlan, inFlightJobs, state.annotations, bridgeUrl, provider, currentModel.id]);
+  }, [activePlan, inFlightJobs, state.annotations, resolvedBridgeUrl, provider, currentModel.id]);
 
   // Compute the active job's annotation color for the toolbar spinner
   const activeJobColor = useMemo(() => {
@@ -1093,13 +1098,13 @@ export function PopmeltProvider({
   const handleCancelJob = useCallback(async (jobId?: string) => {
     try {
       const url = jobId
-        ? `${bridgeUrl}/cancel?jobId=${jobId}`
-        : `${bridgeUrl}/cancel`;
+        ? `${resolvedBridgeUrl}/cancel?jobId=${jobId}`
+        : `${resolvedBridgeUrl}/cancel`;
       await fetch(url, { method: 'POST' });
     } catch {
       // Best-effort
     }
-  }, [bridgeUrl]);
+  }, [resolvedBridgeUrl]);
 
   // Mutual exclusion: close thread panel when model/library panel opens
   useEffect(() => {
@@ -1159,6 +1164,8 @@ export function PopmeltProvider({
   const handleClearEventStream = useCallback(() => {
     setClearSignal((s) => s + 1);
     bridge.clearEvents();
+    setOpenThreadId(null);
+    setDismissedThreadIds(new Set());
   }, [bridge.clearEvents]);
 
   // Cleanup hide timeout
@@ -1191,6 +1198,10 @@ export function PopmeltProvider({
         onAttachImages={handleAttachImages}
         onReply={bridge.isConnected ? handleReply : undefined}
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
+        onCloseThread={(threadId) => {
+          setOpenThreadId(null);
+          if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
+        }}
         activePlan={activePlan}
         onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
         onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
@@ -1223,7 +1234,7 @@ export function PopmeltProvider({
         mcpStatus={mcpStatus}
         onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
         mcpJustInstalled={mcpJustInstalled}
-        bridgeUrl={bridgeUrl}
+        bridgeUrl={resolvedBridgeUrl}
         isBridgeConnected={bridge.isConnected}
         modelSelectedComponent={modelSelectedComponent}
         modelCanvasHoveredComponent={modelCanvasHoveredComponent}
@@ -1239,7 +1250,7 @@ export function PopmeltProvider({
       {openThreadId && bridge.isConnected && (
         <ThreadPanel
           threadId={openThreadId}
-          bridgeUrl={bridgeUrl}
+          bridgeUrl={resolvedBridgeUrl}
           accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
           isStreaming={threadActiveJobId !== null}
           streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
@@ -1258,7 +1269,7 @@ export function PopmeltProvider({
 
       <BridgeEventStack
         bridge={bridge}
-        bridgeUrl={bridgeUrl}
+        bridgeUrl={resolvedBridgeUrl}
         inFlightJobs={inFlightJobs}
         isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
         onHover={handleEventStreamHover}
@@ -1267,6 +1278,7 @@ export function PopmeltProvider({
         onViewThread={handleViewThread}
         onCancel={handleCancelJob}
         isConnected={bridge.isConnected}
+        dismissedThreadIds={dismissedThreadIds}
       />
     </PopmeltContext.Provider>
   );

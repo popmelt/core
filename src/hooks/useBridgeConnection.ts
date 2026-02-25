@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import type { AnnotationResolution } from '../tools/types';
-import { checkBridgeHealth } from '../utils/bridge-client';
+import { checkBridgeHealth, discoverBridge } from '../utils/bridge-client';
 
 export type BridgeEvent = {
   type: string;
@@ -101,6 +101,52 @@ let activeEs: EventSource | null = null;
 let activeBridgeUrl: string | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let connectionGeneration = 0;
+
+// ---------------------------------------------------------------------------
+// Bridge discovery cache — survives React remounts
+// ---------------------------------------------------------------------------
+
+let discoveredBridgeUrl: string | null = null;
+let discoveryPromise: Promise<string | null> | null = null;
+
+/**
+ * Discover and cache the correct bridge URL for this tab.
+ * - Explicit non-default URL → use it directly (user override).
+ * - Already discovered → return cached.
+ * - Otherwise → run discoverBridge(), cache result.
+ */
+async function ensureDiscovered(explicitUrl?: string): Promise<string | null> {
+  const DEFAULT_URL = 'http://localhost:1111';
+
+  // Explicit non-default URL — user override, skip discovery
+  if (explicitUrl && explicitUrl !== DEFAULT_URL) {
+    discoveredBridgeUrl = explicitUrl;
+    return explicitUrl;
+  }
+
+  // Already discovered
+  if (discoveredBridgeUrl) return discoveredBridgeUrl;
+
+  // Discovery in progress — await existing promise
+  if (discoveryPromise) return discoveryPromise;
+
+  // Run discovery
+  discoveryPromise = discoverBridge(explicitUrl).then((result) => {
+    discoveredBridgeUrl = result?.url ?? null;
+    discoveryPromise = null;
+    return discoveredBridgeUrl;
+  }).catch(() => {
+    discoveryPromise = null;
+    return null;
+  });
+
+  return discoveryPromise;
+}
+
+/** Return the discovered bridge URL (or null if not yet discovered). */
+export function getDiscoveredBridgeUrl(): string | null {
+  return discoveredBridgeUrl;
+}
 
 function getSnapshot(): BridgeConnectionState {
   return store;
@@ -441,10 +487,13 @@ function connectBridge(bridgeUrl: string) {
 export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-  // Connect on mount (idempotent — won't reconnect if already connected)
+  // Connect on mount — discover the correct port first
   useEffect(() => {
-    checkBridgeHealth(bridgeUrl).then((status) => {
-      if (status) connectBridge(bridgeUrl);
+    ensureDiscovered(bridgeUrl).then((url) => {
+      if (!url) return;
+      checkBridgeHealth(url).then((status) => {
+        if (status) connectBridge(url);
+      });
     });
   }, [bridgeUrl]);
 
