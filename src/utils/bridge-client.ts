@@ -116,8 +116,8 @@ export async function discoverBridge(
   // Fast path: probe port 1111 first
   const first = await probeBridgePort(BASE_PORT);
   if (first) {
-    // If devOrigin matches or is null (not yet set), use it
-    if (!first.devOrigin || !myOrigin || first.devOrigin === myOrigin) {
+    // Positive devOrigin match → use it immediately
+    if (first.devOrigin && myOrigin && first.devOrigin === myOrigin) {
       return { url: `http://localhost:${BASE_PORT}`, port: BASE_PORT };
     }
   }
@@ -132,22 +132,23 @@ export async function discoverBridge(
     (r): r is { status: BridgeStatus; port: number } => r !== null,
   );
 
+  // Collect all running bridges (including :1111)
+  const allRunning: Array<{ port: number; devOrigin?: string }> = [];
+  if (first) allRunning.push({ port: BASE_PORT, devOrigin: first.devOrigin });
+  for (const r of results) allRunning.push({ port: r.port, devOrigin: r.status.devOrigin });
+
   // Find a bridge whose devOrigin matches this tab
   if (myOrigin) {
-    const match = results.find(r => r.status.devOrigin === myOrigin);
+    const match = allRunning.find(r => r.devOrigin === myOrigin);
     if (match) return { url: `http://localhost:${match.port}`, port: match.port };
   }
 
-  // If exactly one bridge is running total (including :1111), use it (backward compat)
-  const allRunning = [
-    ...(first ? [{ port: BASE_PORT }] : []),
-    ...results.map(r => ({ port: r.port })),
-  ];
+  // If exactly one bridge is running total, use it (single-project backward compat)
   if (allRunning.length === 1) {
     return { url: `http://localhost:${allRunning[0]!.port}`, port: allRunning[0]!.port };
   }
 
-  // Multiple bridges, none match — fall back to first (1111) if available
+  // Multiple bridges, none matched — fall back to first (1111) if available
   if (first) return { url: `http://localhost:${BASE_PORT}`, port: BASE_PORT };
   if (allRunning.length > 0) {
     return { url: `http://localhost:${allRunning[0]!.port}`, port: allRunning[0]!.port };

@@ -95,7 +95,8 @@ export async function createPopmelt(
   const basePort = options.port ?? DEFAULT_PORT;
   const projectRoot = options.projectRoot ?? process.cwd();
   const projectId = createHash('sha256').update(projectRoot).digest('hex').slice(0, 12);
-  let devOrigin: string | null = options.devOrigin ?? null;
+  let devOrigin: string | null = options.devOrigin
+    ?? (process.env.PORT ? `http://localhost:${process.env.PORT}` : null);
   const tempDir = options.tempDir ?? join(tmpdir(), 'popmelt-bridge');
   const maxTurns = options.maxTurns ?? 40;
   const maxBudgetUsd = options.maxBudgetUsd ?? 1.0;

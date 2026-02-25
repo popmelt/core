@@ -936,6 +936,7 @@ export function PopmeltProvider({
           annotationIds: allPlanAnnotationIds,
           styleSelectors: [],
           color: state.activeColor,
+          threadId: activePlan.threadId,
           planId: activePlan.planId,
         },
       }));

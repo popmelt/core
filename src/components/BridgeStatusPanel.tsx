@@ -24,6 +24,7 @@ type BridgeEventStackProps = {
   onViewThread?: (threadId: string) => void;
   onCancel?: (jobId: string) => void;
   isConnected?: boolean;
+  dismissedThreadIds?: Set<string>;
 };
 
 type StreamEntry = {
@@ -38,13 +39,18 @@ type StreamEntry = {
 
 const stackContainerStyle: CSSProperties = {
   position: 'fixed',
-  bottom: 70,
+  bottom: 86,
   right: 16,
   zIndex: 9999,
   display: 'flex',
   flexDirection: 'column',
-  gap: 10,
 };
+
+// Stacking constants — row height must approximate actual rendered height
+const ROW_HEIGHT = 24; // 4+4 padding + ~14 text + 2 border
+const PEEK_PX = 6;
+const COLLAPSED_OVERLAP = ROW_HEIGHT - PEEK_PX; // negative margin to hide most of each card
+const EXPANDED_GAP = 8;
 
 const rowStyle: CSSProperties = {
   display: 'flex',
@@ -232,8 +238,9 @@ function SwipeDismiss({ onDismiss, children }: { onDismiss: () => void; children
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, isConnected }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
+  const [isHovered, setIsHovered] = useState(false);
 
   // Clear on signal
   useEffect(() => {
@@ -242,24 +249,49 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     }
   }, [clearSignal]);
 
-  // Add new jobs from inFlightJobs + fallback from bridge.activeJobIds after HMR remount
+  // Remove entries whose thread was dismissed (annotation deleted)
+  useEffect(() => {
+    if (!dismissedThreadIds || dismissedThreadIds.size === 0) return;
+    setEntries((prev) => {
+      const filtered = prev.filter((e) => !e.threadId || !dismissedThreadIds.has(e.threadId));
+      return filtered.length === prev.length ? prev : filtered;
+    });
+  }, [dismissedThreadIds]);
+
+  // Add new jobs from inFlightJobs + fallback from bridge.activeJobIds after HMR remount.
+  // Also backfill threadId/color on existing entries when inFlightJobs arrives after a
+  // race with the SSE job_started event.
   useEffect(() => {
     setEntries((prev) => {
       const existingIds = new Set(prev.map((e) => e.jobId));
-      const newEntries = [...prev];
+      let changed = false;
+      const newEntries = prev.map((entry) => {
+        const job = inFlightJobs[entry.jobId];
+        if (job && (!entry.threadId || entry.color === '#888')) {
+          changed = true;
+          return {
+            ...entry,
+            threadId: entry.threadId || job.threadId,
+            color: entry.color === '#888' ? job.color : entry.color,
+          };
+        }
+        return entry;
+      });
       for (const [jobId, job] of Object.entries(inFlightJobs)) {
         if (!existingIds.has(jobId)) {
           newEntries.push({ jobId, color: job.color, status: 'queued', threadId: job.threadId });
+          changed = true;
         }
       }
       // Safety net: if bridge reports active jobs not tracked by inFlightJobs
       // (e.g. sessionStorage unavailable), create fallback entries
       for (const jobId of bridge.activeJobIds) {
-        if (!existingIds.has(jobId) && !inFlightJobs[jobId]) {
+        if (!existingIds.has(jobId) && !newEntries.some(e => e.jobId === jobId)) {
           newEntries.push({ jobId, color: '#888', status: 'working' });
+          changed = true;
         }
       }
-      return newEntries.length !== prev.length ? newEntries : prev;
+      return changed ? newEntries : prev;
     });
   }, [inFlightJobs, bridge.activeJobIds]);
 
@@ -303,14 +335,19 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
 
   if (!isVisible || (entries.length === 0 && isConnected !== false)) return null;
 
+  const collapsed = !isHovered && entries.length > 1;
+
   return (
     <div
       style={stackContainerStyle}
       data-devtools
-      onMouseEnter={() => onHover(true)}
-      onMouseLeave={() => onHover(false)}
+      onMouseEnter={() => { setIsHovered(true); onHover(true); }}
+      onMouseLeave={() => { setIsHovered(false); onHover(false); }}
     >
-      {entries.map((entry) => {
+      {entries.map((entry, i) => {
+        const isLast = i === entries.length - 1;
+        const distFromFront = entries.length - 1 - i;
+
         const label =
           entry.status === 'working'
             ? formatStepText(bridge.events.filter(e => e.data.jobId === entry.jobId))
@@ -325,27 +362,52 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                     : 'Error';
 
         return (
-          <SwipeDismiss key={entry.jobId} onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
-            <div
-              style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
-              onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
-              title={entry.errorMessage || undefined}
-            >
-              {entry.status === 'working' && <DotSpinner color={entry.color} />}
-              {entry.status === 'queued' && <ColorSquare color={entry.color} />}
-              {entry.status === 'done' && <Checkmark color={entry.color} />}
-              {entry.status === 'error' && <ErrorDot />}
-              <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
-              {entry.status === 'working' && onCancel && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); onCancel(entry.jobId); }}
-                  style={{ background: 'none', border: 'none', cursor: 'pointer',
-                           color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
-                  title="Cancel"
-                >×</button>
-              )}
-            </div>
-          </SwipeDismiss>
+          <div
+            key={entry.jobId}
+            style={{
+              position: 'relative',
+              zIndex: i,
+              marginBottom: collapsed
+                ? (isLast ? 0 : -COLLAPSED_OVERLAP)
+                : (isLast ? 0 : EXPANDED_GAP),
+              transform: collapsed
+                ? `scale(${Math.max(0.94, 1 - distFromFront * 0.02)})`
+                : 'scale(1)',
+              opacity: collapsed ? Math.max(0.5, 1 - distFromFront * 0.15) : 1,
+              transformOrigin: 'bottom right',
+              transition: 'margin-bottom 250ms ease, transform 250ms ease, opacity 250ms ease',
+            }}
+          >
+            <SwipeDismiss onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
+              <div
+                style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
+                onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
+                title={entry.errorMessage || undefined}
+              >
+                {entry.status === 'working' && <DotSpinner color={entry.color} />}
+                {entry.status === 'queued' && <ColorSquare color={entry.color} />}
+                {entry.status === 'done' && <Checkmark color={entry.color} />}
+                {entry.status === 'error' && <ErrorDot />}
+                <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
+                {entry.status === 'working' && onCancel && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onCancel(entry.jobId); }}
+                    style={{ background: 'none', border: 'none', cursor: 'pointer',
+                             color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+                    title="Cancel"
+                  >×</button>
+                )}
+                {(entry.status === 'done' || entry.status === 'error') && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setEntries(prev => prev.filter(el => el.jobId !== entry.jobId)); }}
+                    style={{ background: 'none', border: 'none', cursor: 'pointer',
+                             color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+                    title="Dismiss"
+                  >×</button>
+                )}
+              </div>
+            </SwipeDismiss>
+          </div>
         );
       })}
       {isConnected === false && entries.length > 0 && (
