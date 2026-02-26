@@ -52,19 +52,51 @@ export default function App() {
 
 ### Backend
 
-Start the bridge server so Popmelt can talk to Claude/Codex. In Next.js, `instrumentation.ts` is the cleanest place:
+Start the bridge server so Popmelt can talk to Claude/Codex. Use the plugin for your framework:
+
+**Next.js** — wrap your config:
 
 ```ts
-// instrumentation.ts (Next.js)
-export async function register() {
-  if (process.env.NODE_ENV === 'development' && process.env.NEXT_RUNTIME === 'nodejs') {
-    const { startPopmelt } = await import('@popmelt.com/core/server');
-    await startPopmelt({ port: 1111 });
-  }
-}
+// next.config.ts
+import { withPopmelt } from '@popmelt.com/core/next';
+export default withPopmelt(nextConfig);
 ```
 
-For other frameworks, call `startPopmelt()` anywhere in your dev server startup.
+**Vite**:
+
+```ts
+// vite.config.ts
+import { popmelt } from '@popmelt.com/core/vite';
+export default defineConfig({ plugins: [popmelt()] });
+```
+
+**Astro**:
+
+```ts
+// astro.config.mjs
+import { popmelt } from '@popmelt.com/core/astro';
+export default defineConfig({ integrations: [popmelt()] });
+```
+
+**Other frameworks** — call `startPopmelt()` in your dev server startup:
+
+```ts
+import { startPopmelt } from '@popmelt.com/core/server';
+await startPopmelt();
+```
+
+### CLI
+
+Run the bridge standalone if you prefer not to integrate it into your dev server:
+
+```bash
+# standalone bridge server
+npx @popmelt.com/core bridge
+
+# bridge + dev server together
+npx @popmelt.com/core wrap -- next dev
+npx @popmelt.com/core wrap -- vite
+```
 
 ### That's it
 
@@ -102,21 +134,18 @@ Switch to the Handle tool (`H`) and hover any element to see draggable handles f
 
 All changes apply as inline styles instantly. Hold Cmd/Alt and swipe on a flex container to cycle `justify-content` or `flex-direction`; hold Shift and swipe to cycle `align-items`. Cmd+Z / Cmd+Shift+Z to undo/redo any change.
 
+Right-click any element in Handle mode to open the **style panel** for full control over layout (flex/grid direction, alignment, gap, sizing), typography (size, weight, line-height, letter-spacing, color), backgrounds, borders, and effects. Every modification is tracked and included in the feedback sent to your AI.
+
 <p align="center">
   <img src="src/assets/bar - handle.png" alt="Handle tool guidance" width="360" style="border-radius: 12px;" />
 </p>
 
-### Style panel
-
-Right-click any element with the Comment tool to open the style panel. Edit layout (flex/grid direction, alignment, gap, sizing), typography (size, weight, line-height, letter-spacing, color), backgrounds, borders, and effects. Every modification is tracked and included in the feedback sent to your AI.
-
 ### AI Collaboration
 
-Cmd+Enter captures a full-page screenshot with your annotations baked in, bundles it with structured feedback (element selectors, style diffs, annotation text), and sends it to Claude or Codex via a local bridge server. Your AI reads the screenshot, sees exactly what you marked up, and edits your code. Cmd+C copies the screenshot to your clipboard instead.
+Cmd+Enter captures an annotated screenshot with your annotations baked in, bundles it with structured feedback (element selectors, style diffs, annotation text), and sends it to Claude or Codex via a local bridge server. Your AI reads the screenshot, sees exactly what you marked up, and edits your code. Cmd+C copies the screenshot to your clipboard instead.
 
 - **Threaded conversations** — follow-up annotations on the same element continue the existing thread. Your AI sees prior context without re-explaining.
 - **Questions** — if your AI needs clarification, it asks. A badge appears on the annotation; reply inline and the conversation continues.
-- **Multi-task plans** — prefix your annotation with `/plan` and your AI decomposes the work into spatial tasks, each pinned to a region of the UI. Approve and they execute in sequence.
 - **Provider switching** — toggle between Claude (Opus/Sonnet) and Codex at any time. Popmelt handles both.
 
 <p align="center">
@@ -144,14 +173,17 @@ Thread history persists to `.popmelt/threads.json` in your project root for cros
 
 ```ts
 await startPopmelt({
-  port: 1111,            // bridge server port (default: 1111)
+  port: 1111,            // bridge server port (default: 1111, auto-selects 1111–1119 if occupied)
   projectRoot: '.',      // working directory for your AI
   claudePath: 'claude',  // path to Claude CLI binary
-  maxTurns: 10,          // max turns per job
+  provider: 'claude',    // 'claude' | 'codex'
+  maxTurns: 40,          // max turns per job
+  maxBudgetUsd: 1.0,     // spending cap per job
+  timeoutMs: undefined,  // optional job timeout
 });
 ```
 
-Returns `{ port: number, close: () => Promise<void> }`.
+Returns `{ port: number, projectId: string, close: () => Promise<void> }`.
 
 ### `usePopmelt()`
 
