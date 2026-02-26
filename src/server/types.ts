@@ -125,7 +125,8 @@ export type SSEEvent =
   | { type: 'queue_drained' }
   | { type: 'materialize_started'; decisionIds: string[] }
   | { type: 'materialize_done'; decisionIds: string[]; success: boolean; error?: string }
-  | { type: 'novel_patterns'; jobId: string; patterns: NovelPattern[]; threadId?: string };
+  | { type: 'novel_patterns'; jobId: string; patterns: NovelPattern[]; threadId?: string }
+  | { type: 'capabilities_changed'; data: Record<string, unknown> };
 
 export type NovelPattern = {
   category: 'token' | 'component' | 'element';

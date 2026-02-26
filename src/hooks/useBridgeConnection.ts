@@ -55,6 +55,7 @@ export type BridgeConnectionState = {
   pendingPlans: PendingPlan[];
   planReviews: PlanReviewResult[];
   incrementalResolutions: AnnotationResolution[];
+  capabilitiesVersion: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ const INITIAL_STATE: BridgeConnectionState = {
   pendingPlans: [],
   planReviews: [],
   incrementalResolutions: [],
+  capabilitiesVersion: 0,
 };
 
 let store: BridgeConnectionState = { ...INITIAL_STATE };
@@ -409,6 +411,14 @@ function connectBridge(bridgeUrl: string) {
         ...prev.events,
         { type: 'task_resolved', data, timestamp: Date.now() },
       ],
+    }));
+  });
+
+  es.addEventListener('capabilities_changed', () => {
+    if (isStale()) return;
+    update((prev) => ({
+      ...prev,
+      capabilitiesVersion: prev.capabilitiesVersion + 1,
     }));
   });
 

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -118,6 +118,41 @@ export async function createPopmelt(
     } catch {
       capabilities[cli] = { available: false, path: null };
     }
+  }
+
+  /** Fire a trivial CLI invocation to prime OS caches (DNS, TLS, project index). */
+  function warmUpCli(cli: string, cliPath: string, cwd: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const args = cli === 'codex'
+        ? ['exec', '--json', '--full-auto', 'ok']
+        : ['-p', 'ok', '--output-format', 'stream-json', '--max-turns', '1', '--verbose'];
+
+      const child = spawn(cliPath, args, {
+        cwd,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, ANTHROPIC_API_KEY: undefined },
+      });
+
+      let resolved = false;
+      const done = (value: boolean) => { if (!resolved) { resolved = true; resolve(value); } };
+
+      const timeout = setTimeout(() => {
+        child.kill('SIGTERM');
+        // SIGKILL fallback if SIGTERM is ignored
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 5_000);
+        done(true); // Timeout is OK — CLI was alive, just slow
+      }, 30_000);
+
+      child.on('error', () => {
+        clearTimeout(timeout);
+        done(false);
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        done(code === 0);
+      });
+    });
   }
 
   // Detect MCP server configuration for each provider
@@ -1353,6 +1388,23 @@ export async function createPopmelt(
 
   if (!didBind) {
     throw new Error(`[Bridge] All ports ${basePort}–${basePort + MAX_PORT_ATTEMPTS - 1} in use`);
+  }
+
+  // Fire-and-forget CLI warm-ups — primes OS caches, validates availability
+  for (const [cli, cap] of Object.entries(capabilities)) {
+    if (!cap.available || !cap.path) continue;
+    warmUpCli(cli, cap.path, projectRoot).then((ok) => {
+      if (!ok) {
+        console.warn(`[Bridge] ${cli} warm-up failed — marking unavailable`);
+        cap.available = false;
+        cap.path = null;
+        for (const client of sseClients) {
+          sendSSE(client, { type: 'capabilities_changed', data: {} });
+        }
+      } else {
+        console.log(`[Bridge] ${cli} warmed up`);
+      }
+    });
   }
 
   // Periodic cleanup (only after successful binding)

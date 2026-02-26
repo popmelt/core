@@ -108,7 +108,7 @@ export function PopmeltProvider({
       const allConfigured = Object.values(mcp).every(s => s.found);
       if (allConfigured) setMcpJustInstalled(false);
     });
-  }, [bridge.isConnected, resolvedBridgeUrl]);
+  }, [bridge.isConnected, bridge.capabilitiesVersion, resolvedBridgeUrl]);
 
   // Auto-switch provider if current one isn't available
   useEffect(() => {
