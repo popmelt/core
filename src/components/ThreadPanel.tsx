@@ -17,6 +17,7 @@ type ThreadMessage = {
   question?: string;
   replyToQuestion?: string;
   toolsUsed?: string[];
+  cancelled?: boolean;
   resolutions?: {
     annotationId: string;
     status: string;
@@ -26,15 +27,6 @@ type ThreadMessage = {
     inferredScope?: { breadth: string; target: string } | null;
     finalScope?: { breadth: string; target: string } | null;
   }[];
-};
-
-type PlanAnnotation = {
-  id: string;
-  planTaskId?: string;
-  status?: string;
-  text?: string;
-  threadId?: string;
-  color: string;
 };
 
 type ThreadPanelProps = {
@@ -47,12 +39,7 @@ type ThreadPanelProps = {
   onReply?: (threadId: string, reply: string, images?: Blob[]) => void;
   onCancel?: () => void;
   lastError?: string;
-  activePlan?: { planId: string; status: string; goal: string; tasks?: { id: string; instruction: string }[] } | null;
-  planAnnotations?: PlanAnnotation[];
-  inFlightJobs?: Record<string, { annotationIds: string[]; threadId?: string }>;
-  onViewThread?: (threadId: string) => void;
-  onApprovePlan?: () => void;
-  onDismissPlan?: () => void;
+  onMouseEnter?: () => void;
 };
 
 const PANEL_WIDTH = 400;
@@ -282,12 +269,7 @@ export function ThreadPanel({
   onReply,
   onCancel,
   lastError,
-  activePlan,
-  planAnnotations,
-  inFlightJobs,
-  onViewThread,
-  onApprovePlan,
-  onDismissPlan,
+  onMouseEnter: onPanelMouseEnter,
 }: ThreadPanelProps) {
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -515,6 +497,7 @@ export function ThreadPanel({
       ref={panelRef}
       style={{ ...basePanelStyle, height: maxHeight, position: 'fixed', top: currentTop, left: currentLeft, zIndex: 10000 }}
       data-devtools="thread-panel"
+      onMouseEnter={onPanelMouseEnter}
     >
       {/* Header — draggable via native listeners */}
       <div
@@ -557,6 +540,29 @@ export function ThreadPanel({
 
         {messages.map((msg, i) => {
           const isHuman = msg.role === 'human';
+          // Cancelled jobs get a distinct message
+          if (msg.cancelled) {
+            return (
+              <div
+                key={`${msg.jobId}-${i}`}
+                style={{
+                  padding: '8px 16px',
+                  borderBottom: '1px solid rgba(0, 0, 0, 0.04)',
+                  opacity: i === messages.length - 1 ? 1 : 0.5,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ fontSize: 11, color: '#9ca3af', fontStyle: 'italic' }}>
+                    Cancelled
+                  </span>
+                  <span style={{ fontSize: 10, color: '#9ca3af', marginLeft: 'auto' }}>
+                    {formatTimestamp(msg.timestamp)}
+                  </span>
+                </div>
+              </div>
+            );
+          }
+
           const text = isHuman
             ? (msg.replyToQuestion || msg.feedbackSummary || '(annotation)')
             : stripInternalTags(msg.responseText || '');
@@ -661,97 +667,6 @@ export function ThreadPanel({
             </div>
           );
         })}
-
-        {/* Plan task list */}
-        {activePlan && planAnnotations && planAnnotations.length > 0 && (
-          <div style={{ padding: '8px 16px', borderBottom: '1px solid rgba(0, 0, 0, 0.04)' }}>
-            <div style={{ fontWeight: 600, fontSize: 11, color: '#6b7280', marginBottom: 6 }}>
-              Plan Tasks
-            </div>
-            {planAnnotations.map((ann) => {
-              const task = activePlan.tasks?.find(t => t.id === ann.planTaskId);
-              const isInFlight = inFlightJobs && Object.values(inFlightJobs).some(j => j.annotationIds.includes(ann.id));
-              const statusLabel = isInFlight ? 'running' : (ann.status ?? 'pending');
-              const statusColor = statusLabel === 'resolved' ? '#10b981'
-                : statusLabel === 'running' ? ann.color
-                : statusLabel === 'needs_review' ? '#f59e0b'
-                : '#9ca3af';
-
-              return (
-                <div
-                  key={ann.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'flex-start',
-                    gap: 8,
-                    padding: '4px 0',
-                    cursor: ann.threadId && onViewThread ? 'pointer' : 'default',
-                  }}
-                  onClick={() => {
-                    if (ann.threadId && onViewThread) onViewThread(ann.threadId);
-                  }}
-                >
-                  <div style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: '50%',
-                    backgroundColor: statusColor,
-                    marginTop: 4,
-                    flexShrink: 0,
-                  }} />
-                  <div style={{ flex: 1, fontSize: 11, lineHeight: 1.4 }}>
-                    <div>{task?.instruction || ann.text || ann.planTaskId}</div>
-                    <div style={{ color: '#9ca3af', fontSize: 10 }}>{statusLabel}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Plan approval — inline after the task list */}
-        {activePlan?.status === 'awaiting_approval' && onApprovePlan && onDismissPlan && (
-          <div style={{ padding: '8px 16px', borderBottom: '1px solid rgba(0, 0, 0, 0.04)' }}>
-            <div style={{ fontWeight: 600, fontSize: 12 }}>
-              {planAnnotations?.length ?? 0} task{(planAnnotations?.length ?? 0) !== 1 ? 's' : ''} planned
-            </div>
-            <div style={{ color: '#6b7280', fontSize: 11, marginTop: 2, marginBottom: 8 }}>
-              Review annotations, then approve to start workers
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                onClick={onApprovePlan}
-                style={{
-                  padding: '5px 14px',
-                  fontSize: 11,
-                  fontWeight: 600,
-                  fontFamily: FONT_FAMILY,
-                  backgroundColor: '#1f2937',
-                  color: '#ffffff',
-                  border: 'none',
-                  cursor: 'pointer',
-                }}
-              >
-                Approve
-              </button>
-              <button
-                onClick={onDismissPlan}
-                style={{
-                  padding: '5px 14px',
-                  fontSize: 11,
-                  fontWeight: 600,
-                  fontFamily: FONT_FAMILY,
-                  backgroundColor: 'transparent',
-                  color: '#6b7280',
-                  border: '1px solid rgba(0, 0, 0, 0.1)',
-                  cursor: 'pointer',
-                }}
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        )}
 
         {/* Live streaming section — unified chronological timeline */}
         {isStreaming && (

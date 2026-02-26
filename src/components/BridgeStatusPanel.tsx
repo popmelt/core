@@ -1,7 +1,7 @@
 'use client';
 
 import type { CSSProperties } from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type { BridgeConnectionState } from '../hooks/useBridgeConnection';
 import { POPMELT_BORDER } from '../styles/border';
@@ -23,6 +23,7 @@ type BridgeEventStackProps = {
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
   onCancel?: (jobId: string) => void;
+  onHoverJob?: (jobId: string | null) => void;
   isConnected?: boolean;
   dismissedThreadIds?: Set<string>;
 };
@@ -180,65 +181,8 @@ function ErrorDot() {
   );
 }
 
-/** Wraps a child so swiping right dismisses it. */
-function SwipeDismiss({ onDismiss, children }: { onDismiss: () => void; children: React.ReactNode }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ startX: number; startY: number; locked: boolean } | null>(null);
-  const [offset, setOffset] = useState(0);
-  const [dismissed, setDismissed] = useState(false);
-  const THRESHOLD = 60;
 
-  const onPointerDown = useCallback((e: React.PointerEvent) => {
-    drag.current = { startX: e.clientX, startY: e.clientY, locked: false };
-    ref.current?.setPointerCapture(e.pointerId);
-  }, []);
-
-  const onPointerMove = useCallback((e: React.PointerEvent) => {
-    const d = drag.current;
-    if (!d) return;
-    const dx = e.clientX - d.startX;
-    const dy = e.clientY - d.startY;
-    // Lock direction after 4px of movement
-    if (!d.locked) {
-      if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
-      d.locked = true;
-      // If more vertical than horizontal, abort swipe
-      if (Math.abs(dy) > Math.abs(dx)) { drag.current = null; return; }
-    }
-    setOffset(Math.max(0, dx)); // right only
-  }, []);
-
-  const onPointerUp = useCallback(() => {
-    if (!drag.current) return;
-    drag.current = null;
-    if (offset >= THRESHOLD) {
-      setDismissed(true);
-      setTimeout(onDismiss, 200);
-    } else {
-      setOffset(0);
-    }
-  }, [offset, onDismiss]);
-
-  return (
-    <div
-      ref={ref}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      style={{
-        transform: dismissed ? 'translateX(120%)' : `translateX(${offset}px)`,
-        opacity: dismissed ? 0 : 1 - offset / (THRESHOLD * 3),
-        transition: drag.current ? 'none' : 'transform 200ms ease, opacity 200ms ease',
-        touchAction: 'pan-y',
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, onHoverJob, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
   const [isHovered, setIsHovered] = useState(false);
 
@@ -287,7 +231,11 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       // (e.g. sessionStorage unavailable), create fallback entries
       for (const jobId of bridge.activeJobIds) {
         if (!existingIds.has(jobId) && !newEntries.some(e => e.jobId === jobId)) {
-          newEntries.push({ jobId, color: '#888', status: 'working' });
+          const startEvt = bridge.events.find(e => e.type === 'job_started' && e.data.jobId === jobId);
+          newEntries.push({
+            jobId, color: '#888', status: 'working',
+            threadId: startEvt?.data?.threadId as string | undefined,
+          });
           changed = true;
         }
       }
@@ -342,9 +290,9 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       style={stackContainerStyle}
       data-devtools
       onMouseEnter={() => { setIsHovered(true); onHover(true); }}
-      onMouseLeave={() => { setIsHovered(false); onHover(false); }}
+      onMouseLeave={() => { setIsHovered(false); onHover(false); onHoverJob?.(null); }}
     >
-      {entries.map((entry, i) => {
+      {[...entries].reverse().map((entry, i) => {
         const isLast = i === entries.length - 1;
         const distFromFront = entries.length - 1 - i;
 
@@ -378,10 +326,11 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
               transition: 'margin-bottom 250ms ease, transform 250ms ease, opacity 250ms ease',
             }}
           >
-            <SwipeDismiss onDismiss={() => setEntries(prev => prev.filter(e => e.jobId !== entry.jobId))}>
               <div
                 style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
                 onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
+                onMouseEnter={onHoverJob ? () => onHoverJob(entry.jobId) : undefined}
+                onMouseLeave={onHoverJob ? () => onHoverJob(null) : undefined}
                 title={entry.errorMessage || undefined}
               >
                 {entry.status === 'working' && <DotSpinner color={entry.color} />}
@@ -406,7 +355,6 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                   >×</button>
                 )}
               </div>
-            </SwipeDismiss>
           </div>
         );
       })}

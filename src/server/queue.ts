@@ -152,7 +152,7 @@ export class JobQueue {
       this.activeJobs.set(job.id, job);
       job.status = 'running';
 
-      this.broadcast({ type: 'job_started', jobId: job.id, position: 0 }, job.id, job.sourceId);
+      this.broadcast({ type: 'job_started', jobId: job.id, position: 0, threadId: job.threadId }, job.id, job.sourceId);
 
       // Fire-and-forget — each job runs independently
       this.processor(job)

@@ -103,16 +103,17 @@ export function useCanvasDrawing() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, []);
 
-  const drawAnnotation = useCallback((annotation: Annotation, groupNumber?: number) => {
+  const drawAnnotation = useCallback((annotation: Annotation, groupNumber?: number, highlighted?: boolean) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Status-aware color: only pending shows own color; everything sent stays gray
+    // Status-aware color: only pending shows own color; everything sent stays gray.
+    // Highlighted annotations (hovered badge) restore their original color.
     const status = annotation.status ?? (annotation.captured ? 'in_flight' : 'pending');
-    const color = status === 'pending' ? annotation.color : '#999999';
+    const color = (status === 'pending' || highlighted) ? annotation.color : '#999999';
 
     switch (annotation.type) {
       case 'freehand':
@@ -129,7 +130,8 @@ export function useCanvasDrawing() {
         break;
       case 'text':
         if (annotation.text && annotation.points[0]) {
-          drawText(ctx, annotation.points[0], annotation.text, color, annotation.fontSize, groupNumber);
+          // Pass viewport-relative X so drawText can wrap near the right edge
+          drawText(ctx, annotation.points[0], annotation.text, color, annotation.fontSize, groupNumber, annotation.points[0].x);
         }
         break;
     }
@@ -269,7 +271,8 @@ export function useCanvasDrawing() {
       handleSize?: number,
       scrollX: number = 0,
       scrollY: number = 0,
-      annotationGroupMap?: Map<string, number>
+      annotationGroupMap?: Map<string, number>,
+      highlightedAnnotationIds?: Set<string> | null
     ) => {
       clearCanvas();
 
@@ -280,7 +283,8 @@ export function useCanvasDrawing() {
           points: offsetPoints(annotation.points, scrollX, scrollY),
         };
         const groupNumber = annotationGroupMap?.get(annotation.id);
-        drawAnnotation(offsetAnnotation, groupNumber);
+        const highlighted = highlightedAnnotationIds?.has(annotation.id) ?? false;
+        drawAnnotation(offsetAnnotation, groupNumber, highlighted);
       });
 
       // Draw current path offset by scroll position

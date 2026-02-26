@@ -106,22 +106,16 @@ export type Job = {
   model?: string;
   imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
   sourceId?: string; // SSE scoping — only the originating client sees job events
-  // Planner fields
-  planId?: string;
-  planTaskId?: string;
 };
 
 export type SSEEvent =
-  | { type: 'job_started'; jobId: string; position: number }
+  | { type: 'job_started'; jobId: string; position: number; threadId?: string }
   | { type: 'delta'; jobId: string; text: string }
   | { type: 'thinking'; jobId: string; text: string }
   | { type: 'tool_use'; jobId: string; tool: string; file?: string }
   | { type: 'done'; jobId: string; success: boolean; resolutions?: AnnotationResolution[]; responseText?: string; threadId?: string }
   | { type: 'error'; jobId: string; message: string; cancelled?: boolean }
   | { type: 'question'; jobId: string; threadId: string; question: string; annotationIds?: string[] }
-  | { type: 'plan_ready'; jobId: string; planId: string; tasks: PlanTask[]; threadId?: string }
-  | { type: 'plan_review'; planId: string; verdict: 'pass' | 'fail'; summary: string; issues?: string[] }
-  | { type: 'task_resolved'; jobId: string; planId: string; resolutions: AnnotationResolution[]; threadId?: string }
   | { type: 'queue_drained' }
   | { type: 'materialize_started'; decisionIds: string[] }
   | { type: 'materialize_done'; decisionIds: string[]; success: boolean; error?: string }
@@ -158,6 +152,7 @@ export type ThreadMessage = {
   sessionId?: string;
   question?: string;         // assistant asks a question
   replyToQuestion?: string;  // human replies to a question
+  cancelled?: boolean;       // job was cancelled by user
 };
 
 export type Thread = {
@@ -198,39 +193,12 @@ export type DecisionRecord = {
   model: string | undefined;
   sessionId: string | undefined;
   threadId: string | undefined;
-  planId?: string;
-  planTaskId?: string;
   responseText: string;
   resolutions: AnnotationResolution[];
   question: string | undefined;
   fileEdits: FileEdit[];
   toolsUsed: string[] | undefined;
   gitDiff: string | null;
-};
-
-// Planner types
-export type PlanTask = {
-  id: string;
-  instruction: string;
-  region: { x: number; y: number; width: number; height: number };
-  priority?: number;
-};
-
-export type JobGroupStatus = 'planning' | 'awaiting_approval' | 'executing' | 'reviewing' | 'done' | 'error';
-
-export type JobGroup = {
-  id: string;
-  goal: string;
-  status: JobGroupStatus;
-  plannerJobId: string;
-  plannerThreadId?: string;
-  plan?: PlanTask[];
-  workerJobIds: string[];
-  executorJobId?: string;
-  screenshotPath: string;
-  pageUrl: string;
-  viewport: { width: number; height: number };
-  createdAt: number;
 };
 
 export type MaterializationIndex = {

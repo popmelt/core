@@ -36,7 +36,6 @@ type AnnotationToolbarProps = {
   dispatch: React.Dispatch<AnnotationAction>;
   onScreenshot: () => Promise<boolean>;
   onSendToClaude?: () => Promise<boolean>;
-  onPlanGoal?: (goal: string) => Promise<boolean>;
   hasActiveJobs?: boolean;
   activeJobColor?: string;
   onCrosshairHover?: (hovering: boolean) => void;
@@ -50,7 +49,6 @@ type AnnotationToolbarProps = {
   onModelChange?: (index: number) => void;
   onViewThread?: (threadId: string) => void;
   isThreadPanelOpen?: boolean;
-  activePlan?: { planId: string; status: string; goal: string } | null;
   mcpStatus?: Record<string, McpStatus>;
   onInstallMcp?: () => Promise<void>;
   mcpJustInstalled?: boolean;
@@ -65,6 +63,7 @@ type AnnotationToolbarProps = {
   modelRefreshKey?: number;
   onModelComponentAdded?: () => void;
   onModelComponentRemoved?: (name: string) => void;
+  onMouseEnter?: () => void;
 };
 
 type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: string };
@@ -331,7 +330,6 @@ export function AnnotationToolbar({
   dispatch,
   onScreenshot,
   onSendToClaude,
-  onPlanGoal,
   hasActiveJobs,
   activeJobColor,
   onCrosshairHover,
@@ -345,7 +343,6 @@ export function AnnotationToolbar({
   onModelChange,
   onViewThread,
   isThreadPanelOpen,
-  activePlan,
   mcpStatus,
   onInstallMcp,
   mcpJustInstalled,
@@ -360,6 +357,7 @@ export function AnnotationToolbar({
   modelRefreshKey,
   onModelComponentAdded,
   onModelComponentRemoved,
+  onMouseEnter: onToolbarMouseEnter,
 }: AnnotationToolbarProps) {
   const [isExpanded, setIsExpanded] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -679,28 +677,9 @@ export function AnnotationToolbar({
   }, [onScreenshot]);
 
   const handleSendToClaude = useCallback(async () => {
-    const pendingAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
-    const pendingStyleMods = state.styleModifications.filter(m => !m.captured);
-    const hasShapes = pendingAnnotations.some(a => a.type !== 'text');
-
-    if (onPlanGoal) {
-      // Only trigger plan mode with explicit /plan prefix
-      const textAnnotations = pendingAnnotations.filter(a => a.type === 'text' && a.text);
-      const planPrefixed = textAnnotations.find(a => a.text!.toLowerCase().startsWith('/plan '));
-      if (planPrefixed) {
-        const goalFromPrefix = planPrefixed.text!.replace(/^\/plan\s+/i, '');
-        const otherText = textAnnotations
-          .filter(a => a !== planPrefixed && a.text)
-          .map(a => a.text!);
-        const goal = [goalFromPrefix, ...otherText].join('. ');
-        await onPlanGoal(goal);
-        return;
-      }
-    }
-
     if (!onSendToClaude) return;
     await onSendToClaude();
-  }, [onSendToClaude, onPlanGoal, state.annotations, state.styleModifications, state.spacingTokenChanges]);
+  }, [onSendToClaude]);
 
   const handleCollapse = useCallback(() => {
     dispatch({ type: 'SET_ANNOTATING', payload: false });
@@ -993,7 +972,7 @@ export function AnnotationToolbar({
 
       // Cmd/Ctrl+Enter to send to Claude (when bridge connected and annotations exist)
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        if ((onSendToClaude || onPlanGoal) && (state.annotations.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0)) {
+        if (onSendToClaude && (state.annotations.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0)) {
           e.preventDefault();
           handleSendToClaude();
         }
@@ -1051,7 +1030,7 @@ export function AnnotationToolbar({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, onPlanGoal, handleClear, state.annotations.length, state.styleModifications.length, state.spacingTokenChanges, guidanceTool]);
+  }, [isExpanded, handleToolSelect, handleScreenshot, handleSendToClaude, onSendToClaude, handleClear, state.annotations.length, state.styleModifications.length, state.spacingTokenChanges, guidanceTool]);
 
 
 
@@ -1079,7 +1058,7 @@ export function AnnotationToolbar({
         <div
           id="devtools-toolbar"
           style={{ ...toolbarStyle, overflow: 'visible', opacity: 0.5, transition: 'opacity 150ms ease' }}
-          onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
+          onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; onToolbarMouseEnter?.(); }}
           onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.5')}
         >
           <button
@@ -1325,6 +1304,7 @@ export function AnnotationToolbar({
       <div
         id="devtools-toolbar"
         style={toolbarStyle}
+        onMouseEnter={onToolbarMouseEnter}
         onMouseMove={handleToolbarMouseMove}
       >
         {(state.annotations.length > 0 || state.styleModifications.length > 0) && (

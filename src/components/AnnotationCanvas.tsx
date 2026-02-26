@@ -7,9 +7,9 @@ import { generateId } from '../hooks/useAnnotationState';
 import { useCanvasDrawing } from '../hooks/useCanvasDrawing';
 import { useModifierKeys } from '../hooks/useModifierKeys';
 import { useWheelZoom } from '../hooks/useWheelZoom';
-import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING } from '../tools/text';
+import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING, VIEWPORT_MARGIN, getEffectiveMaxWidth, wrapLines } from '../tools/text';
 import type { Annotation, AnnotationAction, AnnotationState, ElementInfo, Point } from '../tools/types';
-import { AnnotationBadges, BADGE_HEIGHT, MarchingAntsBorders, PlanWaitingBadges, QuestionBadges } from './badges';
+import { AnnotationBadges, BADGE_HEIGHT, MarchingAntsBorders, QuestionBadges } from './badges';
 import type { BorderRadiusCorner } from '../utils/dom';
 import type { ComponentBoundary } from '../utils/dom';
 import type { SpacingRect } from '../utils/dom';
@@ -57,13 +57,14 @@ type AnnotationCanvasProps = {
   onAttachImages?: (annotationId: string, images: Blob[]) => void;
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
-  activePlan?: { planId: string; status: string; threadId?: string; tasks?: { id: string; instruction: string }[] } | null;
+  onCloseThread?: (threadId?: string) => void;
   onModelComponentsAdd?: (names: string[]) => void;
   onModelComponentFocus?: (name: string) => void;
   onModelComponentHover?: (name: string | null) => void;
   modelComponentNames?: Set<string>;
   modelPanelHoveredComponent?: { name: string; instanceIndex: number } | null;
   modelSpacingTokenHover?: { name: string; px: number; token?: TokenBinding } | null;
+  highlightedAnnotationIds?: Set<string> | null;
 };
 
 type ActiveTextInput = {
@@ -115,7 +116,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, activePlan, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
 
   // Right-click passthrough (two-step): for non-hand tools, the first right-click
@@ -741,6 +742,19 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
+        // Close thread panel and dismiss event-stack entries for deleted threads
+        if (onCloseThread) {
+          const annotations = stateRef.current.annotations;
+          for (const id of currentSelectedIds) {
+            const ann = annotations.find((a) => a.id === id);
+            if (!ann) continue;
+            const threadId = ann.threadId
+              || (ann.groupId && annotations.find(
+                (a) => a.groupId === ann.groupId && a.threadId,
+              )?.threadId);
+            if (threadId) onCloseThread(threadId);
+          }
+        }
         // Delete all selected annotations
         for (const id of currentSelectedIds) {
           dispatch({
@@ -754,7 +768,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [dispatch, clearSelection, selectAnnotation, state.activeTool, modelFocusedComponents, modelComponentNames, onModelComponentsAdd]); // All other values read from refs
+  }, [dispatch, clearSelection, selectAnnotation, state.activeTool, modelFocusedComponents, modelComponentNames, onModelComponentsAdd, onCloseThread]); // All other values read from refs
 
   // Compute superseded annotations: when multiple annotation rounds target
   // the same linkedSelector, only the newest round is visible.
@@ -830,9 +844,10 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       HANDLE_SIZE,
       scroll.x,
       scroll.y,
-      annotationGroupMap
+      annotationGroupMap,
+      highlightedAnnotationIds
     );
-  }, [state.annotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededAnnotations]);
+  }, [state.annotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededAnnotations, highlightedAnnotationIds]);
 
   // Auto-create text annotation after drawing a rectangle
   useEffect(() => {
@@ -1013,14 +1028,24 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             if (ctx) {
               ctx.font = `${fontSize}px ${FONT_FAMILY}`;
               const lines = annotation.text.split('\n');
-              const maxWidth = Math.max(...lines.map((line) => ctx.measureText(line).width));
-              const totalHeight = lines.length * (fontSize * LINE_HEIGHT);
+
+              // Account for viewport-constrained wrapping
+              const viewportX = textPoint.x - scroll.x;
+              const effectiveMax = getEffectiveMaxWidth(viewportX);
+              const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : undefined;
+              const wrapped = capWidth ? wrapLines(ctx, lines, capWidth) : lines;
+              const maxWidth = capWidth
+                ? Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)))
+                : Math.max(...lines.map((line) => ctx.measureText(line).width));
+              const wrappedHeight = wrapped.length * (fontSize * LINE_HEIGHT);
+              const originalHeight = lines.length * (fontSize * LINE_HEIGHT);
+              const yShift = wrappedHeight - originalHeight;
 
               if (
                 point.x >= textPoint.x - PADDING - SAFE_AREA &&
                 point.x <= textPoint.x + maxWidth + PADDING + SAFE_AREA &&
-                point.y >= textPoint.y - PADDING - SAFE_AREA &&
-                point.y <= textPoint.y + totalHeight + PADDING + SAFE_AREA
+                point.y >= textPoint.y - PADDING - SAFE_AREA - yShift &&
+                point.y <= textPoint.y + originalHeight + PADDING + SAFE_AREA
               ) {
                 return annotation;
               }
@@ -1097,7 +1122,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       }
     }
     return null;
-  }, [state.annotations, canvasRef, isPointNearLine, supersededAnnotations]);
+  }, [state.annotations, canvasRef, isPointNearLine, supersededAnnotations, scroll.x]);
 
   // Find text annotation at a given point (for hover/resize)
   const findTextAtPoint = useCallback((point: Point): Annotation | null => {
@@ -2838,10 +2863,10 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   // Calculate textarea dimensions based on content
   const getTextDimensions = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !activeText) return { width: 100, height: 12 * LINE_HEIGHT };
+    if (!canvas || !activeText) return { width: 100, height: 12 * LINE_HEIGHT, isWrapped: false };
 
     const ctx = canvas.getContext('2d');
-    if (!ctx) return { width: 100, height: activeText.fontSize * LINE_HEIGHT };
+    if (!ctx) return { width: 100, height: activeText.fontSize * LINE_HEIGHT, isWrapped: false };
 
     ctx.font = `${activeText.fontSize}px ${FONT_FAMILY}`;
 
@@ -2850,25 +2875,44 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     const minWidth = placeholderWidth;
 
     const lines = activeText.text.split('\n');
-    const maxWidth = lines.length > 0
+    const naturalWidth = lines.length > 0
       ? Math.max(minWidth, ...lines.map((line) => ctx.measureText(line || ' ').width))
       : minWidth;
-    const height = Math.max(1, lines.length) * activeText.fontSize * LINE_HEIGHT;
 
-    return { width: maxWidth, height };
-  }, [activeText, canvasRef]);
+    // Constrain to viewport right edge
+    const viewportLeft = activeText.point.x - scroll.x;
+    const effectiveMax = getEffectiveMaxWidth(viewportLeft);
+    const isWrapped = effectiveMax !== undefined && naturalWidth > effectiveMax;
+
+    if (isWrapped) {
+      const wrappedLines = wrapLines(ctx, lines, effectiveMax);
+      const wrappedWidth = Math.min(effectiveMax, Math.max(minWidth, ...wrappedLines.map(l => ctx.measureText(l).width)));
+      const wrappedHeight = Math.max(1, wrappedLines.length) * activeText.fontSize * LINE_HEIGHT;
+      return { width: wrappedWidth, height: wrappedHeight, isWrapped: true };
+    }
+
+    const height = Math.max(1, lines.length) * activeText.fontSize * LINE_HEIGHT;
+    return { width: naturalWidth, height, isWrapped: false };
+  }, [activeText, canvasRef, scroll.x]);
 
   const textDimensions = getTextDimensions();
 
   // Text input position (convert from document to viewport coords for fixed positioning)
+  // When wrapping is active, shift the textarea up so its bottom edge stays put
+  const unwrappedHeight = activeText
+    ? Math.max(1, activeText.text.split('\n').length) * (activeText.fontSize) * LINE_HEIGHT + PADDING * 2
+    : 0;
+  const wrappedTotalHeight = textDimensions.height + PADDING * 2;
+  const wrapYShift = textDimensions.isWrapped ? wrappedTotalHeight - unwrappedHeight : 0;
+
   const textInputStyle: CSSProperties = activeText
     ? {
         position: 'fixed',
         left: activeText.point.x - PADDING - scroll.x,
-        top: activeText.point.y - PADDING - scroll.y,
+        top: activeText.point.y - PADDING - scroll.y - wrapYShift,
         zIndex: 9999,
         width: textDimensions.width + PADDING * 2,
-        height: textDimensions.height + PADDING * 2,
+        height: wrappedTotalHeight,
         padding: PADDING,
         fontSize: activeText.fontSize,
         fontFamily: FONT_FAMILY,
@@ -2881,7 +2925,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         lineHeight: LINE_HEIGHT,
         resize: 'none',
         overflow: 'hidden',
-        whiteSpace: 'pre',
+        whiteSpace: textDimensions.isWrapped ? 'pre-wrap' : 'pre',
+        wordBreak: textDimensions.isWrapped ? 'break-word' : undefined,
       }
     : {};
 
@@ -2894,7 +2939,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         onMouseDown={handlePointerDown}
         onMouseMove={handlePointerMove}
         onMouseUp={(e) => handlePointerUp(e)}
-        onMouseLeave={(e) => handlePointerUp(e)}
+        onMouseLeave={(e) => { handlePointerUp(e); setHoveredElement(null); setHoveredElementInfo(null); }}
         onTouchStart={handlePointerDown}
         onTouchMove={handlePointerMove}
         onTouchEnd={(e) => handlePointerUp(e)}
@@ -2969,22 +3014,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           annotationGroupMap={annotationGroupMap}
           onViewThread={onViewThread}
           onSelectAnnotation={selectAnnotation}
-        />
-      )}
-
-      {/* Plan badges for annotations with an active plan (planning or awaiting approval) */}
-      {state.isAnnotating && (activePlan?.status === 'awaiting_approval' || activePlan?.status === 'planning') && activePlan.threadId && onViewThread && (
-        <PlanWaitingBadges
-          annotations={state.annotations}
-          supersededAnnotations={supersededAnnotations}
-          scrollX={scroll.x}
-          scrollY={scroll.y}
-          annotationGroupMap={annotationGroupMap}
-          planThreadId={activePlan.threadId}
-          taskCount={activePlan.tasks?.length ?? 0}
-          planStatus={activePlan.status}
-          onViewThread={onViewThread}
-          onSelectAnnotation={selectAnnotation}
+          canvasRef={canvasRef}
         />
       )}
 
@@ -2997,6 +3027,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           scrollY={scroll.y}
           onReply={onReply}
           annotationGroupMap={annotationGroupMap}
+          canvasRef={canvasRef}
         />
       )}
 

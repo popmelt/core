@@ -19,22 +19,6 @@ export type PendingQuestion = {
   timestamp: number;
 };
 
-export type PendingPlan = {
-  jobId: string;
-  planId: string;
-  tasks: { id: string; instruction: string; region: { x: number; y: number; width: number; height: number }; priority?: number }[];
-  threadId?: string;
-  timestamp: number;
-};
-
-export type PlanReviewResult = {
-  planId: string;
-  verdict: 'pass' | 'fail';
-  summary: string;
-  issues?: string[];
-  timestamp: number;
-};
-
 export type BridgeConnectionState = {
   isConnected: boolean;
   status: 'disconnected' | 'idle' | 'streaming' | 'error';
@@ -52,8 +36,6 @@ export type BridgeConnectionState = {
   lastThreadId: string | null;
   lastErrorByJob: Record<string, string>;
   pendingQuestions: PendingQuestion[];
-  pendingPlans: PendingPlan[];
-  planReviews: PlanReviewResult[];
   incrementalResolutions: AnnotationResolution[];
   capabilitiesVersion: number;
 };
@@ -91,8 +73,6 @@ const INITIAL_STATE: BridgeConnectionState = {
   lastThreadId: null,
   lastErrorByJob: {},
   pendingQuestions: [],
-  pendingPlans: [],
-  planReviews: [],
   incrementalResolutions: [],
   capabilitiesVersion: 0,
 };
@@ -356,64 +336,6 @@ function connectBridge(bridgeUrl: string) {
     }));
   });
 
-  es.addEventListener('plan_ready', (e) => {
-    if (isStale()) return;
-    const data = JSON.parse(e.data);
-    update((prev) => ({
-      ...prev,
-      pendingPlans: [
-        ...prev.pendingPlans,
-        {
-          jobId: data.jobId,
-          planId: data.planId,
-          tasks: data.tasks,
-          threadId: data.threadId,
-          timestamp: Date.now(),
-        },
-      ],
-      events: [
-        ...prev.events,
-        { type: 'plan_ready', data, timestamp: Date.now() },
-      ],
-    }));
-  });
-
-  es.addEventListener('plan_review', (e) => {
-    if (isStale()) return;
-    const data = JSON.parse(e.data);
-    update((prev) => ({
-      ...prev,
-      planReviews: [
-        ...prev.planReviews,
-        {
-          planId: data.planId,
-          verdict: data.verdict,
-          summary: data.summary,
-          issues: data.issues,
-          timestamp: Date.now(),
-        },
-      ],
-      events: [
-        ...prev.events,
-        { type: 'plan_review', data, timestamp: Date.now() },
-      ],
-    }));
-  });
-
-  es.addEventListener('task_resolved', (e) => {
-    if (isStale()) return;
-    const data = JSON.parse(e.data);
-    const resolutions = (data.resolutions ?? []) as AnnotationResolution[];
-    update((prev) => ({
-      ...prev,
-      incrementalResolutions: [...prev.incrementalResolutions, ...resolutions],
-      events: [
-        ...prev.events,
-        { type: 'task_resolved', data, timestamp: Date.now() },
-      ],
-    }));
-  });
-
   es.addEventListener('capabilities_changed', () => {
     if (isStale()) return;
     update((prev) => ({
@@ -529,12 +451,5 @@ export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
     }));
   }, []);
 
-  const dismissPlan = useCallback((planId: string) => {
-    update((prev) => ({
-      ...prev,
-      pendingPlans: prev.pendingPlans.filter(p => p.planId !== planId),
-    }));
-  }, []);
-
-  return { ...state, clearEvents, dismissQuestion, dismissPlan };
+  return { ...state, clearEvents, dismissQuestion };
 }

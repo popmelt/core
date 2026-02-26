@@ -11,12 +11,10 @@ import {
   type PropsWithChildren,
 } from 'react';
 
-import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection, type PendingPlan } from '../hooks/useBridgeConnection';
+import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
-import { addComponentToModel, approvePlan, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendPlanExecution, sendPlanReview, sendPlanToBridge, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
-import { resolveRegionToElement } from '../utils/dom';
-import { buildPageManifest } from '../utils/page-manifest';
+import { addComponentToModel, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
@@ -37,7 +35,6 @@ type PopmeltProviderProps = PropsWithChildren<{
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
 const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
-const ACTIVE_PLAN_STORAGE_KEY = 'devtools-active-plan';
 
 // Model definitions per provider
 const CLAUDE_MODELS = [
@@ -310,22 +307,10 @@ export function PopmeltProvider({
   // ThreadIds whose annotations were deleted — BridgeEventStack hides matching entries
   const [dismissedThreadIds, setDismissedThreadIds] = useState<Set<string>>(new Set());
 
-  // Active plan state
-  const [activePlan, setActivePlan] = useState<{
-    planId: string;
-    threadId?: string;
-    goal: string;
-    tasks?: PendingPlan['tasks'];
-    status: 'planning' | 'awaiting_approval' | 'executing' | 'reviewing' | 'done';
-  } | null>(() => {
-    if (typeof window === 'undefined') return null;
-    try {
-      const saved = localStorage.getItem(ACTIVE_PLAN_STORAGE_KEY);
-      return saved ? JSON.parse(saved) : null;
-    } catch { return null; }
-  });
+  // Annotation IDs to highlight when hovering a status badge
+  const [highlightedAnnotationIds, setHighlightedAnnotationIds] = useState<Set<string> | null>(null);
 
-  // Persist openThreadId and activePlan to localStorage
+  // Persist openThreadId to localStorage
   useEffect(() => {
     if (openThreadId) {
       localStorage.setItem(THREAD_ID_STORAGE_KEY, openThreadId);
@@ -334,18 +319,10 @@ export function PopmeltProvider({
     }
   }, [openThreadId]);
 
-  useEffect(() => {
-    if (activePlan) {
-      localStorage.setItem(ACTIVE_PLAN_STORAGE_KEY, JSON.stringify(activePlan));
-    } else {
-      localStorage.removeItem(ACTIVE_PLAN_STORAGE_KEY);
-    }
-  }, [activePlan]);
-
   // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors, color, threadId }
   // Persisted in sessionStorage so state survives HMR remounts (Astro/Vite tear down React islands).
   const IN_FLIGHT_STORAGE_KEY = 'popmelt-in-flight-jobs';
-  const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string; planId?: string }>>(() => {
+  const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string }>>(() => {
     try {
       const stored = sessionStorage.getItem(IN_FLIGHT_STORAGE_KEY);
       return stored ? JSON.parse(stored) : {};
@@ -367,7 +344,6 @@ export function PopmeltProvider({
 
   // Recovery: annotations hydrate from localStorage via PASTE_ANNOTATIONS (after mount).
   // Any annotation stuck in 'in_flight' with no matching active job is a ghost — reset it.
-  // Also clear stale activePlan (planning/executing with no backing job).
   const didRecoverRef = useRef(false);
   useEffect(() => {
     if (didRecoverRef.current) return;
@@ -390,11 +366,7 @@ export function PopmeltProvider({
     if (stuckIds.length > 0) {
       dispatch({ type: 'SET_ANNOTATION_STATUS', payload: { ids: stuckIds, status: 'dismissed' } });
     }
-    // Clear activePlan if it's in a transient state with no backing job
-    if (activePlan && (activePlan.status === 'planning' || activePlan.status === 'executing' || activePlan.status === 'reviewing') && Object.keys(inFlightJobs).length === 0) {
-      setActivePlan(null);
-    }
-  }, [state.annotations, inFlightJobs, dispatch, activePlan]);
+  }, [state.annotations, inFlightJobs, dispatch]);
 
   // Flatten all in-flight annotation IDs and style selectors for the canvas
   const inFlightAnnotationIds = useMemo(() => {
@@ -549,6 +521,22 @@ export function PopmeltProvider({
     }
   }, [bridge.events, dispatch]);
 
+  // Handle cancelled jobs — dismiss their annotations so badges don't show "1 reply"
+  const processedCancelJobIdsRef = useRef(new Set<string>());
+  useEffect(() => {
+    const cancelEvents = bridge.events.filter(e => e.type === 'error' && e.data.cancelled);
+    for (const event of cancelEvents) {
+      const jobId = event.data.jobId as string;
+      if (!jobId || processedCancelJobIdsRef.current.has(jobId)) continue;
+      processedCancelJobIdsRef.current.add(jobId);
+
+      const job = inFlightJobs[jobId];
+      if (job && job.annotationIds.length > 0) {
+        dispatch({ type: 'SET_ANNOTATION_STATUS', payload: { ids: job.annotationIds, status: 'dismissed' } });
+      }
+    }
+  }, [bridge.events, inFlightJobs, dispatch]);
+
   // Handle incremental resolutions from plan executor (task_resolved events)
   const lastIncrementalCountRef = useRef(0);
   useEffect(() => {
@@ -594,129 +582,6 @@ export function PopmeltProvider({
     }
     return success;
   }, [state.annotations, state.styleModifications, dispatch]);
-
-  // Plan goal handler: captures full-page screenshot and sends to planner
-  const handlePlanGoal = useCallback(async (goal: string): Promise<boolean> => {
-    try {
-      // Collect triggering annotations for screenshot overlay and feedback context
-      const activeAnnotations = state.annotations.filter(a => (a.status ?? 'pending') === 'pending');
-
-      const screenshotBlob = await captureFullPage(document.body, activeAnnotations);
-      if (!screenshotBlob) return false;
-
-      const manifest = buildPageManifest();
-
-      // Include pending annotations, uncaptured style mods, and inspected element as context
-      const uncapturedStyleMods = state.styleModifications.filter(m => !m.captured);
-      const inspectedInfo = state.inspectedElement?.info;
-      const hasFeedback = activeAnnotations.length > 0 || uncapturedStyleMods.length > 0 || !!inspectedInfo;
-      const feedbackJson = hasFeedback
-        ? JSON.stringify(buildFeedbackData(activeAnnotations, uncapturedStyleMods, inspectedInfo))
-        : undefined;
-
-      const { planId, threadId } = await sendPlanToBridge(
-        screenshotBlob,
-        goal,
-        resolvedBridgeUrl,
-        provider,
-        currentModel.id,
-        window.location.href,
-        { width: window.innerWidth, height: window.innerHeight },
-        manifest,
-        feedbackJson,
-        getSourceId(),
-      );
-
-      setActivePlan({
-        planId,
-        threadId,
-        goal,
-        status: 'planning',
-      });
-
-      // Tag pending text annotations with the plan's threadId so badges can find them
-      if (threadId) {
-        const pendingTextIds = state.annotations
-          .filter(a => a.type === 'text' && (a.status ?? 'pending') === 'pending')
-          .map(a => a.id);
-        if (pendingTextIds.length > 0) {
-          dispatch({ type: 'SET_ANNOTATION_THREAD', payload: { ids: pendingTextIds, threadId } });
-        }
-      }
-      dispatch({ type: 'MARK_CAPTURED' });
-
-      // Open thread panel to show planner streaming
-      if (threadId) setOpenThreadId(threadId);
-
-      return true;
-    } catch (err) {
-      console.error('[Pare] Failed to send plan:', err);
-      return false;
-    }
-  }, [resolvedBridgeUrl, provider, currentModel.id, state.annotations, state.styleModifications, state.inspectedElement, dispatch]);
-
-  // Materialize plan tasks as annotations on the canvas
-  const materializePlan = useCallback(async (tasks: PendingPlan['tasks']) => {
-    const planId = activePlan?.planId;
-    if (!planId) return;
-
-    // Compute distinct hue per worker so each task gets a unique color
-    const baseHueMatch = state.activeColor.match(/oklch\([^)]*\s+([\d.]+)\s*\)/);
-    const baseHue = baseHueMatch?.[1] ? parseFloat(baseHueMatch[1]) : 29;
-    const hueStep = tasks.length > 1 ? 360 / tasks.length : 0;
-
-    // Stagger annotation creation for visual effect
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i]!;
-      const taskHue = (baseHue + i * hueStep) % 360;
-      const taskColor = `oklch(0.628 0.258 ${Math.round(taskHue)})`;
-
-      // Scroll the region into view (instant to ensure position is correct for elementFromPoint)
-      const regionCenterY = task.region.y + task.region.height / 2;
-      const viewportH = window.innerHeight;
-      if (regionCenterY < window.scrollY || regionCenterY > window.scrollY + viewportH) {
-        window.scrollTo({
-          top: Math.max(0, regionCenterY - viewportH / 2),
-          behavior: 'instant',
-        });
-        // Double rAF for paint settle
-        await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
-      }
-
-      // Resolve region to DOM element
-      const resolved = resolveRegionToElement(task.region);
-
-      const groupId = Math.random().toString(36).substring(2, 9);
-      // Use the resolved element's bounding rect (in page coords) for tighter fit
-      const region = resolved
-        ? {
-            x: resolved.rect.left + window.scrollX,
-            y: resolved.rect.top + window.scrollY,
-            width: resolved.rect.width,
-            height: resolved.rect.height,
-          }
-        : task.region;
-
-      dispatch({
-        type: 'ADD_PLAN_ANNOTATION',
-        payload: {
-          groupId,
-          planId,
-          planTaskId: task.id,
-          instruction: task.instruction,
-          region,
-          color: taskColor,
-          linkedSelector: resolved?.selector,
-          elements: resolved ? [resolved.info] : undefined,
-        },
-      });
-
-      // 200ms stagger between annotations
-      if (i < tasks.length - 1) {
-        await new Promise(r => setTimeout(r, 200));
-      }
-    }
-  }, [activePlan?.planId, state.activeColor, dispatch]);
 
   const handleAttachImages = useCallback((annotationId: string, images: Blob[]) => {
     const existing = annotationImagesRef.current.get(annotationId) || [];
@@ -860,111 +725,6 @@ export function PopmeltProvider({
     }
   }, [state.activeColor, state.annotations, resolvedBridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
 
-  // Handle plan approval: single-session execution for all tasks
-  const handleApprovePlan = useCallback(async () => {
-    if (!activePlan || !activePlan.planId) return;
-
-    try {
-      // Approve on server side
-      await approvePlan(activePlan.planId, resolvedBridgeUrl);
-
-      setActivePlan(prev => prev ? { ...prev, status: 'executing' } : null);
-
-      // Capture ONE full-page screenshot
-      const screenshotBlob = await captureFullPage(document.body);
-      if (!screenshotBlob) return;
-
-      // Collect plan annotations that are still pending (user may have deleted some)
-      const planAnnotations = state.annotations.filter(
-        a => a.planId === activePlan.planId && a.type !== 'text' && (a.status ?? 'pending') === 'pending'
-      );
-
-      // Build tasks array from plan annotations
-      const tasks = planAnnotations.map(ann => {
-        const textAnn = ann.groupId
-          ? state.annotations.find(a => a.groupId === ann.groupId && a.type === 'text')
-          : undefined;
-        // Extract region from rectangle points [topLeft, bottomRight]
-        const p0 = ann.points[0] ?? { x: 0, y: 0 };
-        const p1 = ann.points[1] ?? p0;
-        const x = Math.min(p0.x, p1.x);
-        const y = Math.min(p0.y, p1.y);
-        const width = Math.abs(p1.x - p0.x) || 100;
-        const height = Math.abs(p1.y - p0.y) || 100;
-        return {
-          planTaskId: ann.planTaskId || ann.id,
-          annotationId: ann.id,
-          instruction: textAnn?.text || ann.text || 'No instruction',
-          region: { x, y, width, height },
-          linkedSelector: ann.linkedSelector,
-          elements: ann.elements?.map(el => ({ selector: el.selector, reactComponent: el.reactComponent })),
-        };
-      });
-
-      if (tasks.length === 0) return;
-
-      // Send single execution job
-      const { jobId } = await sendPlanExecution(
-        screenshotBlob,
-        activePlan.planId,
-        tasks,
-        resolvedBridgeUrl,
-        provider,
-        currentModel.id,
-        getSourceId(),
-      );
-
-      // Collect ALL plan annotation IDs (rect + text) for in-flight tracking
-      const allPlanAnnotationIds: string[] = [];
-      const seen = new Set<string>();
-      for (const ann of planAnnotations) {
-        if (!seen.has(ann.id)) { seen.add(ann.id); allPlanAnnotationIds.push(ann.id); }
-        if (ann.groupId) {
-          for (const mate of state.annotations) {
-            if (mate.groupId === ann.groupId && !seen.has(mate.id)) {
-              seen.add(mate.id);
-              allPlanAnnotationIds.push(mate.id);
-            }
-          }
-        }
-      }
-
-      // Track one in-flight entry with ALL plan annotation IDs
-      setInFlightJobs(prev => ({
-        ...prev,
-        [jobId]: {
-          annotationIds: allPlanAnnotationIds,
-          styleSelectors: [],
-          color: state.activeColor,
-          threadId: activePlan.threadId,
-          planId: activePlan.planId,
-        },
-      }));
-
-      // Mark all plan annotations (rect + text) as in_flight
-      dispatch({
-        type: 'SET_ANNOTATION_STATUS',
-        payload: { ids: allPlanAnnotationIds, status: 'in_flight' },
-      });
-
-      dispatch({ type: 'MARK_CAPTURED' });
-
-    } catch (err) {
-      console.error('[Pare] Failed to approve plan:', err);
-    }
-  }, [activePlan, state.annotations, state.activeColor, resolvedBridgeUrl, provider, currentModel.id, dispatch]);
-
-  const handleDismissPlan = useCallback(() => {
-    setActivePlan(null);
-    // Clear plan annotations
-    if (activePlan?.planId) {
-      const planAnnotations = state.annotations.filter(a => a.planId === activePlan.planId);
-      for (const ann of planAnnotations) {
-        dispatch({ type: 'DELETE_ANNOTATION', payload: { id: ann.id } });
-      }
-    }
-  }, [activePlan, state.annotations, dispatch]);
-
   // Handle question events from bridge → dispatch SET_ANNOTATION_QUESTION
   const processedQuestionJobIdsRef = useRef(new Set<string>());
   useEffect(() => {
@@ -996,93 +756,6 @@ export function PopmeltProvider({
     }
   }, [bridge.pendingQuestions, dispatch, state.annotations]);
 
-  // Handle plan_ready events → trigger materialization (and auto-approve single-task plans)
-  const processedPlanIdsRef = useRef(new Set<string>());
-  const pendingAutoApproveRef = useRef<string | null>(null);
-  useEffect(() => {
-    for (const plan of bridge.pendingPlans) {
-      if (processedPlanIdsRef.current.has(plan.planId)) continue;
-      processedPlanIdsRef.current.add(plan.planId);
-
-      const isSingleTask = plan.tasks.length === 1;
-
-      setActivePlan(prev => {
-        if (prev?.planId !== plan.planId) return prev;
-        return {
-          ...prev,
-          tasks: plan.tasks,
-          threadId: plan.threadId,
-          status: isSingleTask ? 'executing' : 'awaiting_approval',
-        };
-      });
-
-      // Materialize annotations then auto-approve if single task
-      materializePlan(plan.tasks).then(() => {
-        if (isSingleTask) {
-          pendingAutoApproveRef.current = plan.planId;
-        }
-      });
-
-      bridge.dismissPlan(plan.planId);
-    }
-  }, [bridge.pendingPlans]);
-
-  // Auto-approve single-task plans after materialization completes
-  useEffect(() => {
-    if (!pendingAutoApproveRef.current) return;
-    if (!activePlan || activePlan.planId !== pendingAutoApproveRef.current) return;
-
-    // Check that the plan annotations have been materialized
-    const planAnns = state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text');
-    if (planAnns.length === 0) return;
-
-    pendingAutoApproveRef.current = null;
-    handleApprovePlan();
-  }, [activePlan, state.annotations, handleApprovePlan]);
-
-  // Handle plan review events
-  useEffect(() => {
-    for (const review of bridge.planReviews) {
-      if (!activePlan || activePlan.planId !== review.planId) continue;
-      if (review.verdict === 'pass') {
-        setActivePlan(prev => prev ? { ...prev, status: 'done' } : null);
-      }
-      // If fail, the plan stays in executing state — could trigger re-work
-    }
-  }, [bridge.planReviews, activePlan]);
-
-  // Track when all plan workers complete → trigger review
-  const reviewTriggeredRef = useRef(new Set<string>());
-  useEffect(() => {
-    if (!activePlan || activePlan.status !== 'executing') return;
-    if (reviewTriggeredRef.current.has(activePlan.planId)) return;
-
-    // Check if any plan-related jobs are still in flight
-    const planJobs = Object.entries(inFlightJobs).filter(([_, j]) => j.planId === activePlan.planId);
-    if (planJobs.length > 0) return;
-
-    // All workers done — check if there are any plan annotations with resolved/needs_review status
-    const planAnnotations = state.annotations.filter(a =>
-      a.planId === activePlan.planId && (a.status === 'resolved' || a.status === 'needs_review')
-    );
-    if (planAnnotations.length === 0) return;
-
-    // Guard against re-triggering
-    reviewTriggeredRef.current.add(activePlan.planId);
-
-    // Trigger review pass
-    (async () => {
-      try {
-        setActivePlan(prev => prev ? { ...prev, status: 'reviewing' } : null);
-        const screenshotBlob = await captureFullPage(document.body);
-        if (!screenshotBlob) return;
-        await sendPlanReview(activePlan.planId, screenshotBlob, resolvedBridgeUrl, provider, currentModel.id, getSourceId());
-      } catch (err) {
-        console.error('[Pare] Failed to trigger review:', err);
-      }
-    })();
-  }, [activePlan, inFlightJobs, state.annotations, resolvedBridgeUrl, provider, currentModel.id]);
-
   // Compute the active job's annotation color for the toolbar spinner
   const activeJobColor = useMemo(() => {
     if (bridge.activeJobId && bridge.activeJobId in inFlightJobs) {
@@ -1095,6 +768,18 @@ export function PopmeltProvider({
   const handleViewThread = useCallback((threadId: string) => {
     setOpenThreadId(threadId);
   }, []);
+
+  const clearAnnotationHighlight = useCallback(() => setHighlightedAnnotationIds(null), []);
+
+  const handleHoverJob = useCallback((jobId: string | null) => {
+    if (!jobId) { setHighlightedAnnotationIds(null); return; }
+    const job = inFlightJobs[jobId];
+    if (job && job.annotationIds.length > 0) {
+      setHighlightedAnnotationIds(new Set(job.annotationIds));
+    } else {
+      setHighlightedAnnotationIds(null);
+    }
+  }, [inFlightJobs]);
 
   const handleCancelJob = useCallback(async (jobId?: string) => {
     try {
@@ -1203,13 +888,13 @@ export function PopmeltProvider({
           setOpenThreadId(null);
           if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
         }}
-        activePlan={activePlan}
         onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
         onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
         onModelComponentHover={setModelCanvasHoveredComponent}
         modelComponentNames={modelComponentNames}
         modelPanelHoveredComponent={modelPanelHoveredComponent}
         modelSpacingTokenHover={modelSpacingTokenHover}
+        highlightedAnnotationIds={highlightedAnnotationIds}
       />
 
       <AnnotationToolbar
@@ -1217,7 +902,6 @@ export function PopmeltProvider({
         dispatch={dispatch}
         onScreenshot={handleScreenshot}
         onSendToClaude={bridge.isConnected ? handleSendToClaude : undefined}
-        onPlanGoal={bridge.isConnected ? handlePlanGoal : undefined}
         hasActiveJobs={Object.keys(inFlightJobs).length > 0 || bridge.activeJobIds.length > 0}
         activeJobColor={activeJobColor}
         onCrosshairHover={handleEventStreamHover}
@@ -1231,7 +915,6 @@ export function PopmeltProvider({
         onModelChange={bridge.isConnected ? handleModelChange : undefined}
         onViewThread={bridge.isConnected ? handleViewThread : undefined}
         isThreadPanelOpen={openThreadId !== null}
-        activePlan={activePlan}
         mcpStatus={mcpStatus}
         onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
         mcpJustInstalled={mcpJustInstalled}
@@ -1246,6 +929,7 @@ export function PopmeltProvider({
         modelRefreshKey={modelRefreshKey}
         onModelComponentAdded={handleModelComponentAdded}
         onModelComponentRemoved={handleModelComponentRemoved}
+        onMouseEnter={clearAnnotationHighlight}
       />
 
       {openThreadId && bridge.isConnected && (
@@ -1259,12 +943,7 @@ export function PopmeltProvider({
           onReply={handleReply}
           onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
           lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
-          activePlan={activePlan}
-          planAnnotations={activePlan ? state.annotations.filter(a => a.planId === activePlan.planId && a.type !== 'text') : undefined}
-          inFlightJobs={inFlightJobs}
-          onViewThread={handleViewThread}
-          onApprovePlan={activePlan?.status === 'awaiting_approval' ? handleApprovePlan : undefined}
-          onDismissPlan={activePlan?.status === 'awaiting_approval' ? handleDismissPlan : undefined}
+          onMouseEnter={clearAnnotationHighlight}
         />
       )}
 
@@ -1278,6 +957,7 @@ export function PopmeltProvider({
         onReply={handleReply}
         onViewThread={handleViewThread}
         onCancel={handleCancelJob}
+        onHoverJob={handleHoverJob}
         isConnected={bridge.isConnected}
         dismissedThreadIds={dismissedThreadIds}
       />

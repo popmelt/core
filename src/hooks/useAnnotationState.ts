@@ -701,66 +701,6 @@ function handleApplyResolutions(state: AnnotationState, payload: { resolutions: 
   };
 }
 
-function handleAddPlanAnnotation(state: AnnotationState, payload: {
-  groupId: string;
-  planId: string;
-  planTaskId: string;
-  instruction: string;
-  region: { x: number; y: number; width: number; height: number };
-  color: string;
-  linkedSelector?: string;
-  elements?: ElementInfo[];
-}): AnnotationState {
-  const { groupId, planId, planTaskId, instruction, region, color, linkedSelector, elements } = payload;
-
-  // Truncate instruction to first sentence or 60 chars for compact label
-  const label = instruction.length > 60
-    ? instruction.slice(0, 60).replace(/\s+\S*$/, '') + '\u2026'
-    : instruction;
-
-  // Create a rectangle annotation for the region
-  const rectAnnotation: Annotation = {
-    id: generateId(),
-    type: 'rectangle',
-    points: [
-      { x: region.x, y: region.y },
-      { x: region.x + region.width, y: region.y + region.height },
-    ],
-    color,
-    strokeWidth: 2,
-    timestamp: Date.now(),
-    groupId,
-    linkedSelector,
-    elements,
-    planId,
-    planTaskId,
-    status: 'pending' as AnnotationLifecycleStatus,
-  };
-
-  // Create a text annotation with truncated label (full instruction stays in feedback payload)
-  const textAnnotation: Annotation = {
-    id: generateId(),
-    type: 'text',
-    points: [{ x: region.x, y: region.y + region.height + 4 }],
-    text: label,
-    fontSize: 12,
-    color,
-    strokeWidth: 2,
-    timestamp: Date.now(),
-    status: 'pending' as AnnotationLifecycleStatus,
-    groupId,
-    linkedSelector,
-    elements,
-    planId,
-    planTaskId,
-  };
-
-  return {
-    ...state,
-    annotations: [...state.annotations, rectAnnotation, textAnnotation],
-  };
-}
-
 function handleCleanupOrphaned(state: AnnotationState, payload: { linkedSelectors: string[]; styleSelectors: string[] }): AnnotationState {
   const { linkedSelectors, styleSelectors } = payload;
   const linkedSet = new Set(linkedSelectors);
@@ -930,7 +870,6 @@ const handlers: Record<string, Handler> = {
   SET_ANNOTATION_THREAD: handleSetAnnotationThread,
   SET_ANNOTATION_QUESTION: handleSetAnnotationQuestion,
   APPLY_RESOLUTIONS: handleApplyResolutions,
-  ADD_PLAN_ANNOTATION: handleAddPlanAnnotation,
   ADD_SPACING_TOKEN_CHANGE: handleAddSpacingTokenChange,
   RESTORE_SPACING_TOKEN_CHANGES: handleRestoreSpacingTokenChanges,
   MODIFY_SPACING_TOKEN: handleModifySpacingToken,

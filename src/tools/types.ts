@@ -104,9 +104,6 @@ export type Annotation = {
   linkedSelector?: string; // CSS selector of linked DOM element (inspector pin)
   linkedAnchor?: 'top-left' | 'bottom-left'; // Which corner to anchor to
   imageCount?: number; // Number of pasted images attached (blobs stored out-of-band)
-  // Planner fields
-  planId?: string;
-  planTaskId?: string;
 };
 
 /** A token modification tracked for undo/redo. Stores enough to revert both
@@ -217,13 +214,3 @@ export type AnnotationAction =
   | { type: 'RESTORE_SPACING_TOKEN_CHANGES'; payload: SpacingTokenChange[] }
   | { type: 'MODIFY_SPACING_TOKEN'; payload: SpacingTokenMod }
   | { type: 'DELETE_SPACING_TOKEN'; payload: { tokenPath: string; originalValue: string } }
-  | { type: 'ADD_PLAN_ANNOTATION'; payload: {
-      groupId: string;
-      planId: string;
-      planTaskId: string;
-      instruction: string;
-      region: { x: number; y: number; width: number; height: number };
-      color: string;
-      linkedSelector?: string;
-      elements?: ElementInfo[];
-    } };

@@ -13,6 +13,7 @@ export type ParsedMultipart = {
   planId?: string;
   manifest?: string;
   tasks?: string;
+  sourceId?: string;
   // Pasted images (from annotation comments)
   pastedImages: { annotationId: string; index: number; data: Buffer }[];
 };
@@ -44,6 +45,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   let planId: string | undefined;
   let manifest: string | undefined;
   let tasks: string | undefined;
+  let sourceId: string | undefined;
   const pastedImages: { annotationId: string; index: number; data: Buffer }[] = [];
 
   // Split body by delimiter
@@ -113,6 +115,8 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
       manifest = part.body.toString('utf-8');
     } else if (name === 'tasks') {
       tasks = part.body.toString('utf-8');
+    } else if (name === 'sourceId') {
+      sourceId = part.body.toString('utf-8');
     } else if (name!.startsWith('image-')) {
       // image-{annotationId}-{index}
       const segments = name!.split('-');
@@ -129,7 +133,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   // feedback is optional for plan endpoints
   if (!feedback) feedback = '';
 
-  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks, pastedImages };
+  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks, sourceId, pastedImages };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

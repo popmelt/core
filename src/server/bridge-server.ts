@@ -14,10 +14,10 @@ import { Materializer } from './materializer';
 import { detectClaudeMcp, detectCodexMcp } from './mcp-detect';
 import { installClaudeMcp, installCodexMcp } from './mcp-install';
 import { parseMultipart } from './multipart';
-import { buildPlanExecutorPrompt, buildPlannerPrompt, buildPrompt, buildReplyPrompt, buildReviewerPrompt, formatFeedbackContext, parseAllResolutions, parseNovelPatterns, parsePlan, parseQuestion, parseResolutions, parseReview } from './prompt-builder';
+import { buildPrompt, buildReplyPrompt, formatFeedbackContext, parseNovelPatterns, parseQuestion, parseResolutions } from './prompt-builder';
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
-import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, JobGroup, Provider, SSEClient, SSEEvent } from './types';
+import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, Provider, SSEClient, SSEEvent } from './types';
 
 const DEFAULT_PORT = 1111;
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
@@ -182,8 +182,6 @@ export async function createPopmelt(
       }
     },
   });
-  const jobGroups = new Map<string, JobGroup>();
-
   // Recent completed jobs (for reconnect state recovery)
   const RECENT_JOBS_MAX = 20;
   const RECENT_JOBS_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -269,32 +267,9 @@ export async function createPopmelt(
     const tag = ansiColor(job.color, `[⊹ ${boundPort}:${job.id}]`);
     console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
 
-    // Incremental resolution tracking for plan executor jobs
-    const isPlanExecutor = !!(job as Job & { _isPlanExecutor?: boolean })._isPlanExecutor;
-    let deltaBuffer = '';
-    let lastResolutionCount = 0;
-
     const onEvent = (event: SSEEvent, jobId: string) => {
       queue.broadcast(event, jobId, job.sourceId);
-
-      // For plan executor jobs, accumulate delta text and check for new resolutions
-      if (isPlanExecutor && event.type === 'delta' && 'text' in event) {
-        deltaBuffer += event.text;
-        const resolutions = parseAllResolutions(deltaBuffer);
-        if (resolutions.length > lastResolutionCount) {
-          const newResolutions = resolutions.slice(lastResolutionCount);
-          lastResolutionCount = resolutions.length;
-          queue.broadcast(
-            { type: 'task_resolved', jobId, planId: job.planId!, resolutions: newResolutions, threadId: job.threadId },
-            jobId,
-            job.sourceId,
-          );
-        }
-      }
     };
-
-    // Use per-job tool overrides (e.g. planner gets Read-only)
-    const jobAllowedTools = (job as Job & { _allowedTools?: string[] })._allowedTools ?? allowedTools;
 
     const { process: proc, result } = provider === 'codex'
       ? spawnCodex(job.id, {
@@ -310,7 +285,7 @@ export async function createPopmelt(
           projectRoot,
           maxTurns,
           maxBudgetUsd,
-          allowedTools: jobAllowedTools,
+          allowedTools,
           claudePath,
           resumeSessionId,
           model: job.model,
@@ -399,8 +374,6 @@ export async function createPopmelt(
             model: job.model,
             sessionId: spawnResult.sessionId,
             threadId: job.threadId,
-            planId: job.planId,
-            planTaskId: job.planTaskId,
             responseText: spawnResult.text,
             resolutions: resolutions.length > 0 ? resolutions : [],
             question: question ?? undefined,
@@ -421,46 +394,6 @@ export async function createPopmelt(
         });
         if (hasPatternScope) {
           materializer.run().catch(() => {}); // fire-and-forget
-        }
-      }
-
-      // Planner completion: parse plan and broadcast plan_ready
-      if (job.planId && !job.planTaskId) {
-        const group = jobGroups.get(job.planId);
-        if (group) {
-          const plan = parsePlan(spawnResult.text);
-          if (plan && plan.length > 0) {
-            group.plan = plan;
-            group.status = 'awaiting_approval';
-            group.plannerThreadId = job.threadId;
-            console.log(`${tag} Plan ready: ${plan.length} tasks for group ${job.planId}`);
-            queue.broadcast(
-              { type: 'plan_ready', jobId: job.id, planId: job.planId, tasks: plan, threadId: job.threadId },
-              job.id,
-              job.sourceId,
-            );
-          } else if (!question) {
-            // Plan parsing failed and no question — error
-            group.status = 'error';
-            console.error(`${tag} Failed to parse plan from planner response`);
-          }
-        }
-      }
-
-      // Review completion: parse review verdict
-      if (job.planId && (job as Job & { _isReview?: boolean })._isReview) {
-        const group = jobGroups.get(job.planId);
-        if (group) {
-          const review = parseReview(spawnResult.text);
-          if (review) {
-            group.status = review.verdict === 'pass' ? 'done' : 'executing';
-            console.log(`${tag} Review verdict: ${review.verdict} — ${review.summary}`);
-            queue.broadcast(
-              { type: 'plan_review', planId: job.planId, verdict: review.verdict, summary: review.summary, issues: review.issues },
-              job.id,
-              job.sourceId,
-            );
-          }
         }
       }
 
@@ -548,16 +481,6 @@ export async function createPopmelt(
         handleCancel(req, res);
       } else if (req.method === 'POST' && path === '/materialize') {
         await handleMaterialize(res);
-      } else if (req.method === 'POST' && path === '/plan') {
-        await handlePlan(req, res);
-      } else if (req.method === 'POST' && path === '/plan/approve') {
-        await handlePlanApprove(req, res);
-      } else if (req.method === 'POST' && path === '/plan/execute') {
-        await handlePlanExecute(req, res);
-      } else if (req.method === 'POST' && path === '/plan/review') {
-        await handlePlanReview(req, res);
-      } else if (req.method === 'GET' && path.startsWith('/plan/')) {
-        handleGetPlan(path.slice('/plan/'.length), res);
       } else if (req.method === 'POST' && path === '/model/component') {
         await handleAddComponent(req, res);
       } else if (req.method === 'DELETE' && path === '/model/component') {
@@ -621,8 +544,8 @@ export async function createPopmelt(
       .map(a => a.linkedSelector)
       .filter((s): s is string => !!s);
 
-    // Find or create thread
-    let threadId: string | undefined;
+    // Find or create thread (always create one so the chip can open the thread panel)
+    let threadId: string;
     if (linkedSelectors.length > 0) {
       const existingThread = await threadStore.findContinuationThread(linkedSelectors);
       if (existingThread) {
@@ -633,6 +556,9 @@ export async function createPopmelt(
         const newThread = await threadStore.createThread(jobId, linkedSelectors);
         threadId = newThread.id;
       }
+    } else {
+      const newThread = await threadStore.createThread(jobId, []);
+      threadId = newThread.id;
     }
 
     const annotationIds = feedback.annotations.map(a => a.id);
@@ -653,22 +579,20 @@ export async function createPopmelt(
     };
 
     // Append human message to thread
-    if (threadId) {
-      const feedbackSummary = feedback.annotations
-        .map(a => a.instruction || `[${a.type}]`)
-        .join('; ');
-      const feedbackContext = formatFeedbackContext(feedback, Object.keys(imagePaths).length > 0 ? imagePaths : undefined);
+    const feedbackSummary = feedback.annotations
+      .map(a => a.instruction || `[${a.type}]`)
+      .join('; ');
+    const feedbackContext = formatFeedbackContext(feedback, Object.keys(imagePaths).length > 0 ? imagePaths : undefined);
 
-      await threadStore.appendMessage(threadId, {
-        role: 'human',
-        timestamp: Date.now(),
-        jobId,
-        screenshotPath,
-        annotationIds,
-        feedbackSummary,
-        feedbackContext: feedbackContext || undefined,
-      });
-    }
+    await threadStore.appendMessage(threadId, {
+      role: 'human',
+      timestamp: Date.now(),
+      jobId,
+      screenshotPath,
+      annotationIds,
+      feedbackSummary,
+      feedbackContext: feedbackContext || undefined,
+    });
 
     const position = queue.enqueue(job);
 
@@ -857,10 +781,28 @@ export async function createPopmelt(
     });
   }
 
-  function handleCancel(req: IncomingMessage, res: ServerResponse) {
+  async function handleCancel(req: IncomingMessage, res: ServerResponse) {
     const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const jobId = reqUrl.searchParams.get('jobId');
+
+    // Collect threadIds before cancelling (cancelJob deletes the job)
+    const jobsToCancel = jobId
+      ? queue.allActive.filter(j => j.id === jobId)
+      : queue.allActive;
+    const threadIds = jobsToCancel.map(j => j.threadId).filter(Boolean) as string[];
+
     const cancelled = jobId ? queue.cancelJob(jobId) : queue.cancelActive();
+
+    // Append cancellation message to each affected thread
+    for (const tid of threadIds) {
+      await threadStore.appendMessage(tid, {
+        role: 'assistant',
+        timestamp: Date.now(),
+        jobId: jobId || '',
+        cancelled: true,
+      });
+    }
+
     sendJson(res, 200, { cancelled });
   }
 
@@ -876,283 +818,6 @@ export async function createPopmelt(
     }
     materializer.run().catch(() => {}); // fire-and-forget
     sendJson(res, 200, { started: true, decisionCount: pending.length, decisionIds: pending.map(d => d.id) });
-  }
-
-  async function handlePlan(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, goal: goalStr, pageUrl: pageUrlStr, viewport: viewportStr, provider: providerStr, model: modelStr, manifest: manifestStr, sourceId: sourceIdStr } = await parseMultipart(req);
-
-    if (!screenshot || !goalStr) {
-      sendJson(res, 400, { error: 'Missing screenshot or goal' });
-      return;
-    }
-
-    const pageUrl = pageUrlStr || '';
-    let viewport = { width: 1440, height: 900 };
-    try {
-      if (viewportStr) viewport = JSON.parse(viewportStr);
-    } catch {}
-
-    // Parse optional feedback context (annotations + style modifications from the canvas)
-    let feedbackContext: string | undefined;
-    if (feedbackStr) {
-      try {
-        const feedback: FeedbackPayload = JSON.parse(feedbackStr);
-        const ctx = formatFeedbackContext(feedback);
-        if (ctx) feedbackContext = ctx;
-      } catch {
-        // Invalid feedback JSON — skip
-      }
-    }
-
-    const planId = randomUUID().slice(0, 8);
-    const jobId = randomUUID().slice(0, 8);
-    const screenshotPath = join(tempDir, `screenshot-plan-${planId}.png`);
-    await writeFile(screenshotPath, screenshot);
-
-    // Create thread for planner conversation
-    const thread = await threadStore.createThread(jobId, []);
-    const threadId = thread.id;
-
-    // Create job group
-    const group: JobGroup = {
-      id: planId,
-      goal: goalStr,
-      status: 'planning',
-      plannerJobId: jobId,
-      plannerThreadId: threadId,
-      workerJobIds: [],
-      screenshotPath,
-      pageUrl,
-      viewport,
-      createdAt: Date.now(),
-    };
-    jobGroups.set(planId, group);
-
-    // Build planner prompt
-    const prompt = buildPlannerPrompt(screenshotPath, goalStr, pageUrl, viewport, manifestStr, feedbackContext);
-
-    // Append human message to thread
-    await threadStore.appendMessage(threadId, {
-      role: 'human',
-      timestamp: Date.now(),
-      jobId,
-      screenshotPath,
-      feedbackSummary: `Plan: ${goalStr}`,
-      feedbackContext: `Goal: ${goalStr}\nPage: ${pageUrl}`,
-    });
-
-    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
-    const job: Job = {
-      id: jobId,
-      status: 'queued',
-      screenshotPath,
-      feedback: {
-        timestamp: new Date().toISOString(),
-        url: pageUrl,
-        viewport,
-        scrollPosition: { x: 0, y: 0 },
-        annotations: [],
-        styleModifications: [],
-      },
-      createdAt: Date.now(),
-      threadId,
-      provider,
-      model: modelStr || undefined,
-      planId,
-      sourceId: sourceIdStr || undefined,
-    };
-
-    // Override prompt and tools for planner (vision-only, no code changes)
-    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
-    (job as Job & { _allowedTools?: string[] })._allowedTools = ['Read'];
-
-    const position = queue.enqueue(job);
-    sendJson(res, 200, { planId, jobId, position, threadId });
-  }
-
-  async function handlePlanApprove(req: IncomingMessage, res: ServerResponse) {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-    }
-    const body = Buffer.concat(chunks).toString('utf-8');
-
-    let parsed: { planId?: string; approvedTaskIds?: string[] };
-    try {
-      parsed = JSON.parse(body);
-    } catch {
-      sendJson(res, 400, { error: 'Invalid JSON' });
-      return;
-    }
-
-    const { planId, approvedTaskIds } = parsed;
-    if (!planId) {
-      sendJson(res, 400, { error: 'Missing planId' });
-      return;
-    }
-
-    const group = jobGroups.get(planId);
-    if (!group) {
-      sendJson(res, 404, { error: 'Plan not found' });
-      return;
-    }
-
-    if (!group.plan) {
-      sendJson(res, 400, { error: 'Plan has no tasks' });
-      return;
-    }
-
-    // Filter tasks if specific IDs were approved
-    const tasks = approvedTaskIds
-      ? group.plan.filter(t => approvedTaskIds.includes(t.id))
-      : group.plan;
-
-    group.status = 'executing';
-
-    sendJson(res, 200, { planId, tasks, status: 'executing' });
-  }
-
-  async function handlePlanExecute(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, planId: planIdStr, tasks: tasksStr, provider: providerStr, model: modelStr, sourceId: sourceIdStr } = await parseMultipart(req);
-
-    if (!planIdStr || !tasksStr || !screenshot) {
-      sendJson(res, 400, { error: 'Missing planId, tasks, or screenshot' });
-      return;
-    }
-
-    const group = jobGroups.get(planIdStr);
-    if (!group) {
-      sendJson(res, 404, { error: 'Plan not found' });
-      return;
-    }
-
-    if (group.status !== 'executing') {
-      sendJson(res, 400, { error: `Plan status is ${group.status}, expected executing` });
-      return;
-    }
-
-    let tasks: Array<{
-      planTaskId: string;
-      annotationId: string;
-      instruction: string;
-      region: { x: number; y: number; width: number; height: number };
-      linkedSelector?: string;
-      elements?: Array<{ selector: string; reactComponent?: string }>;
-    }>;
-    try {
-      tasks = JSON.parse(tasksStr);
-    } catch {
-      sendJson(res, 400, { error: 'Invalid tasks JSON' });
-      return;
-    }
-
-    const jobId = randomUUID().slice(0, 8);
-    const screenshotPath = join(tempDir, `screenshot-exec-${planIdStr}.png`);
-    await writeFile(screenshotPath, screenshot);
-
-    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
-    const prompt = buildPlanExecutorPrompt(screenshotPath, tasks, group.pageUrl, group.viewport, provider);
-
-    // Collect all annotation IDs from tasks
-    const annotationIds = tasks.map(t => t.annotationId);
-
-    const job: Job = {
-      id: jobId,
-      status: 'queued',
-      screenshotPath,
-      feedback: {
-        timestamp: new Date().toISOString(),
-        url: group.pageUrl,
-        viewport: group.viewport,
-        scrollPosition: { x: 0, y: 0 },
-        annotations: [],
-        styleModifications: [],
-      },
-      createdAt: Date.now(),
-      provider,
-      model: modelStr || undefined,
-      planId: planIdStr,
-      annotationIds,
-      sourceId: sourceIdStr || undefined,
-    };
-
-    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
-    (job as Job & { _isPlanExecutor?: boolean })._isPlanExecutor = true;
-
-    group.executorJobId = jobId;
-
-    const position = queue.enqueue(job);
-    sendJson(res, 200, { jobId, planId: planIdStr, position });
-  }
-
-  async function handlePlanReview(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, planId: planIdStr, provider: providerStr, model: modelStr, sourceId: sourceIdStr } = await parseMultipart(req);
-
-    if (!planIdStr) {
-      sendJson(res, 400, { error: 'Missing planId' });
-      return;
-    }
-
-    const group = jobGroups.get(planIdStr);
-    if (!group) {
-      sendJson(res, 404, { error: 'Plan not found' });
-      return;
-    }
-
-    group.status = 'reviewing';
-
-    const jobId = randomUUID().slice(0, 8);
-    let screenshotPath = group.screenshotPath;
-    if (screenshot) {
-      screenshotPath = join(tempDir, `screenshot-review-${planIdStr}.png`);
-      await writeFile(screenshotPath, screenshot);
-    }
-
-    // Build completed tasks summary from worker results
-    const completedTasks = (group.plan || []).map(t => ({
-      id: t.id,
-      instruction: t.instruction,
-      summary: 'completed', // Workers will have set resolution summaries
-    }));
-
-    const prompt = buildReviewerPrompt(screenshotPath, group.goal, completedTasks);
-
-    const provider = (providerStr === 'claude' || providerStr === 'codex') ? providerStr : defaultProvider;
-    const job: Job = {
-      id: jobId,
-      status: 'queued',
-      screenshotPath,
-      feedback: {
-        timestamp: new Date().toISOString(),
-        url: group.pageUrl,
-        viewport: group.viewport,
-        scrollPosition: { x: 0, y: 0 },
-        annotations: [],
-        styleModifications: [],
-      },
-      createdAt: Date.now(),
-      // Don't set threadId — avoids resuming planner session, which would discard the review prompt
-      provider,
-      model: modelStr || undefined,
-      planId: planIdStr,
-      sourceId: sourceIdStr || undefined,
-    };
-
-    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
-    (job as Job & { _isReview?: boolean })._isReview = true;
-    (job as Job & { _allowedTools?: string[] })._allowedTools = ['Read'];
-
-    const position = queue.enqueue(job);
-    sendJson(res, 200, { jobId, planId: planIdStr, position });
-  }
-
-  function handleGetPlan(planId: string, res: ServerResponse) {
-    const group = jobGroups.get(planId);
-    if (!group) {
-      sendJson(res, 404, { error: 'Plan not found' });
-      return;
-    }
-    sendJson(res, 200, group);
   }
 
   async function handleMcpInstall(req: IncomingMessage, res: ServerResponse) {

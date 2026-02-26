@@ -3,7 +3,7 @@
 import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING } from '../tools/text';
+import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING, getEffectiveMaxWidth, wrapLines } from '../tools/text';
 import type { Annotation, AnnotationLifecycleStatus } from '../tools/types';
 import { findElementBySelector } from '../utils/dom';
 
@@ -21,10 +21,6 @@ const THINKING_WORDS = [
 ];
 const WORD_INTERVAL = 3000;
 
-const PLANNING_WORDS = [
-  'planning', 'strategizing', 'scheming', 'mapping',
-  'scoping', 'drafting', 'outlining', 'architecting',
-];
 
 /**
  * Fixed-position badge wrapper that stays within the viewport via CSS clamping.
@@ -63,6 +59,7 @@ export function AnnotationBadges({
   annotationGroupMap,
   onViewThread,
   onSelectAnnotation,
+  canvasRef,
 }: {
   annotations: Annotation[];
   supersededAnnotations: Set<Annotation>;
@@ -72,6 +69,7 @@ export function AnnotationBadges({
   annotationGroupMap: Map<string, number>;
   onViewThread?: (threadId: string) => void;
   onSelectAnnotation?: (id: string) => void;
+  canvasRef?: React.RefObject<HTMLCanvasElement | null>;
 }) {
   const [charIndex, setCharIndex] = useState(0);
   const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * THINKING_WORDS.length));
@@ -129,7 +127,7 @@ export function AnnotationBadges({
 
     const threadId = annotation.threadId || groupAnns.find(a => a.threadId)?.threadId;
     const isNeedsReview = status === 'needs_review' || groupAnns.some(a => a.status === 'needs_review');
-    const replyCount = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0) || 1;
+    const replyCount = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0);
 
     const point = annotation.points[0];
     const fontSize = annotation.fontSize || 12;
@@ -141,20 +139,29 @@ export function AnnotationBadges({
       ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
       : lines;
 
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
+    // Reuse the display canvas context for text measurement so DPR scaling
+    // and font hinting match the actual rendered text (avoids wrapping drift).
+    const ctx = canvasRef?.current?.getContext('2d') ?? document.createElement('canvas').getContext('2d');
     if (!ctx) continue;
 
     ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
-    const totalHeight = displayLines.length * lineHeightPx;
+
+    // Account for viewport-constrained wrapping
+    const viewportX = point.x - scrollX;
+    const effectiveMax = getEffectiveMaxWidth(viewportX);
+    const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : MAX_DISPLAY_WIDTH;
+    const wrapped = wrapLines(ctx, displayLines, capWidth);
+    const maxWidth = Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)));
+    const wrappedHeight = wrapped.length * lineHeightPx;
+    const originalHeight = displayLines.length * lineHeightPx;
+    const yShift = wrappedHeight - originalHeight;
 
     badges.push({
       id: annotation.id,
       threadId,
       x: point.x + maxWidth + PADDING,
-      y: point.y - PADDING,
-      size: totalHeight + PADDING * 2,
+      y: point.y - PADDING - yShift,
+      size: wrappedHeight + PADDING * 2,
       color: annotation.color,
       isInFlight,
       isNeedsReview,
@@ -233,7 +240,9 @@ export function AnnotationBadges({
                   </svg>
                 )}
                 <span style={{ opacity: 0.7 }}>
-                  {pos.replyCount} {pos.replyCount === 1 ? 'reply' : 'replies'}
+                  {pos.replyCount > 0
+                    ? `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`
+                    : 'Cancelled'}
                 </span>
               </>
             )}
@@ -241,211 +250,6 @@ export function AnnotationBadges({
         </BadgeHitArea>
       ))}
     </>
-  );
-}
-
-// "Plan waiting" badge for annotations whose plan is planning or awaiting approval
-export function PlanWaitingBadges({
-  annotations,
-  supersededAnnotations,
-  scrollX,
-  scrollY,
-  annotationGroupMap,
-  planThreadId,
-  taskCount,
-  planStatus,
-  onViewThread,
-  onSelectAnnotation,
-}: {
-  annotations: Annotation[];
-  supersededAnnotations: Set<Annotation>;
-  scrollX: number;
-  scrollY: number;
-  annotationGroupMap: Map<string, number>;
-  planThreadId: string;
-  taskCount: number;
-  planStatus: 'planning' | 'awaiting_approval';
-  onViewThread: (threadId: string) => void;
-  onSelectAnnotation?: (id: string) => void;
-}) {
-  // Find text annotations linked to the plan thread, or pending text annotations
-  // that haven't been resolved yet (they triggered the plan)
-  const badgePositions: { annotation: Annotation; x: number; y: number; size: number; groupNumber?: number }[] = [];
-
-  for (const annotation of annotations) {
-    if (annotation.type !== 'text' || !annotation.text || !annotation.points[0]) continue;
-    if (supersededAnnotations.has(annotation)) continue;
-
-    const status = annotation.status ?? 'pending';
-    const groupAnns = annotation.groupId
-      ? annotations.filter(a => a.groupId === annotation.groupId)
-      : [annotation];
-    const hasThread = groupAnns.some(a => a.threadId === planThreadId);
-    // Fallback: captured/in_flight text annotations with no planId are likely the plan trigger
-    const isPlanTrigger = !hasThread && !annotation.planId &&
-      (status === 'in_flight' || status === 'pending' || annotation.captured) &&
-      !groupAnns.some(a => a.status === 'resolved' || a.status === 'needs_review');
-
-    if (!hasThread && !isPlanTrigger) continue;
-    // Skip annotations that already have resolution badges
-    if (status === 'resolved' || status === 'needs_review') continue;
-
-    const point = annotation.points[0];
-    const fontSize = annotation.fontSize || 12;
-    const lineHeightPx = fontSize * LINE_HEIGHT;
-    const lines = annotation.text.split('\n');
-
-    const groupNumber = annotationGroupMap.get(annotation.id);
-    const displayLines = groupNumber !== undefined
-      ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
-      : lines;
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    if (!ctx) continue;
-
-    ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-    const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
-    const totalHeight = displayLines.length * lineHeightPx;
-    const annotationHeight = totalHeight + PADDING * 2;
-
-    badgePositions.push({
-      annotation,
-      x: point.x + maxWidth + PADDING,
-      y: point.y - PADDING,
-      size: annotationHeight,
-      groupNumber,
-    });
-  }
-
-  if (badgePositions.length === 0) return null;
-
-  const isPlanning = planStatus === 'planning';
-
-  return (
-    <>
-      {badgePositions.map(({ annotation, x, y, size }) => (
-        isPlanning
-          ? <PlanningSpinner
-              key={`plan-thinking-${annotation.id}`}
-              x={x - scrollX}
-              y={y - scrollY}
-              size={size}
-              color={annotation.color}
-              onClick={() => {
-                onSelectAnnotation?.(annotation.id);
-                onViewThread(planThreadId);
-              }}
-            />
-          : <BadgeHitArea
-              key={`plan-waiting-${annotation.id}`}
-              left={x - scrollX - BADGE_HIT_PAD}
-              top={y - scrollY - BADGE_HIT_PAD}
-              onClick={() => {
-                onSelectAnnotation?.(annotation.id);
-                onViewThread(planThreadId);
-              }}
-              style={{
-                cursor: 'pointer',
-                zIndex: 9999,
-                pointerEvents: 'auto',
-              }}
-            >
-              <div
-                data-devtools="plan-waiting-badge"
-                style={{
-                  height: size,
-                  display: 'flex',
-                  alignItems: 'center',
-                  backgroundColor: annotation.color,
-                  fontFamily: FONT_FAMILY,
-                  fontSize: 12,
-                  color: '#ffffff',
-                  userSelect: 'none',
-                  padding: `0 ${PADDING}px`,
-                  gap: 4,
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
-                  <line x1="12" y1="17" x2="12.01" y2="17" />
-                </svg>
-                <span style={{ opacity: 0.7 }}>
-                  {taskCount} task{taskCount !== 1 ? 's' : ''} — approve?
-                </span>
-              </div>
-            </BadgeHitArea>
-      ))}
-    </>
-  );
-}
-
-function PlanningSpinner({ x, y, size, color, onClick }: { x: number; y: number; size: number; color: string; onClick?: () => void }) {
-  const [charIndex, setCharIndex] = useState(0);
-  const [wordIndex, setWordIndex] = useState(() => Math.floor(Math.random() * PLANNING_WORDS.length));
-
-  useEffect(() => {
-    const charTimer = setInterval(() => {
-      setCharIndex((i) => (i + 1) % SPINNER_FRAME_COUNT);
-    }, SPINNER_INTERVAL);
-    const wordTimer = setInterval(() => {
-      setWordIndex((i) => (i + 1) % PLANNING_WORDS.length);
-    }, WORD_INTERVAL);
-    return () => {
-      clearInterval(charTimer);
-      clearInterval(wordTimer);
-    };
-  }, []);
-
-  return (
-    <BadgeHitArea
-      left={x - BADGE_HIT_PAD}
-      top={y - BADGE_HIT_PAD}
-      onClick={onClick}
-      style={{
-        pointerEvents: onClick ? 'auto' : 'none',
-        cursor: onClick ? 'pointer' : undefined,
-        zIndex: 9999,
-      }}
-    >
-      <div
-        data-devtools="plan-thinking-badge"
-        style={{
-          height: size,
-          display: 'flex',
-          alignItems: 'center',
-          backgroundColor: color,
-          fontFamily: FONT_FAMILY,
-          fontSize: 12,
-          color: '#ffffff',
-          userSelect: 'none',
-          padding: `0 ${PADDING}px`,
-          gap: 4,
-          whiteSpace: 'nowrap',
-        }}
-      >
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
-          {charIndex === 1 ? (
-            <>
-              <circle cx="7" cy="7" r="2" />
-              <circle cx="17" cy="7" r="2" />
-              <circle cx="7" cy="17" r="2" />
-              <circle cx="17" cy="17" r="2" />
-            </>
-          ) : (
-            <>
-              <circle cx="12" cy="6" r="2" />
-              <circle cx="6" cy="12" r="2" />
-              <circle cx="18" cy="12" r="2" />
-              <circle cx="12" cy="18" r="2" />
-            </>
-          )}
-        </svg>
-        <span style={{ opacity: 0.7 }}>{PLANNING_WORDS[wordIndex]}</span>
-      </div>
-    </BadgeHitArea>
   );
 }
 
@@ -574,6 +378,7 @@ export function QuestionBadges({
   scrollY,
   onReply,
   annotationGroupMap,
+  canvasRef,
 }: {
   annotations: Annotation[];
   supersededAnnotations: Set<Annotation>;
@@ -581,6 +386,7 @@ export function QuestionBadges({
   scrollY: number;
   onReply: (threadId: string, reply: string) => void;
   annotationGroupMap: Map<string, number>;
+  canvasRef?: React.RefObject<HTMLCanvasElement | null>;
 }) {
   const waitingAnnotations = annotations.filter(a => {
     if (supersededAnnotations.has(a)) return false;
@@ -617,14 +423,21 @@ export function QuestionBadges({
       if (!ctx) continue;
 
       ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-      const maxWidth = Math.min(MAX_DISPLAY_WIDTH, Math.max(...displayLines.map((line) => ctx.measureText(line).width)));
-      const totalHeight = displayLines.length * lineHeightPx;
-      const annotationHeight = totalHeight + PADDING * 2;
+
+      const viewportX = point.x - scrollX;
+      const effectiveMax = getEffectiveMaxWidth(viewportX);
+      const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : MAX_DISPLAY_WIDTH;
+      const wrapped = wrapLines(ctx, displayLines, capWidth);
+      const maxWidth = Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)));
+      const wrappedHeight = wrapped.length * lineHeightPx;
+      const originalHeight = displayLines.length * lineHeightPx;
+      const yShift = wrappedHeight - originalHeight;
+      const annotationHeight = wrappedHeight + PADDING * 2;
 
       badges.push({
         annotation,
         x: point.x + maxWidth + PADDING,
-        y: point.y - PADDING,
+        y: point.y - PADDING - yShift,
         size: annotationHeight,
       });
     }
