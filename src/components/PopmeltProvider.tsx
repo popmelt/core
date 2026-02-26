@@ -342,6 +342,16 @@ export function PopmeltProvider({
     } catch {}
   }, [inFlightJobs]);
 
+  // Persistent map of jobId→annotationIds (survives job completion, used for hover highlight)
+  const jobAnnotationMapRef = useRef<Map<string, string[]>>(new Map());
+  useEffect(() => {
+    for (const [jobId, job] of Object.entries(inFlightJobs)) {
+      if (job.annotationIds.length > 0) {
+        jobAnnotationMapRef.current.set(jobId, job.annotationIds);
+      }
+    }
+  }, [inFlightJobs]);
+
   // Recovery: annotations hydrate from localStorage via PASTE_ANNOTATIONS (after mount).
   // Any annotation stuck in 'in_flight' with no matching active job is a ghost — reset it.
   const didRecoverRef = useRef(false);
@@ -769,17 +779,16 @@ export function PopmeltProvider({
     setOpenThreadId(threadId);
   }, []);
 
-  const clearAnnotationHighlight = useCallback(() => setHighlightedAnnotationIds(null), []);
 
   const handleHoverJob = useCallback((jobId: string | null) => {
     if (!jobId) { setHighlightedAnnotationIds(null); return; }
-    const job = inFlightJobs[jobId];
-    if (job && job.annotationIds.length > 0) {
-      setHighlightedAnnotationIds(new Set(job.annotationIds));
+    const annotationIds = jobAnnotationMapRef.current.get(jobId);
+    if (annotationIds && annotationIds.length > 0) {
+      setHighlightedAnnotationIds(new Set(annotationIds));
     } else {
       setHighlightedAnnotationIds(null);
     }
-  }, [inFlightJobs]);
+  }, []);
 
   const handleCancelJob = useCallback(async (jobId?: string) => {
     try {
@@ -929,7 +938,6 @@ export function PopmeltProvider({
         modelRefreshKey={modelRefreshKey}
         onModelComponentAdded={handleModelComponentAdded}
         onModelComponentRemoved={handleModelComponentRemoved}
-        onMouseEnter={clearAnnotationHighlight}
       />
 
       {openThreadId && bridge.isConnected && (
@@ -943,7 +951,6 @@ export function PopmeltProvider({
           onReply={handleReply}
           onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
           lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
-          onMouseEnter={clearAnnotationHighlight}
         />
       )}
 

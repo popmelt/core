@@ -120,17 +120,11 @@ export async function createPopmelt(
     }
   }
 
-  /** Fire a trivial CLI invocation to prime OS caches (DNS, TLS, project index). */
-  function warmUpCli(cli: string, cliPath: string, cwd: string): Promise<boolean> {
+  /** Fire --version to prime OS file/binary caches. No API calls, no side effects. */
+  function warmUpCli(cli: string, cliPath: string): Promise<boolean> {
     return new Promise((resolve) => {
-      const args = cli === 'codex'
-        ? ['exec', '--json', '--full-auto', 'ok']
-        : ['-p', 'ok', '--output-format', 'stream-json', '--max-turns', '1', '--verbose'];
-
-      const child = spawn(cliPath, args, {
-        cwd,
-        stdio: ['ignore', 'ignore', 'pipe'],
-        env: { ...process.env, ANTHROPIC_API_KEY: undefined },
+      const child = spawn(cliPath, ['--version'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
       });
 
       let resolved = false;
@@ -138,20 +132,11 @@ export async function createPopmelt(
 
       const timeout = setTimeout(() => {
         child.kill('SIGTERM');
-        // SIGKILL fallback if SIGTERM is ignored
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 5_000);
-        done(true); // Timeout is OK — CLI was alive, just slow
-      }, 30_000);
+        done(true);
+      }, 5_000);
 
-      child.on('error', () => {
-        clearTimeout(timeout);
-        done(false);
-      });
-
-      child.on('close', (code) => {
-        clearTimeout(timeout);
-        done(code === 0);
-      });
+      child.on('error', () => { clearTimeout(timeout); done(false); });
+      child.on('close', (code) => { clearTimeout(timeout); done(code === 0); });
     });
   }
 
@@ -1058,7 +1043,7 @@ export async function createPopmelt(
   // Fire-and-forget CLI warm-ups — primes OS caches, validates availability
   for (const [cli, cap] of Object.entries(capabilities)) {
     if (!cap.available || !cap.path) continue;
-    warmUpCli(cli, cap.path, projectRoot).then((ok) => {
+    warmUpCli(cli, cap.path).then((ok) => {
       if (!ok) {
         console.warn(`[Bridge] ${cli} warm-up failed — marking unavailable`);
         cap.available = false;

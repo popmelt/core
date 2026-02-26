@@ -389,8 +389,8 @@ async function captureSingleRegion(
           if (el.id === 'devtools-canvas' || el.id === 'devtools-toolbar' || el.id === 'devtools-scrim') {
             return false;
           }
-          // Hide any element with data-devtools attribute (panels, badges, highlights, tooltips)
-          if (el.dataset.devtools || el.closest('[data-devtools]')) {
+          // Hide any element with data-devtools attribute (library skips children of filtered nodes)
+          if (el.dataset.devtools !== undefined) {
             return false;
           }
         }
@@ -404,7 +404,6 @@ async function captureSingleRegion(
         transform: `translate(${-window.scrollX}px, ${-scrollY}px)`,
       },
     });
-
     // Create composite canvas
     const composite = document.createElement('canvas');
     composite.width = viewportWidth * dpr;
