@@ -654,9 +654,12 @@ function ComponentPreviewWithFallback({ name, onNotFound }: { name: string; onNo
           flexDirection: 'column' as const,
           justifyContent: 'stretch',
           alignItems: 'center',
+          contain: 'layout paint',
+          position: 'relative' as const,
+          isolation: 'isolate' as const,
         }}
       >
-        <div style={{ zoom: 0.5 }}>
+        <div style={{ zoom: 0.5, pointerEvents: 'none' }}>
           {createElement(fiber.type, fiber.props)}
         </div>
       </div>
