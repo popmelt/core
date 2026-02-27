@@ -9,6 +9,7 @@ import {
   useRef,
   useState,
   type PropsWithChildren,
+  type MutableRefObject,
 } from 'react';
 
 import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hooks/useBridgeConnection';
@@ -19,6 +20,8 @@ import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard,
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { BridgeEventStack } from './BridgeStatusPanel';
+import { ShadowChrome } from './ShadowChrome';
+import { ShadowHost } from './ShadowHost';
 import { ThreadPanel } from './ThreadPanel';
 
 type PopmeltContextValue = {
@@ -60,10 +63,16 @@ function equivalentModelIndex(fromProvider: string, toProvider: string, currentI
 export function PopmeltProvider({
   children,
   enabled = process.env.NODE_ENV === 'development',
-  bridgeUrl = 'http://localhost:1111',
+  bridgeUrl = typeof window !== 'undefined'
+    ? (window as any).__POPMELT_BRIDGE_URL__ ?? 'http://localhost:1111'
+    : 'http://localhost:1111',
 }: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
   const bridge = useBridgeConnection(bridgeUrl);
+
+  // Refs for shadow DOM elements (used instead of getElementById)
+  const canvasRef = useRef<HTMLCanvasElement>(null) as MutableRefObject<HTMLCanvasElement | null>;
+  const toolbarRef = useRef<HTMLDivElement>(null) as MutableRefObject<HTMLDivElement | null>;
 
   // Track the resolved bridge URL (after discovery)
   const resolvedBridgeUrl = getDiscoveredBridgeUrl() ?? bridgeUrl;
@@ -580,7 +589,7 @@ export function PopmeltProvider({
   }, [bridge.status]);
 
   const handleScreenshot = useCallback(async (): Promise<boolean> => {
-    const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
+    const canvas = canvasRef.current;
     if (!canvas) return false;
 
     const blobs = await captureScreenshot(document.body, canvas, state.annotations);
@@ -599,7 +608,7 @@ export function PopmeltProvider({
   }, []);
 
   const handleSendToClaude = useCallback(async (): Promise<boolean> => {
-    const canvas = document.getElementById('devtools-canvas') as HTMLCanvasElement | null;
+    const canvas = canvasRef.current;
     if (!canvas) return false;
 
     // Detect planner mode: no pending annotations = planner goal
@@ -883,91 +892,99 @@ export function PopmeltProvider({
     <PopmeltContext.Provider value={contextValue}>
       {children}
 
-      <AnnotationCanvas
-        state={state}
-        dispatch={dispatch}
-        onScreenshot={handleScreenshot}
-        inFlightAnnotationIds={inFlightAnnotationIds}
-        inFlightStyleSelectors={inFlightStyleSelectors}
-        inFlightSelectorColors={inFlightSelectorColors}
-        onAttachImages={handleAttachImages}
-        onReply={bridge.isConnected ? handleReply : undefined}
-        onViewThread={bridge.isConnected ? handleViewThread : undefined}
-        onCloseThread={(threadId) => {
-          setOpenThreadId(null);
-          if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
-        }}
-        onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
-        onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
-        onModelComponentHover={setModelCanvasHoveredComponent}
-        modelComponentNames={modelComponentNames}
-        modelPanelHoveredComponent={modelPanelHoveredComponent}
-        modelSpacingTokenHover={modelSpacingTokenHover}
-        highlightedAnnotationIds={highlightedAnnotationIds}
-      />
+      <ShadowHost>
+        <ShadowChrome>
+          <AnnotationCanvas
+            state={state}
+            dispatch={dispatch}
+            onScreenshot={handleScreenshot}
+            inFlightAnnotationIds={inFlightAnnotationIds}
+            inFlightStyleSelectors={inFlightStyleSelectors}
+            inFlightSelectorColors={inFlightSelectorColors}
+            onAttachImages={handleAttachImages}
+            onReply={bridge.isConnected ? handleReply : undefined}
+            onViewThread={bridge.isConnected ? handleViewThread : undefined}
+            onCloseThread={(threadId) => {
+              setOpenThreadId(null);
+              if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
+            }}
+            onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
+            onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
+            onModelComponentHover={setModelCanvasHoveredComponent}
+            modelComponentNames={modelComponentNames}
+            modelPanelHoveredComponent={modelPanelHoveredComponent}
+            modelSpacingTokenHover={modelSpacingTokenHover}
+            highlightedAnnotationIds={highlightedAnnotationIds}
+            externalCanvasRef={canvasRef}
+            toolbarRef={toolbarRef}
+          />
 
-      <AnnotationToolbar
-        state={state}
-        dispatch={dispatch}
-        onScreenshot={handleScreenshot}
-        onSendToClaude={bridge.isConnected ? handleSendToClaude : undefined}
-        hasActiveJobs={Object.keys(inFlightJobs).length > 0 || bridge.activeJobIds.length > 0}
-        activeJobColor={activeJobColor}
-        onCrosshairHover={handleEventStreamHover}
-        onClear={handleClearEventStream}
-        provider={provider}
-        onProviderChange={bridge.isConnected && availableProviders.length > 1 ? handleProviderChange : undefined}
-        availableProviders={availableProviders}
-        modelIndex={modelIndex}
-        modelCount={models.length}
-        modelLabel={currentModel.label}
-        onModelChange={bridge.isConnected ? handleModelChange : undefined}
-        onViewThread={bridge.isConnected ? handleViewThread : undefined}
-        isThreadPanelOpen={openThreadId !== null}
-        mcpStatus={mcpStatus}
-        onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
-        mcpJustInstalled={mcpJustInstalled}
-        bridgeUrl={resolvedBridgeUrl}
-        isBridgeConnected={bridge.isConnected}
-        modelSelectedComponent={modelSelectedComponent}
-        modelCanvasHoveredComponent={modelCanvasHoveredComponent}
-        onModelComponentHover={setModelPanelHoveredComponent}
-        onSpacingTokenHover={setModelSpacingTokenHover}
-        onModifySpacingToken={bridge.isConnected ? handleModifySpacingToken : undefined}
-        onDeleteSpacingToken={bridge.isConnected ? handleDeleteSpacingToken : undefined}
-        modelRefreshKey={modelRefreshKey}
-        onModelComponentAdded={handleModelComponentAdded}
-        onModelComponentRemoved={handleModelComponentRemoved}
-      />
+          <AnnotationToolbar
+            state={state}
+            dispatch={dispatch}
+            onScreenshot={handleScreenshot}
+            onSendToClaude={bridge.isConnected ? handleSendToClaude : undefined}
+            hasActiveJobs={Object.keys(inFlightJobs).length > 0 || bridge.activeJobIds.length > 0}
+            activeJobColor={activeJobColor}
+            onCrosshairHover={handleEventStreamHover}
+            onClear={handleClearEventStream}
+            provider={provider}
+            onProviderChange={bridge.isConnected && availableProviders.length > 1 ? handleProviderChange : undefined}
+            availableProviders={availableProviders}
+            modelIndex={modelIndex}
+            modelCount={models.length}
+            modelLabel={currentModel.label}
+            onModelChange={bridge.isConnected ? handleModelChange : undefined}
+            onViewThread={bridge.isConnected ? handleViewThread : undefined}
+            isThreadPanelOpen={openThreadId !== null}
+            mcpStatus={mcpStatus}
+            onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
+            mcpJustInstalled={mcpJustInstalled}
+            bridgeUrl={resolvedBridgeUrl}
+            isBridgeConnected={bridge.isConnected}
+            modelSelectedComponent={modelSelectedComponent}
+            modelCanvasHoveredComponent={modelCanvasHoveredComponent}
+            onModelComponentHover={setModelPanelHoveredComponent}
+            onSpacingTokenHover={setModelSpacingTokenHover}
+            onModifySpacingToken={bridge.isConnected ? handleModifySpacingToken : undefined}
+            onDeleteSpacingToken={bridge.isConnected ? handleDeleteSpacingToken : undefined}
+            modelRefreshKey={modelRefreshKey}
+            onModelComponentAdded={handleModelComponentAdded}
+            onModelComponentRemoved={handleModelComponentRemoved}
+            toolbarRef={toolbarRef}
+          />
 
-      {openThreadId && bridge.isConnected && (
-        <ThreadPanel
-          threadId={openThreadId}
-          bridgeUrl={resolvedBridgeUrl}
-          accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
-          isStreaming={threadActiveJobId !== null}
-          streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
-          onClose={() => setOpenThreadId(null)}
-          onReply={handleReply}
-          onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
-          lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
-        />
-      )}
+          {openThreadId && bridge.isConnected && (
+            <ThreadPanel
+              threadId={openThreadId}
+              bridgeUrl={resolvedBridgeUrl}
+              accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
+              isStreaming={threadActiveJobId !== null}
+              streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
+              onClose={() => setOpenThreadId(null)}
+              onReply={handleReply}
+              onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
+              lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
+              toolbarRef={toolbarRef}
+            />
+          )}
 
-      <BridgeEventStack
-        bridge={bridge}
-        bridgeUrl={resolvedBridgeUrl}
-        inFlightJobs={inFlightJobs}
-        isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
-        onHover={handleEventStreamHover}
-        clearSignal={clearSignal}
-        onReply={handleReply}
-        onViewThread={handleViewThread}
-        onCancel={handleCancelJob}
-        onHoverJob={handleHoverJob}
-        isConnected={bridge.isConnected}
-        dismissedThreadIds={dismissedThreadIds}
-      />
+          <BridgeEventStack
+            bridge={bridge}
+            bridgeUrl={resolvedBridgeUrl}
+            inFlightJobs={inFlightJobs}
+            isVisible={eventStreamVisible || bridge.lastResponseText !== null || bridge.activeJobIds.length > 0}
+            onHover={handleEventStreamHover}
+            clearSignal={clearSignal}
+            onReply={handleReply}
+            onViewThread={handleViewThread}
+            onCancel={handleCancelJob}
+            onHoverJob={handleHoverJob}
+            isConnected={bridge.isConnected}
+            dismissedThreadIds={dismissedThreadIds}
+          />
+        </ShadowChrome>
+      </ShadowHost>
     </PopmeltContext.Provider>
   );
 }
