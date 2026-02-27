@@ -100,7 +100,7 @@ export async function createPopmelt(
   const tempDir = options.tempDir ?? join(tmpdir(), 'popmelt-bridge');
   const maxTurns = options.maxTurns ?? 40;
   const maxBudgetUsd = options.maxBudgetUsd ?? 1.0;
-  const allowedTools = options.allowedTools ?? DEFAULT_ALLOWED_TOOLS;
+  const allowedTools = [...(options.allowedTools ?? DEFAULT_ALLOWED_TOOLS)];
   const claudePath = options.claudePath ?? 'claude';
   const defaultProvider: Provider = options.provider ?? 'claude';
   const timeoutMs = options.timeoutMs;
@@ -147,6 +147,11 @@ export async function createPopmelt(
   ]);
   if (capabilities.claude) capabilities.claude.mcp = claudeMcp;
   if (capabilities.codex) capabilities.codex.mcp = codexMcp;
+
+  // Allow spawned CLIs to use detected MCP tools without interactive permission prompts
+  if (claudeMcp.found && claudeMcp.name) {
+    allowedTools.push(`mcp__${claudeMcp.name}__*`);
+  }
 
   // Ensure temp dir exists
   await mkdir(tempDir, { recursive: true });
