@@ -1,55 +1,42 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useRef, type ReactNode } from 'react';
-import { createRoot, type Root } from 'react-dom/client';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 
 type ShadowHostProps = {
   children: ReactNode;
 };
 
 /**
- * Renders children inside a shadow DOM with a separate React root.
+ * Renders children inside a shadow DOM via createPortal.
  *
- * Using a separate `createRoot` inside the shadow root ensures React's event
- * listeners attach *inside* the shadow boundary. This avoids the event.target
- * retargeting problem that occurs with `createPortal` across shadow boundaries.
+ * Unlike createRoot, createPortal keeps children in the same React tree —
+ * context, refs, state, and event bubbling all work normally. The shadow
+ * boundary provides CSS isolation without breaking React's internals.
  */
 export function ShadowHost({ children }: ShadowHostProps) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const rootRef = useRef<Root | null>(null);
+  const [container, setContainer] = useState<HTMLElement | null>(null);
 
-  // Create shadow root + React root once
-  useEffect(() => {
+  useLayoutEffect(() => {
     const host = hostRef.current;
     if (!host || host.shadowRoot) return;
 
     const shadow = host.attachShadow({ mode: 'open' });
-    const container = document.createElement('div');
-    container.setAttribute('data-popmelt-root', '');
-    shadow.appendChild(container);
-    rootRef.current = createRoot(container);
-
-    return () => {
-      const root = rootRef.current;
-      rootRef.current = null;
-      // Defer unmount so it doesn't fire while React is still rendering,
-      // which triggers "synchronously unmount a root while already rendering".
-      setTimeout(() => root?.unmount(), 0);
-    };
+    const root = document.createElement('div');
+    root.setAttribute('data-popmelt-root', '');
+    shadow.appendChild(root);
+    setContainer(root);
   }, []);
 
-  // Re-render shadow tree on every parent render.
-  // useLayoutEffect minimizes frame delay between main tree state changes
-  // and shadow tree updates.
-  useLayoutEffect(() => {
-    rootRef.current?.render(<>{children}</>);
-  });
-
   return (
-    <div
-      ref={hostRef}
-      data-popmelt-shadow-host
-      style={{ display: 'contents' }}
-    />
+    <>
+      <div
+        ref={hostRef}
+        data-popmelt-shadow-host
+        style={{ position: 'absolute', width: 0, height: 0, overflow: 'visible' }}
+      />
+      {container && createPortal(children, container)}
+    </>
   );
 }

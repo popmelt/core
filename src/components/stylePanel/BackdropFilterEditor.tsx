@@ -79,7 +79,7 @@ export function BackdropFilterEditor({
   useEffect(() => {
     if (!showAddMenu) return;
     const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      if (menuRef.current && !e.composedPath().includes(menuRef.current)) {
         setShowAddMenu(false);
       }
     };

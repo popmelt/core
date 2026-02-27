@@ -262,7 +262,7 @@ export function LayoutSection({
     const THRESHOLD = 30;
     const onWheel = (e: WheelEvent) => {
       const grid = gridRef.current;
-      if (!grid || !grid.contains(e.target as Node)) return;
+      if (!grid || !e.composedPath().includes(grid)) return;
       e.preventDefault();
       e.stopPropagation();
       gridSwipeAccum.current.x += e.deltaX;

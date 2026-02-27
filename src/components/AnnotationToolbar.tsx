@@ -64,6 +64,7 @@ type AnnotationToolbarProps = {
   onModelComponentAdded?: () => void;
   onModelComponentRemoved?: (name: string) => void;
   onMouseEnter?: () => void;
+  toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
 };
 
 type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: string };
@@ -358,6 +359,7 @@ export function AnnotationToolbar({
   onModelComponentAdded,
   onModelComponentRemoved,
   onMouseEnter: onToolbarMouseEnter,
+  toolbarRef: externalToolbarRef,
 }: AnnotationToolbarProps) {
   const [isExpanded, setIsExpanded] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -965,8 +967,12 @@ export function AnnotationToolbar({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       // Ignore if editing text (input/textarea focused)
-      const activeEl = document.activeElement;
-      if (activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA') {
+      // Walk into shadow roots to find the real focused element
+      let activeEl: Element | null = document.activeElement;
+      while (activeEl?.shadowRoot?.activeElement) {
+        activeEl = activeEl.shadowRoot.activeElement;
+      }
+      if (activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA' || (activeEl as HTMLElement)?.isContentEditable) {
         return;
       }
 
@@ -1056,6 +1062,7 @@ export function AnnotationToolbar({
       <>
         <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         <div
+          ref={(el) => { if (externalToolbarRef) externalToolbarRef.current = el; }}
           id="devtools-toolbar"
           style={{ ...toolbarStyle, overflow: 'visible', opacity: 0.5, transition: 'opacity 150ms ease' }}
           onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; onToolbarMouseEnter?.(); }}
@@ -1302,6 +1309,7 @@ export function AnnotationToolbar({
         );
       })()}
       <div
+        ref={(el) => { if (externalToolbarRef) externalToolbarRef.current = el; }}
         id="devtools-toolbar"
         style={toolbarStyle}
         onMouseEnter={onToolbarMouseEnter}

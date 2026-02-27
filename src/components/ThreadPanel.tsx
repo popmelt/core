@@ -40,6 +40,7 @@ type ThreadPanelProps = {
   onCancel?: () => void;
   lastError?: string;
   onMouseEnter?: () => void;
+  toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
 };
 
 const PANEL_WIDTH = 400;
@@ -56,9 +57,8 @@ function getDefaultPosition() {
   };
 }
 
-function getMaxHeight(top: number, left: number) {
-  const toolbar = document.getElementById('devtools-toolbar');
-  const toolbarRect = toolbar?.getBoundingClientRect();
+function getMaxHeight(top: number, left: number, toolbarEl?: HTMLDivElement | null) {
+  const toolbarRect = toolbarEl?.getBoundingClientRect();
   let bottomLimit = window.innerHeight - EDGE_PAD;
   if (toolbarRect && left + PANEL_WIDTH + 2 * BORDER > toolbarRect.left) {
     bottomLimit = toolbarRect.top - TOOLBAR_GAP;
@@ -270,6 +270,7 @@ export function ThreadPanel({
   onCancel,
   lastError,
   onMouseEnter: onPanelMouseEnter,
+  toolbarRef,
 }: ThreadPanelProps) {
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -351,7 +352,7 @@ export function ThreadPanel({
       if (!panel) return;
       panel.style.top = `${clampedTop}px`;
       panel.style.left = `${clampedLeft}px`;
-      panel.style.height = `${getMaxHeight(clampedTop, clampedLeft)}px`;
+      panel.style.height = `${getMaxHeight(clampedTop, clampedLeft, toolbarRef?.current)}px`;
     };
 
     const onMouseUp = () => {
@@ -477,7 +478,7 @@ export function ThreadPanel({
 
   const currentTop = positionRef.current.top + dragOffset.current.y;
   const currentLeft = positionRef.current.left + dragOffset.current.x;
-  const maxHeight = getMaxHeight(currentTop, currentLeft);
+  const maxHeight = getMaxHeight(currentTop, currentLeft, toolbarRef?.current);
 
   return (
     <>

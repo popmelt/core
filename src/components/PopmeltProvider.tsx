@@ -892,33 +892,33 @@ export function PopmeltProvider({
     <PopmeltContext.Provider value={contextValue}>
       {children}
 
+      <AnnotationCanvas
+        state={state}
+        dispatch={dispatch}
+        onScreenshot={handleScreenshot}
+        inFlightAnnotationIds={inFlightAnnotationIds}
+        inFlightStyleSelectors={inFlightStyleSelectors}
+        inFlightSelectorColors={inFlightSelectorColors}
+        onAttachImages={handleAttachImages}
+        onReply={bridge.isConnected ? handleReply : undefined}
+        onViewThread={bridge.isConnected ? handleViewThread : undefined}
+        onCloseThread={(threadId) => {
+          setOpenThreadId(null);
+          if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
+        }}
+        onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
+        onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
+        onModelComponentHover={setModelCanvasHoveredComponent}
+        modelComponentNames={modelComponentNames}
+        modelPanelHoveredComponent={modelPanelHoveredComponent}
+        modelSpacingTokenHover={modelSpacingTokenHover}
+        highlightedAnnotationIds={highlightedAnnotationIds}
+        externalCanvasRef={canvasRef}
+        toolbarRef={toolbarRef}
+      />
+
       <ShadowHost>
         <ShadowChrome>
-          <AnnotationCanvas
-            state={state}
-            dispatch={dispatch}
-            onScreenshot={handleScreenshot}
-            inFlightAnnotationIds={inFlightAnnotationIds}
-            inFlightStyleSelectors={inFlightStyleSelectors}
-            inFlightSelectorColors={inFlightSelectorColors}
-            onAttachImages={handleAttachImages}
-            onReply={bridge.isConnected ? handleReply : undefined}
-            onViewThread={bridge.isConnected ? handleViewThread : undefined}
-            onCloseThread={(threadId) => {
-              setOpenThreadId(null);
-              if (threadId) setDismissedThreadIds((prev) => new Set(prev).add(threadId));
-            }}
-            onModelComponentsAdd={bridge.isConnected ? handleModelComponentsAdd : undefined}
-            onModelComponentFocus={bridge.isConnected ? handleModelComponentFocus : undefined}
-            onModelComponentHover={setModelCanvasHoveredComponent}
-            modelComponentNames={modelComponentNames}
-            modelPanelHoveredComponent={modelPanelHoveredComponent}
-            modelSpacingTokenHover={modelSpacingTokenHover}
-            highlightedAnnotationIds={highlightedAnnotationIds}
-            externalCanvasRef={canvasRef}
-            toolbarRef={toolbarRef}
-          />
-
           <AnnotationToolbar
             state={state}
             dispatch={dispatch}

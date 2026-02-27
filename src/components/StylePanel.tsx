@@ -34,6 +34,7 @@ type StylePanelProps = {
   /** null = mouse left panel, 'element' = general hover, 'padding' | 'gap' = field-specific */
   onHover?: (hint: string | null) => void;
   accentColor?: string;
+  toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
 };
 
 type PropertyConfig = {
@@ -255,8 +256,8 @@ export function DimensionField({
   useEffect(() => {
     if (!dropdownOpen) return;
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
-          fieldRef.current && !fieldRef.current.contains(e.target as Node)) {
+      if (dropdownRef.current && !e.composedPath().includes(dropdownRef.current) &&
+          fieldRef.current && !e.composedPath().includes(fieldRef.current)) {
         onDropdownChange?.(false);
       }
     };
@@ -917,7 +918,7 @@ export function ColorInput({
   useEffect(() => {
     if (!showDropdown && !showSuggestions) return;
     const handleClickOutside = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      if (containerRef.current && !e.composedPath().includes(containerRef.current)) {
         setShowDropdown(false);
         setShowSuggestions(false);
       }
@@ -1259,6 +1260,7 @@ export function StylePanel({
   onClose,
   onHover,
   accentColor = '#3b82f6',
+  toolbarRef,
 }: StylePanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const panelContentRef = useRef<HTMLDivElement>(null);
@@ -1361,8 +1363,7 @@ export function StylePanel({
       wrapper.style.left = `${clampedLeft}px`;
 
       // Recalculate max height based on dragged position vs toolbar
-      const toolbar = document.getElementById('devtools-toolbar');
-      const toolbarRect = toolbar?.getBoundingClientRect();
+      const toolbarRect = toolbarRef?.current?.getBoundingClientRect();
       let bottomLimit = window.innerHeight - 16;
       if (toolbarRect && clampedLeft + panelWidth > toolbarRect.left) {
         bottomLimit = toolbarRect.top - 8;
@@ -1433,8 +1434,7 @@ export function StylePanel({
       }
 
       // Measure toolbar to avoid overlapping it
-      const toolbar = document.getElementById('devtools-toolbar');
-      const toolbarRect = toolbar?.getBoundingClientRect();
+      const toolbarRect = toolbarRef?.current?.getBoundingClientRect();
 
       let bottomLimit = window.innerHeight - 16;
       if (toolbarRect) {

@@ -1,6 +1,6 @@
 'use client';
 
-import type { CSSProperties } from 'react';
+import type { CSSProperties, MutableRefObject } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { generateId } from '../hooks/useAnnotationState';
@@ -65,6 +65,8 @@ type AnnotationCanvasProps = {
   modelPanelHoveredComponent?: { name: string; instanceIndex: number } | null;
   modelSpacingTokenHover?: { name: string; px: number; token?: TokenBinding } | null;
   highlightedAnnotationIds?: Set<string> | null;
+  externalCanvasRef?: MutableRefObject<HTMLCanvasElement | null>;
+  toolbarRef?: MutableRefObject<HTMLDivElement | null>;
 };
 
 type ActiveTextInput = {
@@ -116,8 +118,14 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds, externalCanvasRef, toolbarRef }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
+
+  // Callback ref that sets both the internal (useCanvasDrawing) ref and the external one
+  const mergedCanvasRef = useCallback((el: HTMLCanvasElement | null) => {
+    (canvasRef as MutableRefObject<HTMLCanvasElement | null>).current = el;
+    if (externalCanvasRef) externalCanvasRef.current = el;
+  }, [externalCanvasRef, canvasRef]);
 
   // Right-click passthrough (two-step): for non-hand tools, the first right-click
   // suppresses the native menu and drops pointer-events on the canvas. The user's
@@ -736,9 +744,11 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       // Only handle delete if shapes are selected and not editing text
       const currentSelectedIds = selectedIdsRef.current;
       if (currentSelectedIds.length === 0 || activeTextRef.current) return;
-      // Don't delete annotations while typing in an input/textarea (e.g. thread panel)
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return;
+      // Don't delete annotations while typing in an input/textarea (e.g. thread panel inside shadow DOM)
+      // Use composedPath()[0] to get the real target — e.target is retargeted across shadow boundaries
+      const realTarget = (e.composedPath?.()[0] ?? e.target) as HTMLElement;
+      const tag = realTarget?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || realTarget?.isContentEditable) return;
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
@@ -2933,7 +2943,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   return (
     <>
       <canvas
-        ref={canvasRef}
+        ref={mergedCanvasRef}
         id="devtools-canvas"
         style={canvasStyle}
         onMouseDown={handlePointerDown}
@@ -3270,6 +3280,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             onClose={() => dispatch({ type: 'SELECT_ELEMENT', payload: null })}
             onHover={setStylePanelHint}
             accentColor={state.activeColor}
+            toolbarRef={toolbarRef}
           />
         </>
       )}

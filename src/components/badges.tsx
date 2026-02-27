@@ -489,7 +489,7 @@ function QuestionBadge({
   useEffect(() => {
     if (!expanded) return;
     const handleClickOutside = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+      if (panelRef.current && !e.composedPath().includes(panelRef.current)) {
         setExpanded(false);
       }
     };
