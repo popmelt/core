@@ -10,7 +10,7 @@ type PopmeltPluginOptions = {
 type Plugin = {
   name: string;
   configureServer: (server: any) => Promise<void>;
-  transformIndexHtml: () => { tag: string; attrs: Record<string, string>; children: string; injectTo: string } | undefined;
+  transformIndexHtml: () => { tag: string; attrs: Record<string, string>; children: string; injectTo: string }[] | undefined;
 };
 
 export function popmelt(options?: PopmeltPluginOptions): Plugin {
@@ -99,12 +99,12 @@ export function popmelt(options?: PopmeltPluginOptions): Plugin {
 
     transformIndexHtml() {
       if (bridgePort === null) return undefined;
-      return {
+      return [{
         tag: 'script',
         attrs: { type: 'text/javascript' },
         children: `window.__POPMELT_BRIDGE_URL__="http://localhost:${bridgePort}";`,
-        injectTo: 'head-prepend',
-      };
+        injectTo: 'head-prepend' as const,
+      }];
     },
   };
 }
