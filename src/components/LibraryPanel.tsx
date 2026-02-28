@@ -2,12 +2,14 @@
 
 import React, { Component, createElement, useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 
+import { Link2 } from 'lucide-react';
 import { POPMELT_BORDER } from '../styles/border';
 import type { SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { fetchModel, type DesignModel } from '../utils/bridge-client';
 import { findAllComponentBoundariesByName, getComponentPositions } from '../utils/dom';
 import { buildSpacingChangeContext, captureBindingsFromTargets, findElementsByTokenBinding, inferPropertyScope, resolveSpacingToken, updateBindingClasses, type SpacingElement, type TokenBinding } from '../utils/spacingAnalysis';
 import { getUniqueSelector } from '../utils/cssSelector';
+import { scanRootTokens, groupColorsByNamespace, type ScannedTokens } from '../utils/cssTokenScanner';
 
 export type ComponentHoverInfo = { name: string; instanceIndex: number } | null;
 export type SpacingTokenHover = { name: string; px: number; token?: TokenBinding } | null;
@@ -27,7 +29,7 @@ type LibraryPanelProps = {
   onComponentRemoved?: (name: string) => void;
 };
 
-type Tab = 'tokens' | 'components' | 'rules';
+type Tab = 'patterns' | 'principles' | 'rules';
 
 const TAB_STORAGE_KEY = 'popmelt-library-tab';
 
@@ -131,7 +133,27 @@ const activeTabStyle: CSSProperties = {
 
 // --- Renderers ---
 
-function ColorGrid({ entries }: { entries: [string, string][] }) {
+function ColorSwatch({ varName, value, reference }: { varName: string; value: string; reference?: string }) {
+  return (
+    <div
+      title={reference ? `${varName} \u2192 ${reference}\n${value}` : `${varName}: ${value}`}
+      style={{
+        width: 28,
+        height: 28,
+        backgroundColor: value,
+        outline: '1px solid rgba(0,0,0,0.08)',
+        outlineOffset: -1,
+        position: 'relative',
+      }}
+    >
+      {reference && (
+        <Link2 size={10} strokeWidth={2.5} style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: 'white', filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.5))' }} />
+      )}
+    </div>
+  );
+}
+
+function ColorGrid({ entries, references }: { entries: [string, string][]; references: Record<string, string> }) {
   const colors: [string, string][] = [];
   const other: [string, string][] = [];
   for (const e of entries) {
@@ -139,25 +161,20 @@ function ColorGrid({ entries }: { entries: [string, string][] }) {
     else other.push(e);
   }
 
+  const groups = groupColorsByNamespace(colors);
+
   return (
     <>
-      {colors.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, marginBottom: other.length > 0 ? 6 : 0 }}>
-          {colors.map(([key, value]) => (
-            <div
-              key={key}
-              title={`${key.split('.').pop()}: ${value}`}
-              style={{
-                width: 28,
-                height: 28,
-                backgroundColor: value,
-                outline: '1px solid rgba(0,0,0,0.08)',
-                outlineOffset: -1,
-              }}
-            />
-          ))}
+      {groups.map(([ns, items]) => (
+        <div key={ns} style={{ marginBottom: 4 }}>
+          <div style={{ fontSize: 10, color: '#9ca3af', marginBottom: 2 }}>{ns}{items.length > 1 ? ` (${items.length})` : ''}</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
+            {items.map(([key, value]) => (
+              <ColorSwatch key={key} varName={key} value={value} reference={references[key]} />
+            ))}
+          </div>
         </div>
-      )}
+      ))}
       {other.length > 0 && <GenericList entries={other} />}
     </>
   );
@@ -468,6 +485,20 @@ class PreviewErrorBoundary extends Component<
 
 // --- Tabs ---
 
+const COLLAPSED_STORAGE_KEY = 'popmelt-principles-collapsed';
+
+function readCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_STORAGE_KEY);
+    if (raw) return new Set(JSON.parse(raw) as string[]);
+  } catch {}
+  return new Set();
+}
+
+function writeCollapsed(set: Set<string>) {
+  try { localStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify([...set])); } catch {}
+}
+
 function CategoryHeader({ children }: { children: ReactNode }) {
   return (
     <div style={{ fontWeight: 700, fontSize: 11, color: '#6b7280', letterSpacing: '0.05em', marginBottom: 6 }}>
@@ -476,23 +507,72 @@ function CategoryHeader({ children }: { children: ReactNode }) {
   );
 }
 
-function TokensTab({ tokens, onSpacingTokenHover, onModifyToken, onDeleteToken }: {
-  tokens?: Record<string, unknown>;
-  onSpacingTokenHover?: (info: SpacingTokenHover) => void;
-  onModifyToken?: (mod: SpacingTokenMod, change: SpacingTokenChange) => void;
-  onDeleteToken?: (path: string, originalValue: string) => void;
+function CollapsibleCategory({ id, label, count, children, collapsed, onToggle }: {
+  id: string; label: string; count: number; children: ReactNode;
+  collapsed: boolean; onToggle: (id: string) => void;
 }) {
-  if (!tokens || Object.keys(tokens).length === 0) {
-    return <div style={{ color: '#9ca3af', fontSize: 11 }}>No tokens defined yet.</div>;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div
+        onClick={() => onToggle(id)}
+        style={{ fontWeight: 700, fontSize: 11, color: '#6b7280', letterSpacing: '0.05em', marginBottom: collapsed ? 0 : 6, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none' }}
+      >
+        <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 10, fontSize: 9, color: '#9ca3af', transform: collapsed ? 'rotate(-90deg)' : 'rotate(0deg)' }}>&#9660;</span>
+        {label}
+        <span style={{ fontWeight: 400, color: '#9ca3af' }}>{count}</span>
+      </div>
+      {!collapsed && children}
+    </div>
+  );
+}
+
+const CATEGORY_LABELS: Record<keyof ScannedTokens, string> = {
+  colors: 'Colors',
+  fonts: 'Fonts',
+  typeScale: 'Type Scale',
+  spacing: 'Spacing',
+  radii: 'Radii',
+  shadows: 'Shadows',
+  other: 'Other',
+};
+
+const CATEGORY_ORDER: (keyof ScannedTokens)[] = ['colors', 'fonts', 'typeScale', 'spacing', 'radii', 'shadows', 'other'];
+
+function PrinciplesTab() {
+  const [tokens, setTokens] = useState<ScannedTokens | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(readCollapsed);
+
+  useEffect(() => {
+    setTokens(scanRootTokens());
+  }, []);
+
+  const handleToggle = useCallback((id: string) => {
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      writeCollapsed(next);
+      return next;
+    });
+  }, []);
+
+  if (!tokens) return null;
+
+  const hasAny = CATEGORY_ORDER.some(cat => tokens[cat].length > 0);
+  if (!hasAny) {
+    return <div style={{ color: '#9ca3af', fontSize: 11 }}>No :root tokens found.</div>;
   }
+
   return (
     <>
-      {Object.entries(tokens).map(([category, value]) => (
-        <div key={category} style={{ marginBottom: 14 }}>
-          <CategoryHeader>{category}</CategoryHeader>
-          <SmartEntries entries={flattenEntries(value)} categoryKey={category} rawTokens={value as Record<string, unknown>} onSpacingHover={onSpacingTokenHover} onModifyToken={onModifyToken} onDeleteToken={onDeleteToken} />
-        </div>
-      ))}
+      {CATEGORY_ORDER.map(cat => {
+        const entries = tokens[cat];
+        if (entries.length === 0) return null;
+        return (
+          <CollapsibleCategory key={cat} id={cat} label={CATEGORY_LABELS[cat]} count={entries.length} collapsed={collapsed.has(cat)} onToggle={handleToggle}>
+            {cat === 'colors' ? <ColorGrid entries={entries} references={tokens.references} /> : <GenericList entries={entries} />}
+          </CollapsibleCategory>
+        );
+      })}
     </>
   );
 }
@@ -703,9 +783,9 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     try {
       const stored = localStorage.getItem(TAB_STORAGE_KEY);
-      if (stored === 'tokens' || stored === 'components' || stored === 'rules') return stored;
+      if (stored === 'patterns' || stored === 'principles' || stored === 'rules') return stored;
     } catch {}
-    return 'components';
+    return 'patterns';
   });
 
   useEffect(() => {
@@ -723,29 +803,12 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
   // Auto-switch to components tab and re-fetch when a component is selected
   useEffect(() => {
     if (!selectedComponent) return;
-    setActiveTab('components');
+    setActiveTab('patterns');
     // Re-fetch model to pick up newly added components
     fetchModel(bridgeUrl).then(m => {
       if (m) setModel(m);
     });
   }, [selectedComponent, bridgeUrl]);
-
-  const handleTokenDelete = useCallback((tokenPath: string, originalValue: string) => {
-    // Optimistically remove from local state
-    setModel(prev => {
-      if (!prev?.tokens) return prev;
-      const newTokens = JSON.parse(JSON.stringify(prev.tokens)) as Record<string, Record<string, string>>;
-      const segments = tokenPath.split('.');
-      let cursor: Record<string, unknown> = newTokens;
-      for (let i = 1; i < segments.length - 1; i++) {
-        cursor = cursor[segments[i]!] as Record<string, unknown>;
-        if (!cursor) return prev;
-      }
-      delete cursor[segments[segments.length - 1]!];
-      return { ...prev, tokens: newTokens };
-    });
-    onDeleteSpacingToken?.(tokenPath, originalValue);
-  }, [onDeleteSpacingToken]);
 
   const handleRemove = useCallback((name: string) => {
     // Optimistically remove from local state
@@ -758,14 +821,11 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
     onComponentRemoved?.(name);
   }, [onComponentRemoved]);
 
-  const tokens = model?.tokens as Record<string, unknown> | undefined;
   const components = model?.components as Record<string, unknown> | undefined;
   const rules = model?.rules as string[] | undefined;
 
-  const hasTokens = tokens && Object.keys(tokens).length > 0;
   const hasComponents = components && Object.keys(components).length > 0;
   const hasRules = rules && rules.length > 0;
-  const isEmpty = !model || (!hasTokens && !hasComponents && !hasRules);
 
   return (
     <div style={panelStyle} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}>
@@ -783,7 +843,7 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 10, borderBottom: '1px solid rgba(0,0,0,0.08)', paddingBottom: 6 }}>
-        {(['components', 'rules'] as const).map(tab => (
+        {(['patterns', 'principles', 'rules'] as const).map(tab => (
           <button
             key={tab}
             type="button"
@@ -797,16 +857,17 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
 
       {/* Content area */}
       <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-        {loading ? (
+        {activeTab === 'principles' ? (
+          <PrinciplesTab />
+        ) : loading ? (
           <div style={{ color: '#9ca3af', fontSize: 11 }}>Loading...</div>
-        ) : isEmpty ? (
+        ) : !model || (!hasComponents && !hasRules) ? (
           <div style={{ color: '#9ca3af', lineHeight: 1.5 }}>
             No design model yet. Pattern-scoped annotations will build one automatically.
           </div>
         ) : (
           <>
-            {activeTab === 'components' && <ComponentsTab components={components} selectedComponent={selectedComponent} hoveredComponent={hoveredComponent} onRemove={handleRemove} onHover={onComponentHover} />}
-            {activeTab === 'tokens' && <TokensTab tokens={tokens} onSpacingTokenHover={onSpacingTokenHover} onModifyToken={onModifySpacingToken} onDeleteToken={onDeleteSpacingToken ? handleTokenDelete : undefined} />}
+            {activeTab === 'patterns' && <ComponentsTab components={components} selectedComponent={selectedComponent} hoveredComponent={hoveredComponent} onRemove={handleRemove} onHover={onComponentHover} />}
             {activeTab === 'rules' && <RulesTab rules={rules} />}
           </>
         )}
