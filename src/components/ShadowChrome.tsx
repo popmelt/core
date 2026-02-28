@@ -11,6 +11,13 @@ const BASE_RESET = `
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
+/* Break :host font inheritance for component previews — let mirrored host
+   page styles (Tailwind, globals) apply instead of Popmelt's monospace. */
+[data-popmelt-panel] {
+  font: 16px / 1.5 system-ui, -apple-system, sans-serif;
+  color: initial;
+  -webkit-font-smoothing: auto;
+}
 `;
 
 type ShadowChromeProps = {
