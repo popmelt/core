@@ -1,6 +1,14 @@
-# Polyform Shield License 1.0.0
+# PolyForm Shield License 1.0.0 + No Redistribution Addendum
 
 <https://polyformproject.org/licenses/shield/1.0.0>
+
+## Additional Restriction: No Redistribution for Commercial Gain
+
+You may not sell, resell, sublicense, or distribute the software —
+whether modified or unmodified — as part of a paid product or
+service, or offer it as a hosted or managed service to third parties.
+Internal use within your organization is permitted. For commercial
+distribution or managed-service licensing, contact the licensor.
 
 ## Acceptance
 
@@ -105,9 +113,9 @@ software, under any kind of legal claim.***
 
 ## Definitions
 
-The **licensor** is the entity offering these terms, and the
-**software** is the software the licensor makes available under these
-terms.
+The **licensor** is the individual or entity offering these terms,
+and the **software** is the software the licensor makes available
+under these terms.
 
 **You** refers to the individual or entity agreeing to these terms.
 
@@ -124,3 +132,11 @@ software under these terms.
 
 **Use** means anything you do with the software requiring one of
 your licenses.
+
+---
+
+## Commercial Licensing
+
+For commercial distribution or managed-service licensing, contact
+**[hello@popmelt.com](mailto:hello@popmelt.com)** or visit
+**[https://popmelt.com](https://popmelt.com)**.
