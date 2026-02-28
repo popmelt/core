@@ -15,14 +15,17 @@ import {
 import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
-import { addComponentToModel, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
+import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { BridgeEventStack } from './BridgeStatusPanel';
 import { ShadowChrome } from './ShadowChrome';
 import { ShadowHost } from './ShadowHost';
+import { CLAUDE_MODELS, CODEX_MODELS } from './providers';
 import { ThreadPanel } from './ThreadPanel';
+
+export { MODEL_MAP } from './providers';
 
 type PopmeltContextValue = {
   isEnabled: boolean;
@@ -38,20 +41,6 @@ type PopmeltProviderProps = PropsWithChildren<{
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
 const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
-
-// Model definitions per provider
-const CLAUDE_MODELS = [
-  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { id: 'claude-sonnet-4-6', label: 'Sonn 4.6' },
-] as const;
-
-const CODEX_MODELS = [
-  { id: 'gpt-5.3-codex', label: 'Codex 5.3' },
-  { id: 'gpt-5.3-codex-spark', label: 'Spark 5.3' },
-  { id: 'gpt-5.1-codex-mini', label: 'Mini 5.1' },
-] as const;
-
-export const MODEL_MAP = { claude: CLAUDE_MODELS, codex: CODEX_MODELS } as const;
 
 // Cross-provider equivalence: index 0 = fast, index 1 = thorough
 function equivalentModelIndex(fromProvider: string, toProvider: string, currentIndex: number): number {
@@ -519,6 +508,42 @@ export function PopmeltProvider({
     }
   }, [bridge.lastCompletedJobId]);
 
+  // Safety net: reconcile inFlightJobs against the bridge server after (re)connect.
+  // When Vite HMR re-executes useBridgeConnection.ts, the module-level store resets
+  // (no lastCompletedJobId, no events), but sessionStorage still has stale inFlightJobs.
+  // Validate once per connection by checking the server's actual active job list.
+  const hasReconciledJobsRef = useRef(false);
+  useEffect(() => {
+    if (!bridge.isConnected) {
+      hasReconciledJobsRef.current = false;
+      return;
+    }
+    if (hasReconciledJobsRef.current) return;
+    hasReconciledJobsRef.current = true;
+
+    const inFlightIds = Object.keys(inFlightJobs);
+    if (inFlightIds.length === 0) return;
+
+    // Small delay: let job_started SSE events arrive before checking
+    const timer = setTimeout(() => {
+      checkBridgeHealth(resolvedBridgeUrl).then(health => {
+        if (!health) return;
+        const serverActiveIds = new Set<string>(
+          (health.activeJobs ?? []).map((j: { id: string }) => j.id),
+        );
+        setInFlightJobs(prev => {
+          const staleIds = Object.keys(prev).filter(id => !serverActiveIds.has(id));
+          if (staleIds.length === 0) return prev;
+          const next = { ...prev };
+          for (const id of staleIds) delete next[id];
+          return next;
+        });
+      });
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [bridge.isConnected, resolvedBridgeUrl]);
+
   // Handle resolutions from done events (process ALL unprocessed, not just latest)
   const processedDoneJobIdsRef = useRef(new Set<string>());
   useEffect(() => {
@@ -966,6 +991,8 @@ export function PopmeltProvider({
               onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
               lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
               toolbarRef={toolbarRef}
+              currentModel={currentModel.id}
+              currentProvider={provider}
             />
           )}
 

@@ -153,6 +153,9 @@ export type ThreadMessage = {
   question?: string;         // assistant asks a question
   replyToQuestion?: string;  // human replies to a question
   cancelled?: boolean;       // job was cancelled by user
+  error?: string;            // spawn/runtime error (e.g. git trust, timeout)
+  model?: string;            // model id used for this message
+  provider?: Provider;       // provider used for this message
 };
 
 export type Thread = {

@@ -56,7 +56,15 @@ export function getSourceId(): string {
 
 // ---------------------------------------------------------------------------
 // Module-level singleton store — survives React remounts (HMR, Astro refresh)
+//
+// Vite HMR can re-execute this module (when any file in its import chain
+// changes), which would reset all module-level variables. We use
+// import.meta.hot.data to preserve critical state across those reloads.
 // ---------------------------------------------------------------------------
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _hot: { data?: Record<string, unknown> } | undefined = typeof import.meta !== 'undefined' ? (import.meta as any).hot : undefined;
+const _hmrData = _hot?.data as Record<string, unknown> | undefined;
 
 const INITIAL_STATE: BridgeConnectionState = {
   isConnected: false,
@@ -77,18 +85,31 @@ const INITIAL_STATE: BridgeConnectionState = {
   capabilitiesVersion: 0,
 };
 
-let store: BridgeConnectionState = { ...INITIAL_STATE };
-const listeners = new Set<() => void>();
-let activeEs: EventSource | null = null;
-let activeBridgeUrl: string | null = null;
+let store: BridgeConnectionState = (_hmrData?.store as BridgeConnectionState) ?? { ...INITIAL_STATE };
+const listeners = (_hmrData?.listeners as Set<() => void>) ?? new Set<() => void>();
+let activeEs: EventSource | null = (_hmrData?.activeEs as EventSource | null) ?? null;
+let activeBridgeUrl: string | null = (_hmrData?.activeBridgeUrl as string | null) ?? null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let connectionGeneration = 0;
+let connectionGeneration = (_hmrData?.connectionGeneration as number) ?? 0;
+
+// Persist state into HMR data so the next module instance can pick it up
+if (_hot?.data) {
+  // Use getter/setters so the HMR data always reflects the latest values
+  Object.defineProperties(_hot.data, {
+    store: { get: () => store, configurable: true },
+    listeners: { get: () => listeners, configurable: true },
+    activeEs: { get: () => activeEs, configurable: true },
+    activeBridgeUrl: { get: () => activeBridgeUrl, configurable: true },
+    connectionGeneration: { get: () => connectionGeneration, configurable: true },
+    discoveredBridgeUrl: { get: () => discoveredBridgeUrl, configurable: true },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Bridge discovery cache — survives React remounts
 // ---------------------------------------------------------------------------
 
-let discoveredBridgeUrl: string | null = null;
+let discoveredBridgeUrl: string | null = (_hmrData?.discoveredBridgeUrl as string | null) ?? null;
 let discoveryPromise: Promise<string | null> | null = null;
 
 /**

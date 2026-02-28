@@ -95,6 +95,13 @@ function formatStepText(events: BridgeConnectionState['events']): string {
   }
 }
 
+/** Shorten an error message for the pill label */
+function truncateLabel(msg: string): string {
+  // Strip "Error: " prefix if present
+  const clean = msg.replace(/^Error:\s*/i, '');
+  return clean.length > 40 ? clean.slice(0, 37) + '...' : clean;
+}
+
 /** Derive a completion label from the bridge events for a given jobId */
 function deriveDoneLabel(events: BridgeConnectionState['events'], jobId: string): string {
   // Check if the agent asked a question
@@ -272,10 +279,12 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     const errorMessage = errorEvent ? String(errorEvent.data.message || '') : undefined;
     const cancelled = errorEvent ? !!errorEvent.data.cancelled : undefined;
 
+    const errorThreadId = errorEvent?.data.threadId as string | undefined;
+
     setEntries((prev) =>
       prev.map((e) =>
         e.jobId === completedId
-          ? { ...e, status: isError ? 'error' : 'done', doneLabel, errorMessage, cancelled }
+          ? { ...e, status: isError ? 'error' : 'done', doneLabel, errorMessage, cancelled, threadId: e.threadId || errorThreadId }
           : e,
       ),
     );
@@ -305,8 +314,8 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                 ? (entry.doneLabel || 'Done')
                 : entry.cancelled
                   ? 'Cancelled'
-                  : entry.errorMessage?.includes('Timed out')
-                    ? 'Timed out'
+                  : entry.errorMessage
+                    ? truncateLabel(entry.errorMessage)
                     : 'Error';
 
         return (

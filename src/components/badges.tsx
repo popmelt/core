@@ -34,16 +34,24 @@ export function BadgeHitArea({ left, top, style, children, ...props }: {
   style?: CSSProperties;
   children: React.ReactNode;
 } & Omit<React.HTMLAttributes<HTMLDivElement>, 'style'>) {
+  // Position the badge at exact coordinates. The hit-area padding may extend
+  // off-screen — that's fine. We only clamp the *inner* badge to stay visible
+  // by nudging left/up when it overflows the right or bottom edge.
+  const innerLeft = left + BADGE_HIT_PAD;
+  const innerTop = top + BADGE_HIT_PAD;
   return (
     <div data-devtools="badge-hit-area" {...props} style={{
       position: 'fixed',
-      left: `max(0px, ${left}px)`,
-      top: `max(0px, ${top}px)`,
+      left: left,
+      top: top,
       padding: BADGE_HIT_PAD,
-      transform: `translate(min(0px, calc(100vw - max(0px, ${left}px) - 100%)), min(0px, calc(100vh - max(0px, ${top}px) - 100%)))`,
       ...style,
     }}>
-      {children}
+      <div style={{
+        transform: `translate(min(0px, calc(100vw - ${innerLeft}px - 100%)), min(0px, calc(100vh - ${innerTop}px - 100%)))`,
+      }}>
+        {children}
+      </div>
     </div>
   );
 }

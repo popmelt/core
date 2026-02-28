@@ -328,6 +328,8 @@ export async function createPopmelt(
           question: question ?? undefined,
           sessionId: spawnResult.sessionId,
           toolsUsed,
+          model: job.model,
+          provider: job.provider,
         });
       }
 
@@ -420,10 +422,24 @@ export async function createPopmelt(
       console.error(`${tag} Error: ${spawnResult.error}`);
       job.status = 'error';
       job.error = spawnResult.error;
+
+      // Persist error to thread so it appears in conversation history
+      if (job.threadId) {
+        await threadStore.appendMessage(job.threadId, {
+          role: 'assistant',
+          timestamp: Date.now(),
+          jobId: job.id,
+          error: spawnResult.error || 'Unknown error',
+          model: job.model,
+          provider: job.provider,
+        });
+      }
+
       queue.broadcast(
         {
           type: 'error',
           jobId: job.id,
+          threadId: job.threadId,
           message: spawnResult.error || 'Unknown error',
         },
         job.id,
