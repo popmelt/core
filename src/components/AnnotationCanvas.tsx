@@ -65,6 +65,8 @@ type AnnotationCanvasProps = {
   modelPanelHoveredComponent?: { name: string; instanceIndex: number } | null;
   modelSpacingTokenHover?: { name: string; px: number; token?: TokenBinding } | null;
   highlightedAnnotationIds?: Set<string> | null;
+  /** Annotation ID whose thread panel is currently open — shows focused overlay on linked element */
+  focusedThreadAnnotationId?: string | null;
   externalCanvasRef?: MutableRefObject<HTMLCanvasElement | null>;
   toolbarRef?: MutableRefObject<HTMLDivElement | null>;
 };
@@ -97,6 +99,10 @@ function calculateLinkedPosition(
   rect: DOMRect,
   anchor: 'top-left' | 'bottom-left',
   stackOffset = 0,
+  toolbarEl?: HTMLDivElement | null,
+  /** Measured text width of the annotation. When provided, toolbar avoidance
+   *  only triggers if the annotation + badge actually overlaps the toolbar. */
+  textWidth?: number,
 ): Point {
   // Position so the textarea background (which starts at point - PADDING)
   // is flush above the badge/modification tooltip stack
@@ -108,17 +114,40 @@ function calculateLinkedPosition(
   // Clamp inside the element when the annotation would fall outside the viewport
   // (e.g. when the element is flush with or larger than the viewport)
   const viewportTop = window.scrollY + PADDING;
-  const viewportBottom = window.scrollY + window.innerHeight - BADGE_HEIGHT - PADDING;
+  let viewportBottom = window.scrollY + window.innerHeight - BADGE_HEIGHT - PADDING;
+
+  // Avoid toolbar zone: only when we know the annotation actually overlaps
+  // the toolbar horizontally (requires measured text width).
+  // Right edge = element_left + annotation_padding + text + annotation_padding + badge_width.
+  // Badge width ≈ padding(6) + icon(11) + gap(4) + label(~60) + padding(6) ≈ 90px.
+  const BADGE_WIDTH_ESTIMATE = 90;
+  let toolbarAvoidance = false;
+  if (toolbarEl && textWidth !== undefined) {
+    const toolbarRect = toolbarEl.getBoundingClientRect();
+    const annotationRight = rect.left + PADDING + textWidth + PADDING + BADGE_WIDTH_ESTIMATE;
+    if (annotationRight > toolbarRect.left) {
+      const toolbarLimit = window.scrollY + toolbarRect.top - BADGE_HEIGHT - PADDING;
+      if (toolbarLimit < viewportBottom) {
+        viewportBottom = toolbarLimit;
+        toolbarAvoidance = true;
+      }
+    }
+  }
+
   if (y < viewportTop) {
     y = rect.top + window.scrollY + PADDING;
   } else if (y > viewportBottom) {
-    y = Math.max(rect.top + window.scrollY + PADDING, viewportBottom);
+    // When avoiding toolbar, hard-clamp above it. For basic viewport-edge
+    // clamping, prefer staying inside the element when possible.
+    y = toolbarAvoidance
+      ? viewportBottom
+      : Math.max(rect.top + window.scrollY + PADDING, viewportBottom);
   }
 
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds, externalCanvasRef, toolbarRef }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds, focusedThreadAnnotationId, externalCanvasRef, toolbarRef }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
 
   // Callback ref that sets both the internal (useCanvasDrawing) ref and the external one
@@ -183,6 +212,10 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   // Inspector mode state
   const [hoveredElement, setHoveredElement] = useState<Element | null>(null);
   const [hoveredElementInfo, setHoveredElementInfo] = useState<ElementInfo | null>(null);
+
+  // Badge hover → element highlight
+  const [badgeHoveredAnnotationId, setBadgeHoveredAnnotationId] = useState<string | null>(null);
+  const [badgeHoveredSelector, setBadgeHoveredSelector] = useState<string | null>(null);
 
   // Hand tool state
   const handDragRef = useRef<{
@@ -1387,7 +1420,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
           // Determine anchor: top-left if there's room above (matches badge positioning), bottom-left otherwise
           const anchor: 'top-left' | 'bottom-left' = rect.top >= BADGE_HEIGHT * (1 + stackOffset) ? 'top-left' : 'bottom-left';
-          const textPoint = calculateLinkedPosition(rect, anchor, stackOffset);
+          const textPoint = calculateLinkedPosition(rect, anchor, stackOffset, toolbarRef?.current);
 
           setPendingLinkedText({
             point: textPoint,
@@ -2743,6 +2776,9 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
     let rafId: number | null = null;
 
+    // Reusable canvas context for text measurement
+    const measureCtx = document.createElement('canvas').getContext('2d');
+
     const checkPositions = () => {
       const updates: { id: string; point: Point; linkedAnchor?: 'top-left' | 'bottom-left' }[] = [];
       for (const ann of linkedAnnotations) {
@@ -2774,9 +2810,17 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         ).length;
         const stackOffset = (hasModBadge ? 1 : 0) + earlierLinked;
 
+        // Measure actual annotation text width for toolbar overlap check
+        let textWidth: number | undefined;
+        if (ann.text && measureCtx) {
+          const fontSize = ann.fontSize || 12;
+          measureCtx.font = `${fontSize}px ${FONT_FAMILY}`;
+          textWidth = Math.max(...ann.text.split('\n').map(l => measureCtx.measureText(l).width));
+        }
+
         // Re-evaluate anchor based on current element position
         const anchor: 'top-left' | 'bottom-left' = rect.top >= BADGE_HEIGHT * (1 + stackOffset) ? 'top-left' : 'bottom-left';
-        const newPoint = calculateLinkedPosition(rect, anchor, stackOffset);
+        const newPoint = calculateLinkedPosition(rect, anchor, stackOffset, toolbarRef?.current, textWidth);
         const current = ann.points[0];
         const anchorChanged = anchor !== ann.linkedAnchor;
         if (current && (anchorChanged || Math.abs(newPoint.x - current.x) > 1 || Math.abs(newPoint.y - current.y) > 1)) {
@@ -3002,6 +3046,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           annotationGroupCount={new Set(state.annotations.map(a => a.groupId || a.id)).size}
           dispatch={dispatch}
           inFlightSelectors={inFlightStyleSelectors}
+          toolbarRef={toolbarRef}
+          onHoverSelector={setBadgeHoveredSelector}
         />
       )}
 
@@ -3024,6 +3070,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           annotationGroupMap={annotationGroupMap}
           onViewThread={onViewThread}
           onSelectAnnotation={selectAnnotation}
+          onHoverAnnotation={setBadgeHoveredAnnotationId}
           canvasRef={canvasRef}
         />
       )}
@@ -3038,6 +3085,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           onReply={onReply}
           annotationGroupMap={annotationGroupMap}
           canvasRef={canvasRef}
+          onHoverAnnotation={setBadgeHoveredAnnotationId}
         />
       )}
 
@@ -3139,6 +3187,78 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           })()}
         </>
       )}
+
+      {/* Focused element highlight: solid border when actively annotating a linked element */}
+      {(activeText?.linkedSelector || pendingLinkedText?.linkedSelector) && (() => {
+        const selector = activeText?.linkedSelector || pendingLinkedText?.linkedSelector;
+        if (!selector) return null;
+        let el: Element | null = null;
+        try { el = document.querySelector(selector); } catch { /* invalid selector */ }
+        if (!el) return null;
+        return (
+          <ElementHighlight
+            element={el}
+            isSelected={true}
+            color={state.activeColor}
+            hideTooltip
+          />
+        );
+      })()}
+
+      {/* Open thread panel → focused overlay on linked element */}
+      {focusedThreadAnnotationId && (() => {
+        const ann = state.annotations.find(a => a.id === focusedThreadAnnotationId);
+        if (!ann?.linkedSelector) return null;
+        let el: Element | null = null;
+        try { el = document.querySelector(ann.linkedSelector); } catch { /* invalid selector */ }
+        if (!el) return null;
+        const isThinking = !!(inFlightAnnotationIds && inFlightAnnotationIds.has(ann.id));
+        return (
+          <ElementHighlight
+            element={el}
+            isSelected={!isThinking}
+            color={ann.color}
+            hideTooltip
+          />
+        );
+      })()}
+
+      {/* Badge hover → linked element highlight (annotation badges) */}
+      {badgeHoveredAnnotationId && (() => {
+        const ann = state.annotations.find(a => a.id === badgeHoveredAnnotationId);
+        if (!ann?.linkedSelector) return null;
+        let el: Element | null = null;
+        try { el = document.querySelector(ann.linkedSelector); } catch { /* invalid selector */ }
+        if (!el) return null;
+        const groupAnns = ann.groupId
+          ? state.annotations.filter(a => a.groupId === ann.groupId)
+          : [ann];
+        const isThinking = !!(inFlightAnnotationIds && groupAnns.some(a => inFlightAnnotationIds.has(a.id)));
+        return (
+          <ElementHighlight
+            element={el}
+            isSelected={!isThinking}
+            color={ann.color}
+            hideTooltip
+          />
+        );
+      })()}
+
+      {/* Badge hover → linked element highlight (style modification badges) */}
+      {badgeHoveredSelector && (() => {
+        let el: Element | null = null;
+        try { el = document.querySelector(badgeHoveredSelector); } catch { /* invalid selector */ }
+        if (!el) return null;
+        const isThinking = !!(inFlightStyleSelectors && inFlightStyleSelectors.has(badgeHoveredSelector));
+        return (
+          <ElementHighlight
+            element={el}
+            isSelected={!isThinking}
+            color={state.activeColor}
+            hideTooltip
+          />
+        );
+      })()}
 
       {/* Model tool: Focused component highlights (purple, selected style) */}
       {state.activeTool === 'model' && state.isAnnotating && modelFocusedComponents.size > 0 && (

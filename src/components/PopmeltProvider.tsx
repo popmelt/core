@@ -870,6 +870,9 @@ export function PopmeltProvider({
     return null;
   }, [openThreadId, inFlightJobs]);
 
+  const threadAnnotation = openThreadId ? state.annotations.find(a => a.threadId === openThreadId) : undefined;
+  const threadAnnotationNumber = threadAnnotation ? state.annotations.indexOf(threadAnnotation) + 1 : undefined;
+
   // Event stream hover visibility (debounced to bridge gap between crosshair and stack)
   const [eventStreamVisible, setEventStreamVisible] = useState(false);
   const [clearSignal, setClearSignal] = useState(0);
@@ -938,6 +941,7 @@ export function PopmeltProvider({
         modelPanelHoveredComponent={modelPanelHoveredComponent}
         modelSpacingTokenHover={modelSpacingTokenHover}
         highlightedAnnotationIds={highlightedAnnotationIds}
+        focusedThreadAnnotationId={threadAnnotation?.id}
         externalCanvasRef={canvasRef}
         toolbarRef={toolbarRef}
       />
@@ -983,7 +987,7 @@ export function PopmeltProvider({
             <ThreadPanel
               threadId={openThreadId}
               bridgeUrl={resolvedBridgeUrl}
-              accentColor={state.annotations.find(a => a.threadId === openThreadId)?.color ?? state.activeColor}
+              accentColor={threadAnnotation?.color ?? state.activeColor}
               isStreaming={threadActiveJobId !== null}
               streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
               onClose={() => setOpenThreadId(null)}
@@ -993,6 +997,8 @@ export function PopmeltProvider({
               toolbarRef={toolbarRef}
               currentModel={currentModel.id}
               currentProvider={provider}
+              annotationNumber={threadAnnotationNumber}
+              annotationText={threadAnnotation?.text}
             />
           )}
 

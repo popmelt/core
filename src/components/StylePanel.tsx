@@ -461,7 +461,7 @@ export function DimensionField({
           ref={dropdownRef}
           style={{
             ...getDropdownStyle(),
-            backgroundColor: '#ffffff',
+            backgroundColor: '#eaeaea',
             border: '1px solid rgba(0,0,0,0.1)',
             borderRadius: 0,
             zIndex: 10001,
@@ -1146,7 +1146,7 @@ export function ColorInput({
         <div
           style={{
             ...getDropdownStyle(),
-            backgroundColor: '#ffffff',
+            backgroundColor: '#eaeaea',
             border: '1px solid rgba(0,0,0,0.1)',
             borderRadius: 0,
             zIndex: 10001,
@@ -1198,7 +1198,7 @@ export function ColorInput({
           ref={dropdownRef}
           style={{
             ...getDropdownStyle(),
-            backgroundColor: '#ffffff',
+            backgroundColor: '#eaeaea',
             border: '1px solid rgba(0,0,0,0.1)',
             borderRadius: 0,
             zIndex: 10001,

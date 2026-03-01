@@ -6,8 +6,8 @@ import type { CSSProperties, ReactNode } from 'react';
 const colors = {
   iconDefault: '#1f2937',
   iconActive: '#1f2937',
-  bgActive: '#f3f4f6',
-  bgHover: '#f9fafb',
+  bgActive: '#dedede',
+  bgHover: '#e2e2e2',
   separator: '#e5e7eb',
 };
 

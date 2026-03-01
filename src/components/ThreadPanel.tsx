@@ -44,6 +44,8 @@ type ThreadPanelProps = {
   toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
   currentModel?: string;
   currentProvider?: string;
+  annotationNumber?: number;
+  annotationText?: string;
 };
 
 const PANEL_WIDTH = 400;
@@ -71,7 +73,7 @@ function getMaxHeight(top: number, left: number, toolbarEl?: HTMLDivElement | nu
 
 const basePanelStyle: CSSProperties = {
   width: PANEL_WIDTH,
-  backgroundColor: '#ffffff',
+  backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
   boxSizing: 'content-box',
   display: 'flex',
@@ -91,6 +93,7 @@ const baseHeaderStyle: CSSProperties = {
   margin: '3px 3px 0',
   fontWeight: 600,
   fontSize: 12,
+  overflow: 'hidden',
 };
 
 const messagesStyle: CSSProperties = {
@@ -117,8 +120,11 @@ const SCROLLBAR_CSS = `
 `;
 
 const replyAreaStyle: CSSProperties = {
-  borderTop: '1px solid rgba(0, 0, 0, 0.08)',
-  padding: 12,
+  borderTop: '1px solid rgba(0, 0, 0, 0.12)',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 4,
+  padding: '0 4px 0 10px',
 };
 
 function stripInternalTags(text: string): string {
@@ -267,6 +273,8 @@ export function ThreadPanel({
   toolbarRef,
   currentModel,
   currentProvider,
+  annotationNumber,
+  annotationText,
 }: ThreadPanelProps) {
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -501,7 +509,14 @@ export function ThreadPanel({
         ref={headerRef}
         style={{ ...baseHeaderStyle, backgroundColor: accentColor, color: '#ffffff', cursor: 'grab', userSelect: 'none', WebkitUserSelect: 'none' } as CSSProperties}
       >
-        <span>Conversation</span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          <span style={{ flexShrink: 0 }}>{annotationNumber ? `${annotationNumber}.` : 'Conversation'}</span>
+          {annotationText && (
+            <span style={{ opacity: 0.7, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+              {annotationText}
+            </span>
+          )}
+        </span>
         <button
           onClick={onClose}
           style={{
@@ -772,71 +787,49 @@ export function ThreadPanel({
       {/* Reply area */}
       {onReply && (
         <div style={replyAreaStyle}>
-          {replyImages.length > 0 && (
-            <div style={{
-              fontSize: 11,
-              color: '#6b7280',
-              marginBottom: 4,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-            }}>
-              <span>{replyImages.length} image{replyImages.length > 1 ? 's' : ''} attached</span>
-              <button
-                onClick={() => setReplyImages([])}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: 11,
-                  color: '#9ca3af',
-                  padding: '0 2px',
-                }}
-              >
-                &times;
-              </button>
-            </div>
-          )}
-          <textarea
+          <input
             value={replyText}
             onChange={(e) => setReplyText(e.target.value)}
             onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            placeholder="Reply... (Cmd+Enter to send)"
+            onPaste={handlePaste as unknown as React.ClipboardEventHandler<HTMLInputElement>}
+            placeholder="Reply (cmd enter)"
             style={{
-              width: '100%',
-              minHeight: 60,
-              padding: PADDING,
+              flex: 1,
+              minWidth: 0,
+              height: 32,
+              padding: '0 4px',
               fontSize: 12,
               fontFamily: FONT_FAMILY,
-              backgroundColor: 'rgba(0, 0, 0, 0.03)',
+              backgroundColor: 'transparent',
               color: '#1f2937',
-              border: '1px solid rgba(0, 0, 0, 0.1)',
-              borderRadius: 0,
+              border: 'none',
               outline: 'none',
-              resize: 'vertical',
-              lineHeight: 1.4,
+              lineHeight: '32px',
               boxSizing: 'border-box',
             }}
           />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
-            <button
-              onClick={handleSubmit}
-              disabled={!replyText.trim()}
-              style={{
-                padding: '5px 14px',
-                fontSize: 11,
-                fontFamily: FONT_FAMILY,
-                fontWeight: 600,
-                backgroundColor: replyText.trim() ? accentColor : 'rgba(0,0,0,0.1)',
-                color: replyText.trim() ? '#ffffff' : 'rgba(0,0,0,0.3)',
-                border: 'none',
-                cursor: replyText.trim() ? 'pointer' : 'default',
-              }}
-            >
-              Send &#8984;&#9166;
-            </button>
-          </div>
+          <button
+            onClick={handleSubmit}
+            disabled={!replyText.trim()}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 28,
+              height: 28,
+              padding: 0,
+              background: 'none',
+              border: 'none',
+              cursor: replyText.trim() ? 'pointer' : 'default',
+              color: replyText.trim() ? '#1f2937' : 'rgba(0,0,0,0.2)',
+              flexShrink: 0,
+            }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 2 11 13" />
+              <path d="M22 2 15 22 11 13 2 9z" />
+            </svg>
+          </button>
         </div>
       )}
     </div>

@@ -282,7 +282,7 @@ const baseToolbarStyle: CSSProperties = {
   zIndex: 9999,
   display: 'flex',
   alignItems: 'center',
-  backgroundColor: '#ffffff',
+  backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
   cursor: 'pointer',
@@ -503,6 +503,13 @@ export function AnnotationToolbar({
         try {
           const annotations = JSON.parse(stored);
           if (Array.isArray(annotations) && annotations.length > 0) {
+            // Clear transient statuses that don't survive a page refresh —
+            // the agent session that set waiting_input/in_flight is gone.
+            for (const a of annotations) {
+              if (a.status === 'waiting_input' || a.status === 'in_flight') {
+                a.status = a.threadId ? 'resolved' : 'pending';
+              }
+            }
             dispatch({ type: 'RESTORE_ANNOTATIONS', payload: { annotations } });
           }
         } catch {
@@ -1167,7 +1174,7 @@ export function AnnotationToolbar({
             bottom: 80,
             right: 16,
             width: 300,
-            backgroundColor: '#ffffff',
+            backgroundColor: '#eaeaea',
             ...POPMELT_BORDER,
             boxSizing: 'content-box',
             zIndex: 10001,
@@ -1226,7 +1233,7 @@ export function AnnotationToolbar({
                   {connected.length > 0 ? (
                     <span style={{ color: '#6b7280', display: 'flex', alignItems: 'center', gap: 6 }}>
                       <span>
-                        Taste library ready in {connected.join(', ')}
+                        Registry available in {connected.join(', ')}
                         {mcpJustInstalled && ' — restart CLI to activate'}
                       </span>
                       {unconfigured.length > 0 && onInstallMcp && !mcpJustInstalled && (

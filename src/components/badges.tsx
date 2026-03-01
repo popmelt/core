@@ -28,9 +28,10 @@ const WORD_INTERVAL = 3000;
  * overflows the right or bottom edge. 100% inside translate refers to the
  * element's own rendered size, so no JS measurement is needed.
  */
-export function BadgeHitArea({ left, top, style, children, ...props }: {
+export function BadgeHitArea({ left, top, avoidBottom, style, children, ...props }: {
   left: number;
   top: number;
+  avoidBottom?: number; // viewport Y below which badges should not extend
   style?: CSSProperties;
   children: React.ReactNode;
 } & Omit<React.HTMLAttributes<HTMLDivElement>, 'style'>) {
@@ -39,6 +40,7 @@ export function BadgeHitArea({ left, top, style, children, ...props }: {
   // by nudging left/up when it overflows the right or bottom edge.
   const innerLeft = left + BADGE_HIT_PAD;
   const innerTop = top + BADGE_HIT_PAD;
+  const bottomLimit = avoidBottom !== undefined ? `${avoidBottom}px` : '100vh';
   return (
     <div data-devtools="badge-hit-area" {...props} style={{
       position: 'fixed',
@@ -48,7 +50,7 @@ export function BadgeHitArea({ left, top, style, children, ...props }: {
       ...style,
     }}>
       <div style={{
-        transform: `translate(min(0px, calc(100vw - ${innerLeft}px - 100%)), min(0px, calc(100vh - ${innerTop}px - 100%)))`,
+        transform: `translate(min(0px, calc(100vw - ${innerLeft}px - 100%)), min(0px, calc(${bottomLimit} - ${innerTop}px - 100%)))`,
       }}>
         {children}
       </div>
@@ -67,6 +69,7 @@ export function AnnotationBadges({
   annotationGroupMap,
   onViewThread,
   onSelectAnnotation,
+  onHoverAnnotation,
   canvasRef,
 }: {
   annotations: Annotation[];
@@ -77,6 +80,7 @@ export function AnnotationBadges({
   annotationGroupMap: Map<string, number>;
   onViewThread?: (threadId: string) => void;
   onSelectAnnotation?: (id: string) => void;
+  onHoverAnnotation?: (id: string | null) => void;
   canvasRef?: React.RefObject<HTMLCanvasElement | null>;
 }) {
   const [charIndex, setCharIndex] = useState(0);
@@ -101,6 +105,7 @@ export function AnnotationBadges({
   type BadgePos = {
     id: string;
     threadId?: string;
+    linkedSelector?: string;
     x: number;
     y: number;
     size: number;
@@ -167,6 +172,7 @@ export function AnnotationBadges({
     badges.push({
       id: annotation.id,
       threadId,
+      linkedSelector: annotation.linkedSelector || groupAnns.find(a => a.linkedSelector)?.linkedSelector,
       x: point.x + maxWidth + PADDING,
       y: point.y - PADDING - yShift,
       size: wrappedHeight + PADDING * 2,
@@ -179,22 +185,91 @@ export function AnnotationBadges({
 
   if (badges.length === 0) return null;
 
-  const clickable = !!onViewThread;
+  // Fan out badges horizontally when they cluster at the same viewport Y
+  // (e.g. when multiple annotations are clamped above the toolbar).
+  // Measure each badge's content width so they pack tightly with a 2px gap.
+  const FAN_GAP = 2;
+  const badgeCtx = canvasRef?.current?.getContext('2d') ?? document.createElement('canvas').getContext('2d');
+  const badgeWidths: number[] = badges.map((pos) => {
+    let labelText: string;
+    if (pos.isInFlight) {
+      labelText = THINKING_WORDS[wordIndex] ?? 'thinking';
+    } else if (pos.replyCount > 0) {
+      labelText = `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`;
+    } else if (pos.threadId) {
+      labelText = '1 reply';
+    } else {
+      labelText = 'Cancelled';
+    }
+    const iconWidth = 11; // svg icon or "?" glyph
+    const gap = 4;
+    let textPx = labelText.length * 7.2; // fallback estimate
+    if (badgeCtx) {
+      badgeCtx.font = `12px ${FONT_FAMILY}`;
+      textPx = badgeCtx.measureText(labelText).width;
+    }
+    return PADDING + iconWidth + gap + textPx + PADDING;
+  });
+
+  // Compute absolute viewport-X for each badge. When badges truly overlap
+  // (both vertically AND horizontally), pack them side by side.
+  // Simulate the CSS viewport-bottom clamping so collision detection matches
+  // what the user sees (badges pushed up by translate(min(0, ...))).
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 9999;
+  const badgeViewportX: number[] = [];
+  for (let i = 0; i < badges.length; i++) {
+    const rawTopI = badges[i]!.y - scrollY;
+    const topI = Math.min(rawTopI, vh - BADGE_HEIGHT);
+    const bottomI = topI + BADGE_HEIGHT;
+    const naturalX = badges[i]!.x - scrollX;
+    let placedX = naturalX;
+    for (let j = 0; j < i; j++) {
+      const rawTopJ = badges[j]!.y - scrollY;
+      const topJ = Math.min(rawTopJ, vh - BADGE_HEIGHT);
+      const bottomJ = topJ + BADGE_HEIGHT;
+      const yOverlap = topI < bottomJ && bottomI > topJ;
+      if (!yOverlap) continue;
+      // They overlap vertically — check if they'd also collide horizontally
+      const rightJ = badgeViewportX[j]! + badgeWidths[j]!;
+      if (placedX < rightJ + FAN_GAP) {
+        placedX = rightJ + FAN_GAP;
+      }
+    }
+    badgeViewportX.push(placedX);
+  }
 
   return (
     <>
-      {badges.map((pos) => (
+      {badges.map((pos, idx) => {
+        const hasThread = !!pos.threadId;
+        return (
         <BadgeHitArea
           key={pos.id}
-          left={pos.x - scrollX - BADGE_HIT_PAD}
+          left={badgeViewportX[idx]! - BADGE_HIT_PAD}
           top={pos.y - scrollY - BADGE_HIT_PAD}
-          onClick={clickable && pos.threadId ? () => {
+          onMouseDown={hasThread ? (e: React.MouseEvent) => e.stopPropagation() : undefined}
+          onClick={hasThread ? (e: React.MouseEvent) => {
+            e.stopPropagation();
             onSelectAnnotation?.(pos.id);
-            onViewThread!(pos.threadId!);
+            onViewThread?.(pos.threadId!);
+            // Scroll to linked element if it's off-screen
+            if (pos.linkedSelector) {
+              try {
+                const el = document.querySelector(pos.linkedSelector);
+                if (el) {
+                  const r = el.getBoundingClientRect();
+                  if (r.bottom < 0 || r.top > window.innerHeight) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                }
+              } catch { /* invalid selector */ }
+            }
           } : undefined}
+          onMouseEnter={onHoverAnnotation ? () => onHoverAnnotation(pos.id) : undefined}
+          onMouseLeave={onHoverAnnotation ? () => onHoverAnnotation(null) : undefined}
           style={{
-            pointerEvents: clickable ? 'auto' : 'none',
-            cursor: clickable && pos.threadId ? 'pointer' : undefined,
+            pointerEvents: hasThread ? 'auto' : 'none',
+            cursor: hasThread ? 'pointer' : undefined,
             zIndex: 9999,
           }}
         >
@@ -240,23 +315,21 @@ export function AnnotationBadges({
                 {pos.isNeedsReview ? (
                   <span style={{ fontWeight: 700 }}>?</span>
                 ) : (
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                    <line x1="12" y1="3" x2="12" y2="9" />
-                    <line x1="12" y1="15" x2="12" y2="21" />
-                    <line x1="3" y1="12" x2="9" y2="12" />
-                    <line x1="15" y1="12" x2="21" y2="12" />
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="4 12 10 18 20 6" />
                   </svg>
                 )}
                 <span style={{ opacity: 0.7 }}>
                   {pos.replyCount > 0
                     ? `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`
-                    : 'Cancelled'}
+                    : pos.threadId ? '1 reply' : 'Cancelled'}
                 </span>
               </>
             )}
           </div>
         </BadgeHitArea>
-      ))}
+        );
+      })}
     </>
   );
 }
@@ -387,6 +460,7 @@ export function QuestionBadges({
   onReply,
   annotationGroupMap,
   canvasRef,
+  onHoverAnnotation,
 }: {
   annotations: Annotation[];
   supersededAnnotations: Set<Annotation>;
@@ -395,6 +469,7 @@ export function QuestionBadges({
   onReply: (threadId: string, reply: string) => void;
   annotationGroupMap: Map<string, number>;
   canvasRef?: React.RefObject<HTMLCanvasElement | null>;
+  onHoverAnnotation?: (id: string | null) => void;
 }) {
   const waitingAnnotations = annotations.filter(a => {
     if (supersededAnnotations.has(a)) return false;
@@ -463,6 +538,7 @@ export function QuestionBadges({
           y={y - scrollY}
           size={size}
           onReply={onReply}
+          onHoverAnnotation={onHoverAnnotation}
         />
       ))}
     </>
@@ -475,12 +551,14 @@ function QuestionBadge({
   y,
   size,
   onReply,
+  onHoverAnnotation,
 }: {
   annotation: Annotation;
   x: number;
   y: number;
   size: number;
   onReply: (threadId: string, reply: string) => void;
+  onHoverAnnotation?: (id: string | null) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [replyText, setReplyText] = useState('');
@@ -534,6 +612,8 @@ function QuestionBadge({
     <div
       ref={panelRef}
       data-devtools="question-badge"
+      onMouseEnter={onHoverAnnotation ? () => onHoverAnnotation(annotation.id) : undefined}
+      onMouseLeave={onHoverAnnotation ? () => onHoverAnnotation(null) : undefined}
       style={{
         position: 'fixed',
         left: `max(0px, ${badgeLeft}px)`,
@@ -578,7 +658,7 @@ function QuestionBadge({
           style={{
             minWidth: 260,
             maxWidth: 360,
-            backgroundColor: '#ffffff',
+            backgroundColor: '#eaeaea',
             fontFamily: FONT_FAMILY,
             fontSize: 12,
             color: '#1f2937',

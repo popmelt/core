@@ -14,6 +14,8 @@ type ModifiedElementBadgesProps = {
   annotationGroupCount: number; // Number of annotation groups for numbering
   dispatch: React.Dispatch<AnnotationAction>;
   inFlightSelectors?: Set<string>;
+  toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
+  onHoverSelector?: (selector: string | null) => void;
 };
 
 type BadgeData = {
@@ -45,19 +47,21 @@ const TOOLTIP_HEIGHT = 22;
 const BADGE_HIT_PAD = 12;
 
 /** Fixed-position badge wrapper that stays within the viewport via CSS clamping. */
-function BadgeHitArea({ left, top, style, children, ...props }: {
+function BadgeHitArea({ left, top, avoidBottom, style, children, ...props }: {
   left: number;
   top: number;
+  avoidBottom?: number;
   style?: CSSProperties;
   children: React.ReactNode;
 } & Omit<React.HTMLAttributes<HTMLDivElement>, 'style'>) {
+  const bottomLimit = avoidBottom !== undefined ? `${avoidBottom}px` : '100vh';
   return (
     <div data-devtools="badge-hit-area" {...props} style={{
       position: 'fixed',
       left: `max(0px, ${left}px)`,
       top: `max(0px, ${top}px)`,
       padding: BADGE_HIT_PAD,
-      transform: `translate(min(0px, calc(100vw - max(0px, ${left}px) - 100%)), min(0px, calc(100vh - max(0px, ${top}px) - 100%)))`,
+      transform: `translate(min(0px, calc(100vw - max(0px, ${left}px) - 100%)), min(0px, calc(${bottomLimit} - max(0px, ${top}px) - 100%)))`,
       ...style,
     }}>
       {children}
@@ -72,6 +76,8 @@ export function ModifiedElementBadges({
   annotationGroupCount,
   dispatch,
   inFlightSelectors,
+  toolbarRef,
+  onHoverSelector,
 }: ModifiedElementBadgesProps) {
   const [badges, setBadges] = useState<BadgeData[]>([]);
 
@@ -167,6 +173,9 @@ export function ModifiedElementBadges({
 
   if (badges.length === 0) return null;
 
+  const toolbarRect = toolbarRef?.current?.getBoundingClientRect();
+  const avoidBottom = toolbarRect ? toolbarRect.top - 8 : undefined;
+
   const tooltipStyle: CSSProperties = {
     display: 'flex',
     alignItems: 'center',
@@ -197,7 +206,10 @@ export function ModifiedElementBadges({
             key={badge.selector}
             left={badge.left - BADGE_HIT_PAD}
             top={badge.top - BADGE_HIT_PAD}
+            avoidBottom={avoidBottom}
             onClick={() => handleBadgeClick(badge.modIndex)}
+            onMouseEnter={onHoverSelector ? () => onHoverSelector(badge.selector) : undefined}
+            onMouseLeave={onHoverSelector ? () => onHoverSelector(null) : undefined}
             style={{
               zIndex: 10000,
               cursor: 'pointer',

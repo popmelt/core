@@ -100,7 +100,7 @@ const panelStyle: CSSProperties = {
   right: 16,
   bottom: 80,
   width: 300,
-  backgroundColor: '#ffffff',
+  backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
   boxSizing: 'content-box',
   zIndex: 10001,

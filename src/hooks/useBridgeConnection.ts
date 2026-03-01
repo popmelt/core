@@ -41,13 +41,21 @@ export type BridgeConnectionState = {
 };
 
 // ---------------------------------------------------------------------------
-// Stable client identity — survives React remounts (HMR, Astro refresh)
+// Stable client identity — survives React remounts AND Vite HMR module re-execution
 // ---------------------------------------------------------------------------
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _hotEarly: { data?: Record<string, unknown> } | undefined = typeof import.meta !== 'undefined' ? (import.meta as any).hot : undefined;
+
 const SOURCE_ID: string =
-  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+  (_hotEarly?.data?.sourceId as string) ??
+  (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2);
+    : Math.random().toString(36).slice(2));
+
+if (_hotEarly?.data) {
+  (_hotEarly.data as Record<string, unknown>).sourceId = SOURCE_ID;
+}
 
 /** Return this client's stable sourceId (for tagging bridge requests). */
 export function getSourceId(): string {
