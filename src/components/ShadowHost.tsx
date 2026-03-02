@@ -141,7 +141,7 @@ export function ShadowHost({ children }: ShadowHostProps) {
       <div
         ref={hostRef}
         data-popmelt-shadow-host
-        style={{ position: 'absolute', width: 0, height: 0, overflow: 'visible' }}
+        style={{ position: 'absolute', width: 0, height: 0, overflow: 'visible', zIndex: 10000 }}
       />
       {container && createPortal(children, container)}
     </>
