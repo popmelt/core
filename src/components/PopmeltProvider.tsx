@@ -77,7 +77,7 @@ export function PopmeltProvider({
   });
 
   // Available providers (detected from bridge capabilities)
-  const [availableProviders, setAvailableProviders] = useState<string[]>(['claude', 'codex']);
+  const [availableProviders, setAvailableProviders] = useState<string[]>([]);
 
   // MCP server detection results per provider
   const [mcpStatus, setMcpStatus] = useState<Record<string, McpDetectionResult>>({});

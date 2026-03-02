@@ -827,8 +827,23 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
   const hasComponents = components && Object.keys(components).length > 0;
   const hasRules = rules && rules.length > 0;
 
+  // Native event listeners for shadow DOM compatibility
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const enter = onMouseEnter;
+    const leave = onMouseLeave;
+    if (enter) el.addEventListener('mouseenter', enter);
+    if (leave) el.addEventListener('mouseleave', leave);
+    return () => {
+      if (enter) el.removeEventListener('mouseenter', enter);
+      if (leave) el.removeEventListener('mouseleave', leave);
+    };
+  }, [onMouseEnter, onMouseLeave]);
+
   return (
-    <div style={panelStyle} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}>
+    <div ref={panelRef} style={panelStyle}>
       {/* Title */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
         <span>Model</span>

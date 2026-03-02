@@ -4,7 +4,6 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { BridgeEvent } from '../hooks/useBridgeConnection';
-import { POPMELT_BORDER } from '../styles/border';
 import { FONT_FAMILY, PADDING } from '../tools/text';
 import { renderMarkdown } from '../utils/threadMarkdown';
 import { ProviderIcon, modelLabel } from './providers';
@@ -51,22 +50,31 @@ type ThreadPanelProps = {
 const PANEL_WIDTH = 400;
 const EDGE_PAD = 16;
 const BORDER = 3; // POPMELT_BORDER borderWidth
-const TOOLBAR_GAP = 16;
+const ANIMATED_BORDER_OUTSET = 3; // animated border extends this far outside the panel
+const ANIMATED_BORDER_PADDING = 4; // inner padding when animated border is showing
+const TOOLBAR_GAP = 8;
 const THREAD_POS_KEY = 'devtools-thread-panel-position';
 
 /** Right-aligned with the toolbar (right: 16), top: 16 */
+/** Border-box width (content + padding + border) — used for positioning */
+const PANEL_BOX_WIDTH = PANEL_WIDTH + 2 * BORDER + 2 * ANIMATED_BORDER_PADDING;
+/** Full visual width including overlay outset — used for overlap detection */
+const PANEL_VISUAL_WIDTH = PANEL_BOX_WIDTH + 2 * ANIMATED_BORDER_OUTSET;
+
 function getDefaultPosition() {
   return {
     top: EDGE_PAD,
-    left: window.innerWidth - PANEL_WIDTH - 2 * BORDER - EDGE_PAD,
+    left: window.innerWidth - PANEL_BOX_WIDTH - EDGE_PAD,
   };
 }
 
 function getMaxHeight(top: number, left: number, toolbarEl?: HTMLDivElement | null) {
   const toolbarRect = toolbarEl?.getBoundingClientRect();
-  let bottomLimit = window.innerHeight - EDGE_PAD;
-  if (toolbarRect && left + PANEL_WIDTH + 2 * BORDER > toolbarRect.left) {
-    bottomLimit = toolbarRect.top - TOOLBAR_GAP;
+  // Subtract border + padding + outset since box-sizing is content-box
+  const boxChrome = 2 * BORDER + 2 * ANIMATED_BORDER_PADDING;
+  let bottomLimit = window.innerHeight - EDGE_PAD - boxChrome;
+  if (toolbarRect && left + PANEL_VISUAL_WIDTH > toolbarRect.left) {
+    bottomLimit = toolbarRect.top - TOOLBAR_GAP - boxChrome;
   }
   return Math.max(200, bottomLimit - Math.max(0, top));
 }
@@ -74,11 +82,14 @@ function getMaxHeight(top: number, left: number, toolbarEl?: HTMLDivElement | nu
 const basePanelStyle: CSSProperties = {
   width: PANEL_WIDTH,
   backgroundColor: '#eaeaea',
-  ...POPMELT_BORDER,
+  borderWidth: 3,
+  borderStyle: 'solid',
+  borderColor: 'transparent',
   boxSizing: 'content-box',
   display: 'flex',
   flexDirection: 'column',
-  overflow: 'hidden',
+  overflow: 'visible',
+  padding: 4,
   fontFamily: FONT_FAMILY,
   fontSize: 12,
   color: '#1f2937',
@@ -90,7 +101,7 @@ const baseHeaderStyle: CSSProperties = {
   alignItems: 'center',
   justifyContent: 'space-between',
   padding: '4px 5px 4px 10px',
-  margin: '3px 3px 0',
+  margin: 0,
   fontWeight: 600,
   fontSize: 12,
   overflow: 'hidden',
@@ -124,7 +135,7 @@ const replyAreaStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   gap: 4,
-  padding: '0 4px 0 10px',
+  padding: '0 8px 0 10px',
 };
 
 function stripInternalTags(text: string): string {
@@ -344,7 +355,7 @@ export function ThreadPanel({
       const rawX = ds.offsetX + (e.clientX - ds.x);
       const rawY = ds.offsetY + (e.clientY - ds.y);
 
-      const clampedLeft = Math.max(EDGE_PAD, Math.min(window.innerWidth - PANEL_WIDTH - 2 * BORDER - EDGE_PAD, positionRef.current.left + rawX));
+      const clampedLeft = Math.max(EDGE_PAD, Math.min(window.innerWidth - PANEL_BOX_WIDTH - EDGE_PAD, positionRef.current.left + rawX));
       const clampedTop = Math.max(EDGE_PAD, positionRef.current.top + rawY);
 
       dragOffset.current = {
@@ -500,10 +511,43 @@ export function ThreadPanel({
     />
     <div
       ref={panelRef}
-      style={{ ...basePanelStyle, height: maxHeight, position: 'fixed', top: currentTop, left: currentLeft, zIndex: 10000 }}
+      style={{
+        ...basePanelStyle,
+        height: maxHeight,
+        position: 'fixed',
+        top: currentTop,
+        left: currentLeft,
+        zIndex: 10000,
+      }}
       data-devtools="thread-panel"
       onMouseEnter={onPanelMouseEnter}
     >
+      {(() => {
+        const tileColor = isStreaming ? accentColor : 'rgb(0,0,0)';
+        const svgTile = `<svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'><path d='M-1,1 l2,-2 M0,5 l5,-5 M4,6 l2,-2' stroke='${tileColor}' stroke-width='.75'/></svg>`;
+        const bgUrl = `url("data:image/svg+xml,${encodeURIComponent(svgTile)}")`;
+        return (
+          <>
+            <style>{`@keyframes popmelt-border-march { to { background-position: 0 -5px; } }
+[data-popmelt-reply]::placeholder { opacity: 0.35; }`}</style>
+            <div style={{
+              position: 'absolute',
+              inset: -3,
+              padding: 5,
+              backgroundImage: bgUrl,
+              backgroundSize: '5px 5px',
+              WebkitMask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+              WebkitMaskComposite: 'xor',
+              mask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+              maskComposite: 'exclude' as string,
+              pointerEvents: 'none' as const,
+              ...(isStreaming && { animation: 'popmelt-border-march 0.8s linear infinite' }),
+            }} />
+          </>
+        );
+      })()}
+      {/* Inner clip wrapper — needed so overflow:visible on outer panel (for animated border) doesn't leak content */}
+      <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', flex: 1, minHeight: 0 }}>
       {/* Header — draggable via native listeners */}
       <div
         ref={headerRef}
@@ -786,17 +830,45 @@ export function ThreadPanel({
 
       {/* Reply area */}
       {onReply && (
-        <div style={replyAreaStyle}>
+        <div style={{ flexShrink: 0, position: 'relative' }}>
+          {replyImages.length > 0 && (
+            <div style={{ position: 'absolute', bottom: '100%', display: 'flex', gap: 4, padding: '6px 5px 5px', flexWrap: 'wrap' }}>
+              {replyImages.map((blob, i) => (
+                <span
+                  key={i}
+                  onClick={() => setReplyImages(prev => prev.filter((_, j) => j !== i))}
+                  onMouseEnter={(e) => { const x = e.currentTarget.querySelector('[data-chip-x]') as HTMLElement; if (x) x.style.color = '#ef4444'; }}
+                  onMouseLeave={(e) => { const x = e.currentTarget.querySelector('[data-chip-x]') as HTMLElement; if (x) x.style.color = '#9ca3af'; }}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 5,
+                    fontSize: 10,
+                    color: '#fff',
+                    backgroundColor: 'rgba(0,0,0,1)',
+                    backdropFilter: 'blur(4px)',
+                    padding: '2px 5px 2px 8px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  image {i + 1}
+                  <span data-chip-x style={{ fontSize: 12, lineHeight: 1, color: '#9ca3af' }}>&times;</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <div style={replyAreaStyle}>
           <input
+            data-popmelt-reply
             value={replyText}
             onChange={(e) => setReplyText(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste as unknown as React.ClipboardEventHandler<HTMLInputElement>}
-            placeholder="Reply (cmd enter)"
+            placeholder="Reply here (cmd + enter to send)"
             style={{
               flex: 1,
               minWidth: 0,
-              height: 32,
+              minHeight: 44,
               padding: '0 4px',
               fontSize: 12,
               fontFamily: FONT_FAMILY,
@@ -804,7 +876,7 @@ export function ThreadPanel({
               color: '#1f2937',
               border: 'none',
               outline: 'none',
-              lineHeight: '32px',
+              lineHeight: '40px',
               boxSizing: 'border-box',
             }}
           />
@@ -825,13 +897,15 @@ export function ThreadPanel({
               flexShrink: 0,
             }}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M22 2 11 13" />
-              <path d="M22 2 15 22 11 13 2 9z" />
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3.714 3.048a.498.498 0 0 0-.683.627l2.843 7.627a2 2 0 0 1 0 1.396l-2.842 7.627a.498.498 0 0 0 .682.627l18-8.5a.5.5 0 0 0 0-.904z" />
+              <path d="M6 12h16" />
             </svg>
           </button>
+          </div>
         </div>
       )}
+      </div>{/* end inner clip wrapper */}
     </div>
     </>
   );

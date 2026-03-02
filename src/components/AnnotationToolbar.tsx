@@ -283,7 +283,9 @@ const baseToolbarStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   backgroundColor: '#eaeaea',
-  ...POPMELT_BORDER,
+  borderWidth: 3,
+  borderStyle: 'solid',
+  borderColor: 'transparent',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
   cursor: 'pointer',
   overflow: 'visible',
@@ -1045,23 +1047,80 @@ export function AnnotationToolbar({
     justifyContent: isExpanded ? 'flex-start' : 'center',
   };
 
+  const borderTileColor = hasActiveJobs && activeJobColor ? activeJobColor : 'rgb(0,0,0)';
+  const borderSvgTile = `<svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'><path d='M-1,1 l2,-2 M0,5 l5,-5 M4,6 l2,-2' stroke='${borderTileColor}' stroke-width='.75'/></svg>`;
+  const borderOverlay = (
+    <div style={{
+      position: 'absolute',
+      inset: -3,
+      padding: 5,
+      backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(borderSvgTile)}")`,
+      backgroundSize: '5px 5px',
+      WebkitMask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+      WebkitMaskComposite: 'xor',
+      mask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+      maskComposite: 'exclude' as string,
+      pointerEvents: 'none' as const,
+      ...(hasActiveJobs && { animation: 'popmelt-border-march 0.8s linear infinite' }),
+    }} />
+  );
+
   // Crosshair icon color based on job state
   const crosshairColor = isBridgeConnected === false
     ? 'rgba(239, 68, 68, 0.4)'
     : hasActiveJobs && activeJobColor ? activeJobColor : colors.iconActive;
 
+  // Expanded collapse button — native listeners (shadow DOM compat)
+  const expandedCollapseRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isExpanded) return;
+    const el = expandedCollapseRef.current;
+    if (!el) return;
+    const onEnter = () => {
+      onCrosshairHover?.(true);
+      el.style.opacity = '1';
+      const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
+      if (logo) logo.style.fill = '#000';
+      handleToolHoverStart('collapse');
+    };
+    const onLeave = () => {
+      onCrosshairHover?.(false);
+      el.style.opacity = hasActiveJobs ? '1' : '0.5';
+      const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
+      if (logo) logo.style.fill = 'none';
+      handleToolHoverEnd();
+    };
+    el.addEventListener('mouseenter', onEnter);
+    el.addEventListener('mouseleave', onLeave);
+    return () => { el.removeEventListener('mouseenter', onEnter); el.removeEventListener('mouseleave', onLeave); };
+  }, [isExpanded, hasActiveJobs, onCrosshairHover, handleToolHoverStart, handleToolHoverEnd]);
+
   // Collapsed state content
+  const collapsedRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (isExpanded) return;
+    const el = collapsedRef.current;
+    if (!el) return;
+    const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
+    const onEnter = () => { el.style.opacity = '1'; if (logo) logo.style.fill = '#000'; onToolbarMouseEnter?.(); };
+    const onLeave = () => { el.style.opacity = '0.5'; if (logo) logo.style.fill = 'none'; };
+    el.addEventListener('mouseenter', onEnter);
+    el.addEventListener('mouseleave', onLeave);
+    return () => { el.removeEventListener('mouseenter', onEnter); el.removeEventListener('mouseleave', onLeave); };
+  }, [isExpanded, onToolbarMouseEnter]);
   if (!isExpanded) {
     return (
       <>
-        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+        <style>{`
+          @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+          @keyframes popmelt-border-march { to { background-position: 0 -5px; } }
+        `}</style>
         <div
-          ref={(el) => { if (externalToolbarRef) externalToolbarRef.current = el; }}
+          ref={(el) => { collapsedRef.current = el; if (externalToolbarRef) externalToolbarRef.current = el; }}
           id="devtools-toolbar"
           style={{ ...toolbarStyle, overflow: 'visible', opacity: 0.5, transition: 'opacity 150ms ease' }}
-          onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; onToolbarMouseEnter?.(); }}
-          onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.5')}
         >
+          {borderOverlay}
           <button
             type="button"
             style={{
@@ -1103,11 +1162,8 @@ export function AnnotationToolbar({
                 )}
               </svg>
             ) : (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={crosshairColor} strokeWidth="1.5" strokeLinecap="round">
-                <line x1="12" y1="3" x2="12" y2="9" />
-                <line x1="12" y1="15" x2="12" y2="21" />
-                <line x1="3" y1="12" x2="9" y2="12" />
-                <line x1="15" y1="12" x2="21" y2="12" />
+              <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill="none" stroke={crosshairColor} strokeWidth="1" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg">
+                <path d="M20.25 8.00293H20.249C21.5098 8.0286 22.7219 8.25094 23.8584 8.63672L23.8604 8.63574C23.8961 8.64787 23.9312 8.66145 23.9668 8.67383C24.0611 8.70686 24.1548 8.74106 24.248 8.77637C24.2915 8.79273 24.3357 8.80727 24.3789 8.82422L24.376 8.82617C27.6145 10.0955 30.1646 12.7301 31.3213 16.0234L31.3232 16.0225C31.3327 16.0493 31.3404 16.0766 31.3496 16.1035C31.7691 17.3256 32 18.6356 32 20C32 20.8726 31.9366 21.6706 31.7598 22.4902L31.7197 22.6328C31.6412 23.0066 31.5136 23.6108 31.3408 24.2217L31.3398 24.2246C31.2967 24.377 31.251 24.5299 31.2021 24.6797C30.9215 25.5403 30.5473 26.2998 30.0879 26.2998C29.7613 26.2996 29.5995 25.9674 29.4316 25.6221C29.2501 25.2487 29.0614 24.8605 28.6484 24.8604C27.8532 24.8604 27.2081 25.5046 27.208 26.2998V27.0771C27.2079 27.6079 26.9661 28.112 26.5205 28.4004C25.9146 28.7925 25.2357 28.6462 24.7959 28.2061L24.7949 28.208C24.7897 28.2028 24.7854 28.1967 24.7803 28.1914C24.7654 28.1761 24.7507 28.1606 24.7363 28.1445C24.7105 28.1156 24.6858 28.0857 24.6621 28.0547C24.6461 28.0339 24.6302 28.013 24.6152 27.9912C24.5931 27.9591 24.5726 27.9257 24.5527 27.8916C24.5392 27.8685 24.5261 27.8452 24.5137 27.8213C24.5093 27.8128 24.5043 27.8045 24.5 27.7959L24.501 27.7939C24.3932 27.5763 24.3282 27.3276 24.3281 27.0576V26.2998C24.328 25.5993 23.8278 25.0158 23.165 24.8867V24.8877C23.0752 24.8702 22.9826 24.8604 22.8877 24.8604C22.8446 24.8604 22.8019 24.8624 22.7598 24.8662C22.0247 24.9312 21.4483 25.5479 21.4482 26.2998C21.4482 26.9127 21.4608 27.5305 21.4736 28.1494L21.4951 29.3135C21.5 29.7013 21.5015 30.089 21.4971 30.4756C21.4874 31.3103 20.8426 32 20.0078 32C19.1732 31.9998 18.5292 31.3102 18.5195 30.4756C18.5159 30.1613 18.5176 29.8464 18.5205 29.5312V29.5322C18.5212 29.4593 18.5206 29.3864 18.5215 29.3135L18.5303 28.8154V28.8145C18.5343 28.5927 18.5384 28.371 18.543 28.1494C18.5558 27.5305 18.5684 28.1129 18.5684 27.5C18.5684 26.7047 17.9232 26.0596 17.1279 26.0596C16.907 26.0596 16.6978 26.1103 16.5107 26.1992C16.2161 26.3393 15.9767 26.5769 15.834 26.8701C15.8269 26.8846 15.8201 26.8993 15.8135 26.9141C15.7821 26.9845 15.7562 27.0579 15.7363 27.1338C15.7243 27.1798 15.7155 27.2267 15.708 27.2744C15.7012 27.3175 15.6953 27.361 15.6924 27.4053C15.6903 27.4366 15.6885 27.4681 15.6885 27.5V28.7383C15.6883 29.9234 14.4911 30.7248 13.4961 30.0811C13.0505 29.7926 12.8086 29.2886 12.8086 28.7578V26.2998C12.8086 25.9737 12.6984 25.674 12.5156 25.4326C12.4437 25.3381 12.3612 25.2521 12.2686 25.1777V25.1768C12.0219 24.9788 11.709 24.8604 11.3682 24.8604C10.9892 24.8604 10.8622 24.8872 10.7295 25.2295C10.5837 25.6055 10.4302 26 9.92773 26C9.33081 25.9996 8.95963 25.2403 8.71484 24.3799C8.5591 23.8325 8.45907 23.571 8.3623 23.0107C8.3501 22.9401 8.33284 22.8403 8.31738 22.7529C8.12812 21.9466 8.02043 21.1089 8.00293 20.249V20.25L8 20C8 19.8617 8.00317 19.724 8.00781 19.5869C8.00837 19.5703 8.00816 19.5537 8.00879 19.5371L8.00977 19.5352C8.0998 17.1716 8.87444 14.9844 10.1396 13.1631C10.1488 13.1499 10.1587 13.1372 10.168 13.124C12.255 10.1453 15.6582 8.15745 19.5352 8.00977L19.5371 8.00879C19.5537 8.00816 19.5703 8.00837 19.5869 8.00781C19.724 8.00317 19.8617 8 20 8L20.25 8.00293Z" />
               </svg>
             )}
           </button>
@@ -1121,6 +1177,7 @@ export function AnnotationToolbar({
     <>
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes popmelt-border-march { to { background-position: 0 -5px; } }
       `}</style>
       {/* Scrim overlay */}
       <div
@@ -1309,6 +1366,7 @@ export function AnnotationToolbar({
         onMouseEnter={onToolbarMouseEnter}
         onMouseMove={handleToolbarMouseMove}
       >
+        {borderOverlay}
         {(state.annotations.length > 0 || state.styleModifications.length > 0) && (
           <>
             <span onMouseEnter={() => handleToolHoverStart('clear')} onMouseLeave={handleToolHoverEnd}>
@@ -1561,13 +1619,12 @@ export function AnnotationToolbar({
             </span>
           )}
           <div
-            onMouseEnter={(e) => { onCrosshairHover?.(true); e.currentTarget.style.opacity = '1'; handleToolHoverStart('collapse'); }}
-            onMouseLeave={(e) => { onCrosshairHover?.(false); e.currentTarget.style.opacity = hasActiveJobs ? '1' : '0.3'; handleToolHoverEnd(); }}
-            style={{ display: 'inline-flex', opacity: hasActiveJobs ? 1 : 0.3, transition: 'opacity 150ms ease' }}
+            ref={expandedCollapseRef}
+            style={{ display: 'inline-flex', opacity: hasActiveJobs ? 1 : 0.5, transition: 'opacity 150ms ease', cursor: 'pointer' }}
           >
-            <ToolButton onClick={handleCollapse} title="Collapse (⌘⌘)">
+            <button type="button" onClick={handleCollapse} title="Collapse (⌘⌘)" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 32, height: 32, border: 'none', background: 'none', padding: 0, cursor: 'inherit' }}>
               {hasActiveJobs ? (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill={crosshairColor}>
+                <svg width="30" height="30" viewBox="0 0 24 24" fill={crosshairColor}>
                   {spinnerCharIndex === 1 ? (
                     <>
                       <circle cx="7" cy="7" r="2" />
@@ -1585,14 +1642,11 @@ export function AnnotationToolbar({
                   )}
                 </svg>
               ) : (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={crosshairColor} strokeWidth="1.5" strokeLinecap="round" style={{ transform: 'rotate(45deg)' }}>
-                  <line x1="12" y1="3" x2="12" y2="9" />
-                  <line x1="12" y1="15" x2="12" y2="21" />
-                  <line x1="3" y1="12" x2="9" y2="12" />
-                  <line x1="15" y1="12" x2="21" y2="12" />
+                <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill="none" stroke="#000" strokeWidth="1" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M20.25 8.00293H20.249C21.5098 8.0286 22.7219 8.25094 23.8584 8.63672L23.8604 8.63574C23.8961 8.64787 23.9312 8.66145 23.9668 8.67383C24.0611 8.70686 24.1548 8.74106 24.248 8.77637C24.2915 8.79273 24.3357 8.80727 24.3789 8.82422L24.376 8.82617C27.6145 10.0955 30.1646 12.7301 31.3213 16.0234L31.3232 16.0225C31.3327 16.0493 31.3404 16.0766 31.3496 16.1035C31.7691 17.3256 32 18.6356 32 20C32 20.8726 31.9366 21.6706 31.7598 22.4902L31.7197 22.6328C31.6412 23.0066 31.5136 23.6108 31.3408 24.2217L31.3398 24.2246C31.2967 24.377 31.251 24.5299 31.2021 24.6797C30.9215 25.5403 30.5473 26.2998 30.0879 26.2998C29.7613 26.2996 29.5995 25.9674 29.4316 25.6221C29.2501 25.2487 29.0614 24.8605 28.6484 24.8604C27.8532 24.8604 27.2081 25.5046 27.208 26.2998V27.0771C27.2079 27.6079 26.9661 28.112 26.5205 28.4004C25.9146 28.7925 25.2357 28.6462 24.7959 28.2061L24.7949 28.208C24.7897 28.2028 24.7854 28.1967 24.7803 28.1914C24.7654 28.1761 24.7507 28.1606 24.7363 28.1445C24.7105 28.1156 24.6858 28.0857 24.6621 28.0547C24.6461 28.0339 24.6302 28.013 24.6152 27.9912C24.5931 27.9591 24.5726 27.9257 24.5527 27.8916C24.5392 27.8685 24.5261 27.8452 24.5137 27.8213C24.5093 27.8128 24.5043 27.8045 24.5 27.7959L24.501 27.7939C24.3932 27.5763 24.3282 27.3276 24.3281 27.0576V26.2998C24.328 25.5993 23.8278 25.0158 23.165 24.8867V24.8877C23.0752 24.8702 22.9826 24.8604 22.8877 24.8604C22.8446 24.8604 22.8019 24.8624 22.7598 24.8662C22.0247 24.9312 21.4483 25.5479 21.4482 26.2998C21.4482 26.9127 21.4608 27.5305 21.4736 28.1494L21.4951 29.3135C21.5 29.7013 21.5015 30.089 21.4971 30.4756C21.4874 31.3103 20.8426 32 20.0078 32C19.1732 31.9998 18.5292 31.3102 18.5195 30.4756C18.5159 30.1613 18.5176 29.8464 18.5205 29.5312V29.5322C18.5212 29.4593 18.5206 29.3864 18.5215 29.3135L18.5303 28.8154V28.8145C18.5343 28.5927 18.5384 28.371 18.543 28.1494C18.5558 27.5305 18.5684 28.1129 18.5684 27.5C18.5684 26.7047 17.9232 26.0596 17.1279 26.0596C16.907 26.0596 16.6978 26.1103 16.5107 26.1992C16.2161 26.3393 15.9767 26.5769 15.834 26.8701C15.8269 26.8846 15.8201 26.8993 15.8135 26.9141C15.7821 26.9845 15.7562 27.0579 15.7363 27.1338C15.7243 27.1798 15.7155 27.2267 15.708 27.2744C15.7012 27.3175 15.6953 27.361 15.6924 27.4053C15.6903 27.4366 15.6885 27.4681 15.6885 27.5V28.7383C15.6883 29.9234 14.4911 30.7248 13.4961 30.0811C13.0505 29.7926 12.8086 29.2886 12.8086 28.7578V26.2998C12.8086 25.9737 12.6984 25.674 12.5156 25.4326C12.4437 25.3381 12.3612 25.2521 12.2686 25.1777V25.1768C12.0219 24.9788 11.709 24.8604 11.3682 24.8604C10.9892 24.8604 10.8622 24.8872 10.7295 25.2295C10.5837 25.6055 10.4302 26 9.92773 26C9.33081 25.9996 8.95963 25.2403 8.71484 24.3799C8.5591 23.8325 8.45907 23.571 8.3623 23.0107C8.3501 22.9401 8.33284 22.8403 8.31738 22.7529C8.12812 21.9466 8.02043 21.1089 8.00293 20.249V20.25L8 20C8 19.8617 8.00317 19.724 8.00781 19.5869C8.00837 19.5703 8.00816 19.5537 8.00879 19.5371L8.00977 19.5352C8.0998 17.1716 8.87444 14.9844 10.1396 13.1631C10.1488 13.1499 10.1587 13.1372 10.168 13.124C12.255 10.1453 15.6582 8.15745 19.5352 8.00977L19.5371 8.00879C19.5537 8.00816 19.5703 8.00837 19.5869 8.00781C19.724 8.00317 19.8617 8 20 8L20.25 8.00293Z" />
                 </svg>
               )}
-            </ToolButton>
+            </button>
           </div>
         </div>
       </div>

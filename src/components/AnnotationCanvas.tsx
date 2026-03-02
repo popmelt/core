@@ -3217,6 +3217,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           <ElementHighlight
             element={el}
             isSelected={!isThinking}
+
             color={ann.color}
             hideTooltip
           />
@@ -3238,6 +3239,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           <ElementHighlight
             element={el}
             isSelected={!isThinking}
+
             color={ann.color}
             hideTooltip
           />
@@ -3254,6 +3256,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           <ElementHighlight
             element={el}
             isSelected={!isThinking}
+
             color={state.activeColor}
             hideTooltip
           />
