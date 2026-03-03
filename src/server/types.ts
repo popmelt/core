@@ -114,7 +114,7 @@ export type SSEEvent =
   | { type: 'job_started'; jobId: string; position: number; threadId?: string }
   | { type: 'delta'; jobId: string; text: string }
   | { type: 'thinking'; jobId: string; text: string }
-  | { type: 'tool_use'; jobId: string; tool: string; file?: string }
+  | { type: 'tool_use'; jobId: string; tool: string; file?: string; content?: string }
   | { type: 'done'; jobId: string; success: boolean; resolutions?: AnnotationResolution[]; responseText?: string; threadId?: string }
   | { type: 'error'; jobId: string; message: string; cancelled?: boolean }
   | { type: 'question'; jobId: string; threadId: string; question: string; annotationIds?: string[] }

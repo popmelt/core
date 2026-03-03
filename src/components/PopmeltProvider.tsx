@@ -81,7 +81,7 @@ export function PopmeltProvider({
   navigate: navigateProp,
 }: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
-  const bridge = useBridgeConnection(bridgeUrl);
+  const bridge = useBridgeConnection(bridgeUrl, enabled);
 
   // Refs for shadow DOM elements (used instead of getElementById)
   const canvasRef = useRef<HTMLCanvasElement>(null) as MutableRefObject<HTMLCanvasElement | null>;
@@ -328,6 +328,9 @@ export function PopmeltProvider({
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(THREAD_ID_STORAGE_KEY) || null;
   });
+
+  // Fallback accent color for the thread panel when the annotation is off-page
+  const threadColorFallbackRef = useRef<string | null>(null);
 
   // ThreadIds whose annotations were deleted — BridgeEventStack hides matching entries
   const [dismissedThreadIds, setDismissedThreadIds] = useState<Set<string>>(new Set());
@@ -986,6 +989,14 @@ export function PopmeltProvider({
     setOpenThreadId(threadId);
   }, []);
 
+  const handleClickJob = useCallback((jobId: string) => {
+    const job = inFlightJobs[jobId];
+    const threadId = job?.threadId || jobThreadMapRef.current.get(jobId);
+    if (threadId) {
+      threadColorFallbackRef.current = job?.color ?? null;
+      setOpenThreadId(threadId);
+    }
+  }, [inFlightJobs]);
 
   const handleHoverJob = useCallback((jobId: string | null) => {
     if (!jobId) { setHighlightedAnnotationIds(null); return; }
@@ -1082,13 +1093,22 @@ export function PopmeltProvider({
     };
   }, []);
 
+  // SSR safety: render children immediately, defer Popmelt chrome to client.
+  // This avoids the BailoutToCSR issue when PopmeltProvider wraps page content.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+
   const contextValue = useMemo(
     () => ({ isEnabled: enabled }),
     [enabled]
   );
 
-  if (!enabled) {
-    return <>{children}</>;
+  if (!enabled || !mounted) {
+    return (
+      <PopmeltContext.Provider value={contextValue}>
+        {children}
+      </PopmeltContext.Provider>
+    );
   }
 
   return (
@@ -1162,7 +1182,7 @@ export function PopmeltProvider({
             <ThreadPanel
               threadId={openThreadId}
               bridgeUrl={resolvedBridgeUrl}
-              accentColor={threadAnnotation?.color ?? state.activeColor}
+              accentColor={threadAnnotation?.color ?? threadColorFallbackRef.current ?? state.activeColor}
               isStreaming={threadActiveJobId !== null}
               streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
               onClose={() => setOpenThreadId(null)}
@@ -1191,6 +1211,7 @@ export function PopmeltProvider({
             clearSignal={clearSignal}
             onReply={handleReply}
             onViewThread={handleViewThread}
+            onClickJob={handleClickJob}
             onCancel={handleCancelJob}
             onHoverJob={handleHoverJob}
             isConnected={bridge.isConnected}

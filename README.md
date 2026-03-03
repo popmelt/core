@@ -6,9 +6,9 @@
 
 ## What is it?
 
-Popmelt is a design collaboration layer for AI coding agents. Drop it into any React, Vite, or Astro codebase and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, and hand off annotated screenshots with full technical context in a keystroke.
+Popmelt is a design collaboration layer for AI coding agents. Drop it into any React codebase and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, and hand off annotated screenshots with full technical context in a keystroke.
 
-It works with AI CLI tools like [Claude Code](https://code.claude.com/docs/en/cli-reference) and [Codex](https://developers.openai.com/codex/cli/),
+It works with AI CLI tools like [Claude Code](https://code.claude.com/docs/en/cli-reference) and [Codex](https://developers.openai.com/codex/cli/) — your agent sees exactly what you marked up, understands the code behind it, and edits your files.
 
 <p align="center">
   <img src="src/assets/bar - annotations.png" alt="Popmelt annotations on a running app" width="720" style="border-radius: 6px;" />
@@ -104,6 +104,8 @@ Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar.
 | Tool | Shortcut | What it does |
 |------|----------|-------------|
 | **Comment** | `C` | Click any element to pin a comment. Captures tag, classes, React component name, and ancestor context. |
+| **Handle** | `H` | Drag padding, gap, border-radius, font-size, and line-height handles directly on elements. Shift to snap to a scale. |
+| **Model** | `M` | Hover elements to see component boundaries. Click to promote a component or token into your design model. |
 | **Rectangle** | `R` | Draw a rectangle to highlight a region. Auto-prompts for a text label. |
 | **Oval** | `O` | Draw an ellipse. |
 | **Line** | `L` | Draw a straight line. |
@@ -115,7 +117,6 @@ Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar.
   <img src="src/assets/bar - rectangle.png" alt="Rectangle tool guidance" width="360" style="border-radius: 12px;" />
   <img src="src/assets/bar - text.png" alt="Text tool guidance" width="360" style="border-radius: 12px;" />
 </p>
-
 
 ## Handle tool
 
@@ -135,28 +136,7 @@ Right-click any element in Handle mode to open the **style panel** for full cont
   <img src="src/assets/bar - handle.png" alt="Handle tool guidance" width="360" style="border-radius: 12px;" />
 </p>
 
-
-
-## Model pane
-
-Popmelt maintains a design model for your project, a structured record of components, tokens, and rules.
-
-Switch to the Model tool (`M`) and hover any element to see component boundaries. Click to promote a component or token into your model. Popmelt classifies the scope of each promotion (instance vs pattern, element vs component vs token) so your AI understands what's a one-off tweak and what's a system-level change.
-
-Every annotation and resolution is stored in your project, creating a searchable history of what changed and why. You can use this record to track evolution of your design vision, and your AI can use it to make better decisions and avoid past mistake
-
-Your AI references the design model when making changes, keeping its output consistent with your established patterns.
-
-<p align="center">
-  <img src="src/assets/bar - model.png" alt="Model tool guidance" width="360" style="border-radius: 12px;" />
-</p>
-
-
-## Annotation counter
-
-The toolbar shows a count of active annotations. Click the counter to cycle through them; scroll to change the annotation color; hover to see a route-grouped navigation list of all annotations across pages.
-
-## AI Collaboration
+## AI collaboration
 
 Press Cmd+Enter to capture an annotated screenshot, bundle it with structured feedback (element selectors, style diffs, annotation text), and send it to your AI. Cmd+C copies the screenshot to your clipboard instead. Toggle between Claude (Opus/Sonnet) and Codex at any time.
 
@@ -171,6 +151,26 @@ Annotate across multiple pages in a single session. Popmelt captures per-page sc
 ### Resolution lifecycle
 
 When your AI resolves an annotation, it's marked with a status badge. Resolved annotations show a checkmark; annotations that need your review get a flag. Dismissed annotations gray out. The lifecycle keeps your canvas clean as you iterate.
+
+## Design model
+
+Popmelt maintains a design model in `.popmelt/model.json` — a structured record of your design tokens and promoted components.
+
+Switch to the Model tool (`M`) and hover any element to see component boundaries. Click to promote a component or token into your model. Popmelt classifies the scope of each promotion (instance vs pattern, element vs component vs token) so your AI understands what's a one-off tweak and what's a system-level change.
+
+Your AI references the design model when making changes, keeping its output consistent with your established patterns.
+
+<p align="center">
+  <img src="src/assets/bar - model.png" alt="Model tool guidance" width="360" style="border-radius: 12px;" />
+</p>
+
+## Decision history
+
+Every annotation and resolution is persisted to `.popmelt/decisions/` — a searchable record of what changed, why, and who asked for it. As your project evolves, this history becomes an invaluable reference for understanding past design choices and their context.
+
+## Annotation counter
+
+The toolbar shows a count of active annotations. Click the counter to cycle through them; scroll to change the annotation color; hover to see a route-grouped navigation list of all annotations across pages.
 
 ## API
 

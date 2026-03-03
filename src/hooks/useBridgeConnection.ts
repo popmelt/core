@@ -596,18 +596,20 @@ function connectBridge(bridgeUrl: string) {
 // React hook — thin wrapper over module-level store
 // ---------------------------------------------------------------------------
 
-export function useBridgeConnection(bridgeUrl = 'http://localhost:1111') {
+export function useBridgeConnection(bridgeUrl = 'http://localhost:1111', enabled = true) {
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-  // Connect on mount — discover the correct port first
+  // Connect on mount — discover the correct port first.
+  // Skip entirely when disabled (production) to avoid probing localhost ports.
   useEffect(() => {
+    if (!enabled) return;
     ensureDiscovered(bridgeUrl).then((url) => {
       if (!url) return;
       checkBridgeHealth(url).then((status) => {
         if (status) connectBridge(url);
       });
     });
-  }, [bridgeUrl]);
+  }, [bridgeUrl, enabled]);
 
   const clearEvents = useCallback(() => {
     update(() => ({

@@ -337,6 +337,7 @@ function getStreamPhase(events: BridgeEvent[]): string | null {
 
 type StreamSegment =
   | { kind: 'tool'; label: string }
+  | { kind: 'file_content'; file: string; content: string; ext: string; isPlan: boolean }
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string };
 
@@ -348,6 +349,14 @@ function buildStreamSegments(events: BridgeEvent[]): StreamSegment[] {
     if (e.type === 'tool_use') {
       const label = formatToolEvent(e);
       if (label) segments.push({ kind: 'tool', label });
+      // Surface file content for Write/Edit on text files
+      const content = e.data.content ? String(e.data.content) : null;
+      const file = e.data.file ? String(e.data.file) : null;
+      if (content && file) {
+        const ext = file.includes('.') ? `.${file.split('.').pop()!.toLowerCase()}` : '';
+        const isPlan = file.includes('.claude/plans/');
+        segments.push({ kind: 'file_content', file, content, ext, isPlan });
+      }
     } else if (e.type === 'delta') {
       const text = String(e.data.text || '');
       if (!text) continue;
@@ -370,6 +379,93 @@ function buildStreamSegments(events: BridgeEvent[]): StreamSegment[] {
   }
 
   return segments;
+}
+
+/** Collapsible inline display of file content written by the agent */
+function FileContentBlock({
+  file,
+  content,
+  ext,
+  isPlan,
+  onAccept,
+}: {
+  file: string;
+  content: string;
+  ext: string;
+  isPlan: boolean;
+  onAccept?: () => void;
+}) {
+  const [expanded, setExpanded] = useState(isPlan);
+  const basename = file.split('/').pop() ?? file;
+  const isMarkdown = ext === '.md';
+
+  return (
+    <div style={{
+      margin: '4px 0 4px 12px',
+      border: '1px solid rgba(0,0,0,0.08)',
+      backgroundColor: 'rgba(255,255,255,0.6)',
+      fontSize: 11,
+    }}>
+      <div
+        onClick={() => setExpanded(v => !v)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '4px 8px',
+          cursor: 'pointer',
+          userSelect: 'none',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          color: '#374151',
+        }}
+      >
+        <span style={{ fontSize: 9, color: '#9ca3af' }}>{expanded ? '▼' : '▶'}</span>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{basename}</span>
+        {isPlan && <span style={{ fontSize: 9, color: '#6366f1', fontFamily: 'inherit' }}>plan</span>}
+      </div>
+      {expanded && (
+        <>
+          <div style={{
+            maxHeight: 300,
+            overflowY: 'auto',
+            padding: '6px 10px',
+            borderTop: '1px solid rgba(0,0,0,0.06)',
+            lineHeight: 1.5,
+            wordBreak: 'break-word',
+          }}>
+            {isMarkdown ? (
+              renderMarkdown(content)
+            ) : (
+              <pre style={{
+                margin: 0,
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                fontSize: 11,
+                whiteSpace: 'pre-wrap',
+              }}>{content}</pre>
+            )}
+          </div>
+          {isPlan && onAccept && (
+            <div style={{ padding: '4px 8px', borderTop: '1px solid rgba(0,0,0,0.06)', display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                onClick={(e) => { e.stopPropagation(); onAccept(); }}
+                style={{
+                  background: '#111',
+                  color: '#fff',
+                  border: 'none',
+                  padding: '4px 12px',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                Accept
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 export function ThreadPanel({
@@ -984,6 +1080,18 @@ export function ThreadPanel({
                   >
                     {seg.label}
                   </div>
+                );
+              }
+              if (seg.kind === 'file_content') {
+                return (
+                  <FileContentBlock
+                    key={i}
+                    file={seg.file}
+                    content={seg.content}
+                    ext={seg.ext}
+                    isPlan={seg.isPlan}
+                    onAccept={seg.isPlan && onReply ? () => onReply(threadId, 'Looks good, please proceed with implementation.') : undefined}
+                  />
                 );
               }
               if (seg.kind === 'thinking') {

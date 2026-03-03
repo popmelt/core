@@ -22,6 +22,7 @@ type BridgeEventStackProps = {
   clearSignal: number;
   onReply?: (threadId: string, reply: string) => void;
   onViewThread?: (threadId: string) => void;
+  onClickJob?: (jobId: string) => void;
   onCancel?: (jobId: string) => void;
   onHoverJob?: (jobId: string | null) => void;
   isConnected?: boolean;
@@ -229,7 +230,7 @@ function DismissButton({ onDismiss }: { onDismiss: () => void }) {
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, onHoverJob, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onClickJob, onCancel, onHoverJob, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
   const [isHovered, setIsHovered] = useState(false);
 
@@ -363,9 +364,9 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       const el = rowRefs.current.get(entry.jobId);
       if (!el) continue;
 
-      if (entry.threadId && onViewThread) {
-        const threadId = entry.threadId;
-        const onClick = () => onViewThread(threadId);
+      if (onClickJob) {
+        const jobId = entry.jobId;
+        const onClick = () => onClickJob(jobId);
         el.addEventListener('click', onClick);
         cleanups.push(() => el.removeEventListener('click', onClick));
       }
@@ -380,7 +381,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       }
     }
     return () => cleanups.forEach(fn => fn());
-  }, [isRendered, entries, onViewThread, onHoverJob]);
+  }, [isRendered, entries, onClickJob, onHoverJob]);
 
   if (!isRendered) return null;
 
@@ -428,7 +429,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
           >
               <div
                 ref={(el) => setRowRef(entry.jobId, el)}
-                style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
+                style={{ ...rowStyle, cursor: onClickJob ? 'pointer' : undefined }}
                 title={entry.errorMessage || undefined}
               >
                 {entry.status === 'working' && <DotSpinner color={entry.color} />}

@@ -26,6 +26,36 @@ export type SpawnResult = {
   fileEdits?: FileEdit[];
 };
 
+const TEXT_EXTENSIONS = new Set([
+  '.md', '.txt', '.json', '.ts', '.tsx', '.js', '.jsx', '.css', '.scss',
+  '.html', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+  '.sh', '.bash', '.zsh', '.py', '.rb', '.go', '.rs', '.java', '.c',
+  '.h', '.cpp', '.hpp', '.swift', '.kt', '.sql', '.graphql', '.svg',
+  '.env', '.gitignore', '.prettierrc', '.eslintrc',
+]);
+
+const MAX_CONTENT_SIZE = 100_000; // 100KB cap
+
+/** Extract text content from Write/Edit tool_use blocks for surfacing in the UI */
+function getToolContent(block: { name: string; input?: Record<string, unknown> }): string | undefined {
+  const file = (block.input?.file_path || block.input?.path) as string | undefined;
+  if (!file) return undefined;
+
+  const ext = file.includes('.') ? `.${file.split('.').pop()!.toLowerCase()}` : '';
+  if (!TEXT_EXTENSIONS.has(ext)) return undefined;
+
+  let raw: string | undefined;
+  if (block.name === 'Write' && typeof block.input?.content === 'string') {
+    raw = block.input.content;
+  } else if (block.name === 'Edit' && typeof block.input?.new_string === 'string') {
+    raw = block.input.new_string;
+  }
+
+  if (!raw) return undefined;
+  if (raw.length > MAX_CONTENT_SIZE) return raw.slice(0, MAX_CONTENT_SIZE) + '\n…[truncated]';
+  return raw;
+}
+
 export function spawnClaude(
   jobId: string,
   options: SpawnOptions,
@@ -125,7 +155,8 @@ export function spawnClaude(
             }
             if (block.type === 'tool_use' && block.name) {
               const file = block.input?.file_path || block.input?.path || undefined;
-              onEvent?.({ type: 'tool_use', jobId, tool: block.name, ...(file ? { file } : {}) }, jobId);
+              const toolContent = getToolContent(block);
+              onEvent?.({ type: 'tool_use', jobId, tool: block.name, ...(file ? { file } : {}), ...(toolContent ? { content: toolContent } : {}) }, jobId);
               if (block.name === 'Edit' && block.input?.file_path) {
                 fileEdits.push({
                   tool: 'Edit',
