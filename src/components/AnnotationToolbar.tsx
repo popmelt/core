@@ -504,6 +504,33 @@ export function AnnotationToolbar({
   // Batch-persist all toolbar state to localStorage in a single effect
   useLocalStorageBatch(isExpanded, state, hasRestoredAnnotations, !!hasActiveJobs, STORAGE_KEYS);
 
+  // Auto-open toolbar when ?popmelt is present (for automated recording tools).
+  // Optional delay value: ?popmelt=1000 opens after 1000ms (shows collapsed → expanded).
+  // Also hides framework dev overlays (Turbopack, Vite error toast, etc.).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('popmelt')) return;
+
+    // Hide dev overlays
+    const style = document.createElement('style');
+    style.textContent = 'nextjs-portal, vite-error-overlay { display: none !important; }';
+    document.head.appendChild(style);
+
+    const delayMs = parseInt(params.get('popmelt') || '0', 10) || 0;
+    const open = () => {
+      setIsExpanded(true);
+      dispatch({ type: 'SET_TOOL', payload: 'inspector' });
+      dispatch({ type: 'SET_ANNOTATING', payload: true });
+    };
+
+    if (delayMs > 0) {
+      const timer = setTimeout(open, delayMs);
+      return () => clearTimeout(timer);
+    }
+    open();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Initialize annotation mode and restore annotations if restored as expanded.
   // Uses refs captured at init time (savedToolAtInit, etc.) to avoid reading from
   // localStorage after persist effects may have clobbered it (React strict mode).

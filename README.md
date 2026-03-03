@@ -1,38 +1,30 @@
 <p align="center">
-  <img src="src/assets/bar - popmelt.png" alt="Comment and zhuzh, then hand off." width="360" style="border-radius: 12px;" />
+  <img src="src/assets/bar - popmelt.png" alt="Popmelt" width="360" style="border-radius: 12px;" />
 </p>
 
 # Popmelt
 
 ## What is it?
 
-Popmelt is a design collaboration layer for AI models like Codex or Claude Code. It combines the best parts of collaborative design tools like Figma with the best way to design products today: in code, with AI, right in your browser. 
+Popmelt is a design collaboration layer for AI coding agents. Drop it into any React, Vite, or Astro codebase and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, and hand off annotated screenshots with full technical context in a keystroke.
 
-It's a good fit for anyone involved in UI Design and Engineering for the web: it doesn't require deep technical expertise to use, and it won't get in your way if you *do* have that knowledge and want to use it.
-
-Drop it into any React codebase and get a full design-feedback loop: draw on your running UI, pin feedback to elements, adjust style and layout directly, and give your AI the visual and technical context it needs to execute your vision in a keystroke.
+It works with AI CLI tools like [Claude Code](https://code.claude.com/docs/en/cli-reference) and [Codex](https://developers.openai.com/codex/cli/),
 
 <p align="center">
-  <img src="src/assets/annotations.jpg" alt="Popmelt annotations on a running app" width="720" style="border-radius: 6px;" />
+  <img src="src/assets/bar - annotations.png" alt="Popmelt annotations on a running app" width="720" style="border-radius: 6px;" />
 </p>
 
-**Popmelt is free to use and completely local**. It runs inside your codebase, with your existing AI CLI tools ([Claude Code](https://code.claude.com/docs/en/cli-reference), [Codex](https://developers.openai.com/codex/cli/)) handling code changes behind the scenes. You don't need an account to use it and we never see your data. 
+**Popmelt is free to use and completely local**. It runs inside your codebase, with your existing AI CLI tools handling code changes behind the scenes. You don't need an account to use it and we never see your data.
 
-## Why does it exist?
+## Quick start
 
-We're experienced product engineers and early adopters of AI coding models. We know their strengths, we know their weaknesses, and we've learned how to squeeze the best performance out of each generation. Popmelt was built to streamline our way of working, and we're proud to make it available to the design and engineering community.
-
-
-## How do I set it up?
-
-If you're a human, we recommend asking your AI to handle installation for you. We cover the basics below, but your AI should be able to integrate it into whatever setup you throw at it as long as it supports Node and React.
+### Install
 
 ```bash
 npm install @popmelt.com/core
 ```
 
-Peer dependencies: `react >=18`, `react-dom >=18`, `lucide-react >=0.400` (toolbar icons).
-
+Peer dependencies: `react >=18`, `react-dom >=18`, `lucide-react >=0.400`.
 
 ### Frontend
 
@@ -40,15 +32,20 @@ Wrap your app in `PopmeltProvider`. In development, double-tap Cmd/Ctrl to open 
 
 ```tsx
 import { PopmeltProvider } from '@popmelt.com/core';
+import { useRouter } from 'next/navigation';
 
 export default function App() {
+  const router = useRouter();
+
   return (
-    <PopmeltProvider>
+    <PopmeltProvider navigate={router.push}>
       {/* your app */}
     </PopmeltProvider>
   );
 }
 ```
+
+The `navigate` prop enables multi-page annotation support. Pass your framework's router push function (e.g. `router.push` in Next.js, `navigate` in React Router).
 
 ### Backend
 
@@ -102,14 +99,11 @@ npx @popmelt.com/core wrap -- vite
 
 Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar. Draw, type, point at things, hit Cmd+Enter. Your AI sees your annotated screenshot and code context and gets to work.
 
-## How do I use it?
-
-### Annotation tools
+## Annotation tools
 
 | Tool | Shortcut | What it does |
 |------|----------|-------------|
 | **Comment** | `C` | Click any element to pin a comment. Captures tag, classes, React component name, and ancestor context. |
-| **Handle** | `H` | Drag padding, gap, border-radius, font-size, and line-height handles directly on elements. Shift to snap to a scale. |
 | **Rectangle** | `R` | Draw a rectangle to highlight a region. Auto-prompts for a text label. |
 | **Oval** | `O` | Draw an ellipse. |
 | **Line** | `L` | Draw a straight line. |
@@ -122,7 +116,8 @@ Open your app in the browser and double-tap Cmd (or Ctrl) to toggle the toolbar.
   <img src="src/assets/bar - text.png" alt="Text tool guidance" width="360" style="border-radius: 12px;" />
 </p>
 
-### Handle tool
+
+## Handle tool
 
 Switch to the Handle tool (`H`) and hover any element to see draggable handles for its spatial properties:
 
@@ -134,29 +129,48 @@ Switch to the Handle tool (`H`) and hover any element to see draggable handles f
 
 All changes apply as inline styles instantly. Hold Cmd/Alt and swipe on a flex container to cycle `justify-content` or `flex-direction`; hold Shift and swipe to cycle `align-items`. Cmd+Z / Cmd+Shift+Z to undo/redo any change.
 
-Right-click any element in Handle mode to open the **style panel** for full control over layout (flex/grid direction, alignment, gap, sizing), typography (size, weight, line-height, letter-spacing, color), backgrounds, borders, and effects. Every modification is tracked and included in the feedback sent to your AI.
+Right-click any element in Handle mode to open the **style panel** for full control over layout, typography, backgrounds, borders, and effects. Every modification is tracked and included in the feedback sent to your AI.
 
 <p align="center">
   <img src="src/assets/bar - handle.png" alt="Handle tool guidance" width="360" style="border-radius: 12px;" />
 </p>
 
-### AI Collaboration
 
-Cmd+Enter captures an annotated screenshot with your annotations baked in, bundles it with structured feedback (element selectors, style diffs, annotation text), and sends it to Claude or Codex via a local bridge server. Your AI reads the screenshot, sees exactly what you marked up, and edits your code. Cmd+C copies the screenshot to your clipboard instead.
 
-- **Threaded conversations** — follow-up annotations on the same element continue the existing thread. Your AI sees prior context without re-explaining.
-- **Questions** — if your AI needs clarification, it asks. A badge appears on the annotation; reply inline and the conversation continues.
-- **Provider switching** — toggle between Claude (Opus/Sonnet) and Codex at any time. Popmelt handles both.
+## Model pane
+
+Popmelt maintains a design model for your project, a structured record of components, tokens, and rules.
+
+Switch to the Model tool (`M`) and hover any element to see component boundaries. Click to promote a component or token into your model. Popmelt classifies the scope of each promotion (instance vs pattern, element vs component vs token) so your AI understands what's a one-off tweak and what's a system-level change.
+
+Every annotation and resolution is stored in your project, creating a searchable history of what changed and why. You can use this record to track evolution of your design vision, and your AI can use it to make better decisions and avoid past mistake
+
+Your AI references the design model when making changes, keeping its output consistent with your established patterns.
 
 <p align="center">
-  <img src="src/assets/bar - model.png" alt="Model switcher guidance" width="360" style="border-radius: 12px;" />
+  <img src="src/assets/bar - model.png" alt="Model tool guidance" width="360" style="border-radius: 12px;" />
 </p>
 
-### Persistence
 
-Annotations and style modifications save to localStorage automatically. Cmd+Backspace clears unsent annotations and modifications.
+## Annotation counter
 
-Thread history persists to `.popmelt/threads.json` in your project root for cross-session continuity.
+The toolbar shows a count of active annotations. Click the counter to cycle through them; scroll to change the annotation color; hover to see a route-grouped navigation list of all annotations across pages.
+
+## AI Collaboration
+
+Press Cmd+Enter to capture an annotated screenshot, bundle it with structured feedback (element selectors, style diffs, annotation text), and send it to your AI. Cmd+C copies the screenshot to your clipboard instead. Toggle between Claude (Opus/Sonnet) and Codex at any time.
+
+### Threaded conversations
+
+Follow-up annotations on the same element continue the existing thread — your AI sees prior context without re-explaining. If your AI needs clarification, a question badge appears on the annotation; reply inline and the conversation continues.
+
+### Multi-page annotations
+
+Annotate across multiple pages in a single session. Popmelt captures per-page screenshots and stitches them into a single submission so your AI understands the full scope of your feedback. Pass a `navigate` prop to `PopmeltProvider` to enable this.
+
+### Resolution lifecycle
+
+When your AI resolves an annotation, it's marked with a status badge. Resolved annotations show a checkmark; annotations that need your review get a flag. Dismissed annotations gray out. The lifecycle keeps your canvas clean as you iterate.
 
 ## API
 
@@ -164,8 +178,9 @@ Thread history persists to `.popmelt/threads.json` in your project root for cros
 
 ```tsx
 <PopmeltProvider
-  enabled={true}       // default: process.env.NODE_ENV === 'development'
-  bridgeUrl="http://localhost:1111"  // default
+  enabled={true}                    // default: process.env.NODE_ENV === 'development'
+  bridgeUrl="http://localhost:1111" // default
+  navigate={router.push}           // optional: enables multi-page annotations
 >
 ```
 
@@ -205,6 +220,6 @@ const { isEnabled } = usePopmelt();
 
 **If you need a custom license** for your use case, contact [reb@popmelt.com](mailto:reb@popmelt.com) with a brief outline of your desired terms.
 
-<p style="background: #efefef; padding: 4px; display: inline-flex">
-<img src="src/assets/popmelt-logo.svg" alt="Comment and zhuzh, then hand off." width="64" />
+<p align="center">
+<img src="src/assets/popmelt-logo.svg" alt="Popmelt" width="64" />
 </p>
