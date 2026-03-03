@@ -37,12 +37,9 @@ function wrapLine(ctx: CanvasRenderingContext2D, line: string, maxWidth: number)
  * Compute the effective max width for a text annotation given its viewport X.
  * Returns undefined when no constraint is needed.
  */
-export function getEffectiveMaxWidth(viewportX: number): number | undefined {
+export function getEffectiveMaxWidth(viewportX: number): number {
   const rightSpace = window.innerWidth - viewportX - VIEWPORT_MARGIN;
-  if (rightSpace < MAX_DISPLAY_WIDTH) {
-    return Math.max(MIN_WRAP_WIDTH, rightSpace);
-  }
-  return undefined;
+  return Math.max(MIN_WRAP_WIDTH, Math.min(MAX_DISPLAY_WIDTH, rightSpace));
 }
 
 /**
@@ -61,6 +58,17 @@ export function wrapLines(
   return result;
 }
 
+/** Truncate a string with ellipsis to fit within maxWidth pixels */
+export function truncateWithEllipsis(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  const ellipsis = '\u2026';
+  for (let i = text.length - 1; i > 0; i--) {
+    const truncated = text.slice(0, i) + ellipsis;
+    if (ctx.measureText(truncated).width <= maxWidth) return truncated;
+  }
+  return ellipsis;
+}
+
 export function drawText(
   ctx: CanvasRenderingContext2D,
   point: Point,
@@ -74,12 +82,12 @@ export function drawText(
   if (!text) return;
 
   const lineHeightPx = fontSize * LINE_HEIGHT;
-  const lines = text.split('\n');
 
-  // Prepend group number to first line if provided
-  const displayLines = groupNumber !== undefined
-    ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
-    : lines;
+  // Flatten to single line, prepend group number
+  const flat = text.replace(/\n/g, ' ');
+  const displayText = groupNumber !== undefined
+    ? groupNumber + '. ' + flat
+    : flat;
 
   ctx.font = `${fontSize}px ${FONT_FAMILY}`;
   ctx.textBaseline = 'middle';
@@ -89,30 +97,22 @@ export function drawText(
     ? Math.min(MAX_DISPLAY_WIDTH, Math.max(MIN_WRAP_WIDTH, window.innerWidth - viewportX - VIEWPORT_MARGIN))
     : MAX_DISPLAY_WIDTH;
 
-  // Word-wrap lines that exceed the effective max width
-  const wrappedLines = wrapLines(ctx, displayLines, effectiveMax);
-  const maxWidth = Math.min(effectiveMax, Math.max(...wrappedLines.map(l => ctx.measureText(l).width)));
-  const wrappedHeight = wrappedLines.length * lineHeightPx;
-  const originalHeight = displayLines.length * lineHeightPx;
-
-  // Shift upward so the bottom edge stays in place when wrapping adds lines
-  const yShift = wrappedHeight - originalHeight;
-  const drawY = point.y - yShift;
+  // Truncate with ellipsis if wider than the cap
+  const truncated = truncateWithEllipsis(ctx, displayText, effectiveMax);
+  const textWidth = ctx.measureText(truncated).width;
 
   // Draw background
   ctx.fillStyle = color;
   ctx.fillRect(
     point.x - PADDING,
-    drawY - PADDING,
-    maxWidth + PADDING * 2,
-    wrappedHeight + PADDING * 2
+    point.y - PADDING,
+    textWidth + PADDING * 2,
+    lineHeightPx + PADDING * 2
   );
 
-  // Draw text (white) - use middle baseline and center within each line
+  // Draw text (white)
   ctx.fillStyle = '#ffffff';
-  wrappedLines.forEach((line, i) => {
-    ctx.fillText(line, point.x, drawY + i * lineHeightPx + lineHeightPx / 2);
-  });
+  ctx.fillText(truncated, point.x, point.y + lineHeightPx / 2);
 }
 
 export { PADDING, LINE_HEIGHT, FONT_FAMILY, MAX_DISPLAY_WIDTH, VIEWPORT_MARGIN };

@@ -22,6 +22,7 @@ type AnnotationData = {
   type: string;
   instruction?: string;
   linkedSelector?: string;
+  pathname?: string;
   elements: ElementInfo[];
   imageCount?: number;
 };
@@ -68,11 +69,13 @@ export function buildFeedbackData(
     if (shape) {
       const linkedSelector = shape.linkedSelector || text?.linkedSelector;
       const imageCount = text?.imageCount || shape.imageCount;
+      const pathname = shape.pathname || text?.pathname;
       annotationDataList.push({
         id: shape.id,
         type: shape.type,
         instruction: text?.text,
         ...(linkedSelector ? { linkedSelector } : {}),
+        ...(pathname ? { pathname } : {}),
         // Use stored elements (captured at creation time) or empty array
         elements: shape.elements || [],
         ...(imageCount ? { imageCount } : {}),
@@ -87,6 +90,7 @@ export function buildFeedbackData(
       type: annotation.type,
       instruction: annotation.type === 'text' ? annotation.text : undefined,
       ...(annotation.linkedSelector ? { linkedSelector: annotation.linkedSelector } : {}),
+      ...(annotation.pathname ? { pathname: annotation.pathname } : {}),
       // Use stored elements (captured at creation time) or empty array
       elements: annotation.elements || [],
       ...(annotation.imageCount ? { imageCount: annotation.imageCount } : {}),
@@ -205,15 +209,59 @@ function groupAnnotationsIntoRegions(annotations: Annotation[], viewportHeight: 
   return regions;
 }
 
+type ElementBounds = { x: number; y: number; width: number; height: number };
+
+/** Resolve linked element bounding rects in document coordinates (call before capture). */
+function resolveElementBounds(annotations: Annotation[]): Map<string, ElementBounds> {
+  const map = new Map<string, ElementBounds>();
+  for (const ann of annotations) {
+    if (!ann.linkedSelector) continue;
+    try {
+      const el = document.querySelector(ann.linkedSelector);
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        map.set(ann.id, {
+          x: rect.left + window.scrollX,
+          y: rect.top + window.scrollY,
+          width: rect.width,
+          height: rect.height,
+        });
+      }
+    } catch { /* invalid selector */ }
+  }
+  return map;
+}
+
 // Draw annotations onto a canvas at a specific scroll offset
 function drawAnnotationsToCanvas(
   ctx: CanvasRenderingContext2D,
   annotations: Annotation[],
   scrollY: number,
-  dpr: number
+  dpr: number,
+  elementBounds?: Map<string, ElementBounds>,
 ): void {
   ctx.save();
   ctx.scale(dpr, dpr);
+
+  // Draw element highlight outlines first (behind annotations)
+  if (elementBounds) {
+    for (const annotation of annotations) {
+      const bounds = elementBounds.get(annotation.id);
+      if (!bounds) continue;
+      const y = bounds.y - scrollY;
+      // Subtle fill (5% opacity)
+      ctx.fillStyle = annotation.color;
+      ctx.globalAlpha = 0.05;
+      ctx.fillRect(bounds.x, y, bounds.width, bounds.height);
+      ctx.globalAlpha = 1;
+      // Dashed outline
+      ctx.strokeStyle = annotation.color;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.strokeRect(bounds.x, y, bounds.width, bounds.height);
+      ctx.setLineDash([]);
+    }
+  }
 
   for (const annotation of annotations) {
     // Offset points by scroll position
@@ -329,6 +377,9 @@ export async function captureScreenshot(
 
     console.log('[Screenshot] Starting capture with', activeAnnotations.length, 'active annotations (filtered', annotations.length - activeAnnotations.length, 'captured)');
 
+    // Resolve linked element bounding rects before any DOM changes
+    const elBounds = resolveElementBounds(activeAnnotations);
+
     // Group annotations into viewport-height regions
     const regions = groupAnnotationsIntoRegions(activeAnnotations, viewportHeight);
 
@@ -340,7 +391,8 @@ export async function captureScreenshot(
         window.scrollY,
         viewportWidth,
         viewportHeight,
-        dpr
+        dpr,
+        elBounds,
       );
       return blob ? [blob] : [];
     }
@@ -355,7 +407,8 @@ export async function captureScreenshot(
         region.top,
         viewportWidth,
         viewportHeight,
-        dpr
+        dpr,
+        elBounds,
       );
       if (blob) {
         blobs.push(blob);
@@ -378,7 +431,8 @@ async function captureSingleRegion(
   scrollY: number,
   viewportWidth: number,
   viewportHeight: number,
-  dpr: number
+  dpr: number,
+  elementBounds?: Map<string, ElementBounds>,
 ): Promise<Blob | null> {
   try {
     // Capture DOM at this scroll position
@@ -426,7 +480,7 @@ async function captureSingleRegion(
     );
 
     // Draw annotations for this region
-    drawAnnotationsToCanvas(ctx, annotations, scrollY, dpr);
+    drawAnnotationsToCanvas(ctx, annotations, scrollY, dpr, elementBounds);
 
     // Export as blob
     return new Promise((resolve) => {

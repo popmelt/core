@@ -4,6 +4,19 @@ import type { Job, SSEEvent } from './types';
 
 export type QueueListener = (event: SSEEvent, jobId: string, sourceId?: string) => void;
 
+export type BufferedEvent = SSEEvent & { seq: number };
+
+export type BackfillResponse = {
+  jobId: string;
+  events: BufferedEvent[];
+  currentSeq: number;
+  accumulated: { response: string; thinking: string };
+  jobActive: boolean;
+};
+
+const MAX_BUFFERED_EVENTS = 10_000;
+const BUFFER_CLEANUP_DELAY_MS = 60_000;
+
 export class JobQueue {
   private queue: Job[] = [];
   private activeJobs = new Map<string, Job>();
@@ -11,6 +24,11 @@ export class JobQueue {
   private listeners: Set<QueueListener> = new Set();
   private processor: ((job: Job) => Promise<void>) | null = null;
   private maxConcurrency: number;
+
+  // Per-job event buffer for reconnect backfill
+  private eventBuffers = new Map<string, { events: BufferedEvent[]; nextSeq: number }>();
+  private accumulators = new Map<string, { response: string; thinking: string }>();
+  private cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(maxConcurrency = 5) {
     this.maxConcurrency = maxConcurrency;
@@ -62,9 +80,76 @@ export class JobQueue {
   }
 
   broadcast(event: SSEEvent, jobId: string, sourceId?: string) {
+    // Stamp seq and buffer for reconnect backfill
+    const stamped = this.bufferEvent(jobId, event);
+
     for (const listener of this.listeners) {
-      listener(event, jobId, sourceId);
+      listener(stamped, jobId, sourceId);
     }
+  }
+
+  // ---- Event buffer for reconnect backfill ----
+
+  private bufferEvent(jobId: string, event: SSEEvent): BufferedEvent {
+    let buf = this.eventBuffers.get(jobId);
+    if (!buf) {
+      buf = { events: [], nextSeq: 0 };
+      this.eventBuffers.set(jobId, buf);
+    }
+    const stamped: BufferedEvent = { ...event, seq: buf.nextSeq++ };
+    buf.events.push(stamped);
+    // Evict oldest if over cap
+    if (buf.events.length > MAX_BUFFERED_EVENTS) {
+      buf.events.splice(0, buf.events.length - MAX_BUFFERED_EVENTS);
+    }
+    return stamped;
+  }
+
+  getBufferedEvents(jobId: string, afterSeq = -1): BackfillResponse | null {
+    const buf = this.eventBuffers.get(jobId);
+    const acc = this.accumulators.get(jobId) ?? { response: '', thinking: '' };
+    const jobActive = this.activeJobs.has(jobId);
+
+    // No buffer at all — unknown job
+    if (!buf) return null;
+
+    const events = afterSeq < 0
+      ? buf.events
+      : buf.events.filter(e => e.seq > afterSeq);
+
+    return {
+      jobId,
+      events,
+      currentSeq: buf.nextSeq - 1,
+      accumulated: { ...acc },
+      jobActive,
+    };
+  }
+
+  accumulateText(jobId: string, field: 'response' | 'thinking', text: string) {
+    let acc = this.accumulators.get(jobId);
+    if (!acc) {
+      acc = { response: '', thinking: '' };
+      this.accumulators.set(jobId, acc);
+    }
+    acc[field] += text;
+  }
+
+  getAccumulated(jobId: string): { response: string; thinking: string } | null {
+    return this.accumulators.get(jobId) ?? null;
+  }
+
+  private scheduleBufferCleanup(jobId: string) {
+    // Clear any existing timer
+    const existing = this.cleanupTimers.get(jobId);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      this.eventBuffers.delete(jobId);
+      this.accumulators.delete(jobId);
+      this.cleanupTimers.delete(jobId);
+    }, BUFFER_CLEANUP_DELAY_MS);
+    this.cleanupTimers.set(jobId, timer);
   }
 
   cancelJob(jobId: string): boolean {
@@ -103,6 +188,10 @@ export class JobQueue {
     this.activeJobs.clear();
     this.queue = [];
     this.listeners.clear();
+    this.eventBuffers.clear();
+    this.accumulators.clear();
+    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
+    this.cleanupTimers.clear();
   }
 
   async destroyAsync(timeoutMs = 10_000): Promise<void> {
@@ -140,6 +229,10 @@ export class JobQueue {
 
     this.activeProcesses.clear();
     this.activeJobs.clear();
+    this.eventBuffers.clear();
+    this.accumulators.clear();
+    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
+    this.cleanupTimers.clear();
   }
 
   private processNext() {
@@ -168,6 +261,8 @@ export class JobQueue {
         .finally(() => {
           this.activeJobs.delete(job.id);
           this.activeProcesses.delete(job.id);
+          // Schedule deferred cleanup of event buffer (gives reconnecting clients a window)
+          this.scheduleBufferCleanup(job.id);
           // Try to start more queued jobs
           this.processNext();
           // Signal drain when everything is done

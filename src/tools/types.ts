@@ -100,6 +100,7 @@ export type Annotation = {
   scope?: Scope | null; // Effective scope (finalScope ?? inferredScope)
   replyCount?: number; // Number of Claude responses for this annotation
   threadId?: string; // Thread this annotation belongs to
+  pathname?: string; // Page pathname where annotation was created
   elements?: ElementInfo[]; // DOM elements captured at creation time
   linkedSelector?: string; // CSS selector of linked DOM element (inspector pin)
   linkedAnchor?: 'top-left' | 'bottom-left'; // Which corner to anchor to

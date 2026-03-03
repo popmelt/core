@@ -40,6 +40,7 @@ export type FeedbackPayload = {
     type: string;
     instruction?: string;
     linkedSelector?: string;
+    pathname?: string;
     imageCount?: number;
     elements: {
       selector: string;
@@ -106,6 +107,7 @@ export type Job = {
   model?: string;
   imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
   sourceId?: string; // SSE scoping — only the originating client sees job events
+  screenshotPaths?: Record<string, string>; // pathname → temp file path for per-page screenshots
 };
 
 export type SSEEvent =
@@ -142,6 +144,8 @@ export type ThreadMessage = {
   jobId: string;
   // Human
   screenshotPath?: string;
+  screenshotPaths?: Record<string, string>; // pathname → temp file path for per-page screenshots
+  imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
   annotationIds?: string[];
   feedbackSummary?: string;
   feedbackContext?: string; // Full formatted annotation details (selectors, elements, etc.)
@@ -152,6 +156,7 @@ export type ThreadMessage = {
   sessionId?: string;
   question?: string;         // assistant asks a question
   replyToQuestion?: string;  // human replies to a question
+  replyImagePaths?: string[]; // temp file paths for images attached to a reply
   cancelled?: boolean;       // job was cancelled by user
   error?: string;            // spawn/runtime error (e.g. git trust, timeout)
   model?: string;            // model id used for this message

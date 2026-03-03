@@ -178,7 +178,13 @@ export function spawnClaude(
         errorMessage = `Timed out after ${Math.round(TIMEOUT_MS / 60000)} minutes`;
       } else if (code !== 0 && code !== null) {
         hadError = true;
-        errorMessage = stderrChunks.join('') || `Claude process exited with code ${code}`;
+        const stderr = stderrChunks.join('').trim();
+        const noTextHint = textChunks.length === 0 && seenEventTypes.size > 0
+          ? ` (no text captured, event types: ${[...seenEventTypes].join(', ')})`
+          : '';
+        errorMessage = stderr
+          ? stderr
+          : `Claude process exited with code ${code}${noTextHint}`;
       }
 
       resolve({

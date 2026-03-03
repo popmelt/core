@@ -54,16 +54,8 @@ export function ElementHighlight({ element, isSelected = false, elementInfo, col
     height: bounds.height,
     pointerEvents: 'none',
     zIndex: 9996,
-    backgroundColor: isSelected ? colorWithAlpha(color, 0.1) : colorWithAlpha(color, 0.05),
+    backgroundColor: colorWithAlpha(color, 0.05),
     overflow: 'visible',
-  };
-
-  const cornerDotStyle: CSSProperties = {
-    position: 'absolute',
-    width: 2,
-    height: 2,
-    backgroundColor: color,
-    pointerEvents: 'none',
   };
 
   // Build tooltip label
@@ -159,10 +151,6 @@ export function ElementHighlight({ element, isSelected = false, elementInfo, col
             {...(!isSelected && { strokeDasharray: '2 4' })}
           />
         </svg>
-        <div style={{ ...cornerDotStyle, top: -1, left: -1 }} />
-        <div style={{ ...cornerDotStyle, top: -1, right: -1 }} />
-        <div style={{ ...cornerDotStyle, bottom: -1, left: -1 }} />
-        <div style={{ ...cornerDotStyle, bottom: -1, right: -1 }} />
         {isFullHeight && tooltipJsx}
       </div>
       {!isFullHeight && tooltipJsx}

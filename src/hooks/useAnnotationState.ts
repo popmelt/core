@@ -17,7 +17,7 @@ import type {
 const initialState: AnnotationState = {
   isAnnotating: false,
   activeTool: 'inspector',
-  activeColor: '#ff0000',
+  activeColor: 'oklch(0.628 0.258 29)',
   strokeWidth: 3,
   annotations: [],
   undoStack: [],
@@ -101,6 +101,7 @@ function handleFinishPath(state: AnnotationState, payload?: { groupId?: string; 
     strokeWidth: state.strokeWidth,
     timestamp: Date.now(),
     status: 'pending',
+    pathname: typeof window !== 'undefined' ? window.location.pathname : '/',
     groupId: payload?.groupId,
     elements: payload?.elements,
   };
@@ -134,6 +135,7 @@ function handleAddText(state: AnnotationState, payload: {
     strokeWidth: state.strokeWidth,
     timestamp: Date.now(),
     status: 'pending',
+    pathname: typeof window !== 'undefined' ? window.location.pathname : '/',
     groupId: payload.groupId,
     linkedSelector: payload.linkedSelector,
     linkedAnchor: payload.linkedAnchor,

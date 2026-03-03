@@ -6,8 +6,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { generateId } from '../hooks/useAnnotationState';
 import { useCanvasDrawing } from '../hooks/useCanvasDrawing';
 import { useModifierKeys } from '../hooks/useModifierKeys';
+import { usePathname } from '../hooks/usePathname';
 import { useWheelZoom } from '../hooks/useWheelZoom';
-import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING, VIEWPORT_MARGIN, getEffectiveMaxWidth, wrapLines } from '../tools/text';
+import { FONT_FAMILY, LINE_HEIGHT, PADDING, getEffectiveMaxWidth, truncateWithEllipsis, wrapLines } from '../tools/text';
 import type { Annotation, AnnotationAction, AnnotationState, ElementInfo, Point } from '../tools/types';
 import { AnnotationBadges, BADGE_HEIGHT, MarchingAntsBorders, QuestionBadges } from './badges';
 import type { BorderRadiusCorner } from '../utils/dom';
@@ -813,8 +814,16 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [dispatch, clearSelection, selectAnnotation, state.activeTool, modelFocusedComponents, modelComponentNames, onModelComponentsAdd, onCloseThread]); // All other values read from refs
 
+  // Filter annotations to current page (annotations without pathname are visible everywhere for backward compat)
+  const currentPathname = usePathname();
+  const pageAnnotations = useMemo(
+    () => state.annotations.filter(a => !a.pathname || a.pathname === currentPathname),
+    [state.annotations, currentPathname],
+  );
+
   // Compute superseded annotations: when multiple annotation rounds target
   // the same linkedSelector, only the newest round is visible.
+  // Uses all annotations (not just page) so global numbering is correct.
   // Returns Set<Annotation> (object refs) to avoid duplicate-ID collisions.
   const supersededAnnotations = useMemo(
     () => computeSupersededAnnotations(state.annotations),
@@ -822,12 +831,17 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
   );
 
   // Calculate annotation group map (for numbering text annotations)
+  // Numbers are global across ALL pages (sorted by timestamp) so cross-page
+  // annotations get sequential numbers reflecting creation order.
   const annotationGroupMap = useMemo(() => {
     const map = new Map<string, number>();
     const seenGroupIds = new Set<string>();
     let groupIndex = 1;
 
-    for (const annotation of state.annotations) {
+    // Sort all annotations by timestamp to get stable global ordering
+    const sorted = [...state.annotations].sort((a, b) => a.timestamp - b.timestamp);
+
+    for (const annotation of sorted) {
       if (supersededAnnotations.has(annotation)) continue;
       if (annotation.groupId) {
         if (!seenGroupIds.has(annotation.groupId)) {
@@ -870,8 +884,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
   // Redraw when state changes or scroll position changes
   useEffect(() => {
-    // Filter out the annotation being edited and superseded annotations
-    const visibleAnnotations = state.annotations.filter(a => {
+    // Filter out the annotation being edited and superseded annotations (already page-scoped)
+    const visibleAnnotations = pageAnnotations.filter(a => {
       if (supersededAnnotations.has(a)) return false;
       if (activeText && !activeText.isNew && a.id === activeText.id) return false;
       return true;
@@ -890,7 +904,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       annotationGroupMap,
       highlightedAnnotationIds
     );
-  }, [state.annotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededAnnotations, highlightedAnnotationIds]);
+  }, [pageAnnotations, state.currentPath, state.activeTool, state.activeColor, state.strokeWidth, redrawAll, activeText, selectedAnnotationIds, scroll, annotationGroupMap, supersededAnnotations, highlightedAnnotationIds]);
 
   // Auto-create text annotation after drawing a rectangle
   useEffect(() => {
@@ -1048,12 +1062,12 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     return dist <= threshold;
   }, []);
 
-  // Find any annotation at a given point
+  // Find any annotation at a given point (only current-page annotations)
   const findAnnotationAtPoint = useCallback((point: Point): Annotation | null => {
     const SAFE_AREA = 4;
 
-    for (let i = state.annotations.length - 1; i >= 0; i--) {
-      const annotation = state.annotations[i];
+    for (let i = pageAnnotations.length - 1; i >= 0; i--) {
+      const annotation = pageAnnotations[i];
       if (!annotation) continue;
       if (supersededAnnotations.has(annotation)) continue;
 
@@ -1070,25 +1084,19 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
             const ctx = canvas.getContext('2d');
             if (ctx) {
               ctx.font = `${fontSize}px ${FONT_FAMILY}`;
-              const lines = annotation.text.split('\n');
-
-              // Account for viewport-constrained wrapping
+              // Committed text is rendered as single line (truncated with ellipsis)
+              const flat = annotation.text.replace(/\n/g, ' ');
               const viewportX = textPoint.x - scroll.x;
-              const effectiveMax = getEffectiveMaxWidth(viewportX);
-              const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : undefined;
-              const wrapped = capWidth ? wrapLines(ctx, lines, capWidth) : lines;
-              const maxWidth = capWidth
-                ? Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)))
-                : Math.max(...lines.map((line) => ctx.measureText(line).width));
-              const wrappedHeight = wrapped.length * (fontSize * LINE_HEIGHT);
-              const originalHeight = lines.length * (fontSize * LINE_HEIGHT);
-              const yShift = wrappedHeight - originalHeight;
+              const capWidth = getEffectiveMaxWidth(viewportX);
+              const truncated = truncateWithEllipsis(ctx, flat, capWidth);
+              const textWidth = ctx.measureText(truncated).width;
+              const lineH = fontSize * LINE_HEIGHT;
 
               if (
                 point.x >= textPoint.x - PADDING - SAFE_AREA &&
-                point.x <= textPoint.x + maxWidth + PADDING + SAFE_AREA &&
-                point.y >= textPoint.y - PADDING - SAFE_AREA - yShift &&
-                point.y <= textPoint.y + originalHeight + PADDING + SAFE_AREA
+                point.x <= textPoint.x + textWidth + PADDING + SAFE_AREA &&
+                point.y >= textPoint.y - PADDING - SAFE_AREA &&
+                point.y <= textPoint.y + lineH + PADDING + SAFE_AREA
               ) {
                 return annotation;
               }
@@ -1165,7 +1173,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       }
     }
     return null;
-  }, [state.annotations, canvasRef, isPointNearLine, supersededAnnotations, scroll.x]);
+  }, [pageAnnotations, canvasRef, isPointNearLine, supersededAnnotations, scroll.x]);
 
   // Find text annotation at a given point (for hover/resize)
   const findTextAtPoint = useCallback((point: Point): Annotation | null => {
@@ -1396,6 +1404,22 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
         if ('button' in e && e.button === 2) return;
 
         if (hoveredElement && !isElementInFlight(hoveredElement)) {
+          // If element already has a threaded annotation, open the thread instead of stacking
+          const existingThreaded = state.annotations.find(a => {
+            if (!a.linkedSelector || !a.threadId) return false;
+            try { return hoveredElement.matches(a.linkedSelector); } catch { return false; }
+          });
+          if (existingThreaded?.threadId && onViewThread) {
+            onViewThread(existingThreaded.threadId);
+            // Focus the reply input after the panel opens
+            requestAnimationFrame(() => {
+              const shadowHost = document.querySelector('[data-popmelt-shadow-host]');
+              const input = shadowHost?.shadowRoot?.querySelector('[data-popmelt-reply]') as HTMLInputElement | null;
+              input?.focus();
+            });
+            return;
+          }
+
           const info = extractElementInfo(hoveredElement);
           const structuralSelector = getUniqueSelector(hoveredElement);
           const rect = hoveredElement.getBoundingClientRect();
@@ -2771,7 +2795,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
 
   // Position tracking: linked annotations follow their elements
   useEffect(() => {
-    const linkedAnnotations = state.annotations.filter(a => a.linkedSelector);
+    const linkedAnnotations = pageAnnotations.filter(a => a.linkedSelector);
     if (linkedAnnotations.length === 0) return;
 
     let rafId: number | null = null;
@@ -2859,7 +2883,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       observer.disconnect();
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [state.annotations, dispatch]);
+  }, [pageAnnotations, dispatch]);
 
   // Determine cursor based on state
   const getCursor = (): string => {
@@ -2936,7 +2960,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
     // Constrain to viewport right edge
     const viewportLeft = activeText.point.x - scroll.x;
     const effectiveMax = getEffectiveMaxWidth(viewportLeft);
-    const isWrapped = effectiveMax !== undefined && naturalWidth > effectiveMax;
+    const isWrapped = naturalWidth > effectiveMax;
 
     if (isWrapped) {
       const wrappedLines = wrapLines(ctx, lines, effectiveMax);
@@ -3043,7 +3067,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           styleModifications={state.styleModifications}
           isInspecting={!!state.inspectedElement}
           accentColor={state.activeColor}
-          annotationGroupCount={new Set(state.annotations.map(a => a.groupId || a.id)).size}
+          annotationGroupCount={new Set(pageAnnotations.map(a => a.groupId || a.id)).size}
           dispatch={dispatch}
           inFlightSelectors={inFlightStyleSelectors}
           toolbarRef={toolbarRef}
@@ -3062,7 +3086,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {/* Unified annotation badges: thinking spinner OR reply count, click opens thread */}
       {state.isAnnotating && (
         <AnnotationBadges
-          annotations={state.annotations}
+          annotations={pageAnnotations}
           supersededAnnotations={supersededAnnotations}
           inFlightIds={inFlightAnnotationIds}
           scrollX={scroll.x}
@@ -3078,7 +3102,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {/* Question badges for waiting_input annotations */}
       {state.isAnnotating && onReply && (
         <QuestionBadges
-          annotations={state.annotations}
+          annotations={pageAnnotations}
           supersededAnnotations={supersededAnnotations}
           scrollX={scroll.x}
           scrollY={scroll.y}
@@ -3167,10 +3191,16 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
       {state.activeTool === 'inspector' && state.isAnnotating && (
         <>
           {hoveredElement && !state.inspectedElement && (() => {
+            // Skip hover scrim when a focused/selected highlight already covers this element
+            const focusedSelector = activeText?.linkedSelector || pendingLinkedText?.linkedSelector;
+            if (focusedSelector) {
+              try { if (hoveredElement.matches(focusedSelector)) return null; } catch { /* */ }
+            }
+
             // Hide the tooltip badge when a linked annotation is being created
             // or already exists for the hovered element
             const hasLinkedAnnotation = !!pendingLinkedText || !!activeText?.linkedSelector ||
-              state.annotations.some(a => {
+              pageAnnotations.some(a => {
                 if (!a.linkedSelector) return false;
                 try { return hoveredElement.matches(a.linkedSelector); } catch { return false; }
               });
@@ -3347,7 +3377,7 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           {stylePanelHint && stylePanelHint !== 'padding' && stylePanelHint !== 'gap' && (() => {
             // Calculate annotation number: count annotation groups + position in style mods
             const annotationGroupCount = new Set(
-              state.annotations.map(a => a.groupId || a.id)
+              pageAnnotations.map(a => a.groupId || a.id)
             ).size;
             const selector = state.inspectedElement.info.selector;
             const styleModIndex = state.styleModifications.findIndex(m => m.selector === selector);

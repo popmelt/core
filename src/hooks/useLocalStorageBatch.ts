@@ -25,23 +25,31 @@ export function useLocalStorageBatch(
   storageKeys: StorageKeys,
 ) {
   const lastPersistedCount = useRef(0);
+  const lastAnnotationsRef = useRef(state.annotations);
 
+  // Dedicated effect for annotations — only runs when the annotations array
+  // reference actually changes, preventing stale writes from other deps.
   useEffect(() => {
-    // Guard: don't write until restore has completed (prevents overwriting saved state during mount)
-    if (!hasRestoredAnnotations.current) return;
+    if (!hasRestoredAnnotations.current || !isExpanded) return;
+    lastAnnotationsRef.current = state.annotations;
 
-    // Always persist expanded state (even when collapsed)
-    localStorage.setItem(storageKeys.expanded, String(isExpanded));
-
-    // Only persist the rest when expanded
-    if (!isExpanded) return;
-
-    // Annotations: skip write if count shrank AND jobs are active (mid-resolution shrinkage)
     const count = state.annotations.length;
-    if (count >= lastPersistedCount.current || count === 0 || !hasActiveJobs) {
+    // Never write [] here — handleClear does its own localStorage.removeItem.
+    // Writing [] from the effect causes data loss when state transiently empties
+    // (orphan cleanup, strict mode, navigation race conditions).
+    if (count > 0 && (count >= lastPersistedCount.current || !hasActiveJobs)) {
       localStorage.setItem(storageKeys.annotations, JSON.stringify(state.annotations));
       lastPersistedCount.current = count;
     }
+  }, [state.annotations, isExpanded, hasActiveJobs, hasRestoredAnnotations, storageKeys]);
+
+  // Persist everything else (tool, color, styles, etc.)
+  useEffect(() => {
+    if (!hasRestoredAnnotations.current) return;
+
+    localStorage.setItem(storageKeys.expanded, String(isExpanded));
+
+    if (!isExpanded) return;
 
     // Style modifications
     localStorage.setItem(storageKeys.styleMods, JSON.stringify(state.styleModifications));
@@ -65,14 +73,12 @@ export function useLocalStorageBatch(
     }
   }, [
     isExpanded,
-    state.annotations,
     state.styleModifications,
     state.spacingTokenChanges,
     state.activeTool,
     state.activeColor,
     state.strokeWidth,
     state.inspectedElement,
-    hasActiveJobs,
     hasRestoredAnnotations,
     storageKeys,
   ]);

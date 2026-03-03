@@ -14,6 +14,7 @@ import {
 
 import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
+import { usePathname } from '../hooks/usePathname';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
@@ -36,11 +37,33 @@ const PopmeltContext = createContext<PopmeltContextValue | null>(null);
 type PopmeltProviderProps = PropsWithChildren<{
   enabled?: boolean;
   bridgeUrl?: string;
+  /** Framework router push — used for multi-page screenshot capture.
+   *  Pass your SPA router's navigate function (e.g. Next.js `router.push`). */
+  navigate?: (url: string) => void | Promise<unknown>;
 }>;
 
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
 const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
+
+/** Perform a soft (SPA) navigation without causing a full page reload.
+ *  When a framework `navigate` function is provided, uses it directly.
+ *  Falls back to pushState + popstate (unreliable with some frameworks). */
+async function softNavigate(page: string, navigateFn?: (url: string) => void | Promise<unknown>): Promise<void> {
+  if (navigateFn) {
+    await navigateFn(page);
+  } else {
+    window.history.pushState(window.history.state, '', page);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
+  }
+
+  // Wait for the route transition + DOM to settle
+  await new Promise<void>(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      setTimeout(resolve, 600);
+    }));
+  });
+}
 
 // Cross-provider equivalence: index 0 = fast, index 1 = thorough
 function equivalentModelIndex(fromProvider: string, toProvider: string, currentIndex: number): number {
@@ -55,6 +78,7 @@ export function PopmeltProvider({
   bridgeUrl = typeof window !== 'undefined'
     ? (window as any).__POPMELT_BRIDGE_URL__ ?? 'http://localhost:1111'
     : 'http://localhost:1111',
+  navigate: navigateProp,
 }: PopmeltProviderProps) {
   const [state, dispatch] = useAnnotationState();
   const bridge = useBridgeConnection(bridgeUrl);
@@ -66,6 +90,9 @@ export function PopmeltProvider({
   // Track the resolved bridge URL (after discovery)
   const resolvedBridgeUrl = getDiscoveredBridgeUrl() ?? bridgeUrl;
   const annotationImagesRef = useRef(new Map<string, Blob[]>());
+  const pageScreenshotsRef = useRef(new Map<string, Blob>());
+  const isProgrammaticNavRef = useRef(false);
+  const currentPathname = usePathname();
   const [provider, setProvider] = useState<string>(() => {
     if (typeof window === 'undefined') return 'claude';
     return localStorage.getItem(PROVIDER_STORAGE_KEY) || 'claude';
@@ -342,10 +369,15 @@ export function PopmeltProvider({
 
   // Persistent map of jobId→annotationIds (survives job completion, used for hover highlight)
   const jobAnnotationMapRef = useRef<Map<string, string[]>>(new Map());
+  // Persistent map of jobId→threadId (survives job removal, used for error lookup)
+  const jobThreadMapRef = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     for (const [jobId, job] of Object.entries(inFlightJobs)) {
       if (job.annotationIds.length > 0) {
         jobAnnotationMapRef.current.set(jobId, job.annotationIds);
+      }
+      if (job.threadId) {
+        jobThreadMapRef.current.set(jobId, job.threadId);
       }
     }
   }, [inFlightJobs]);
@@ -450,6 +482,11 @@ export function PopmeltProvider({
       for (const ann of annotations) {
         if (!ann.linkedSelector || !ann.linkedSelector.startsWith('[data-pm=')) continue;
 
+        // Page-scoped annotations are never orphan-cleaned. data-pm attributes
+        // are ephemeral and don't survive navigation; the position tracking
+        // effect re-establishes them via structural selector fallback.
+        if (ann.pathname) continue;
+
         // Skip annotations that were sent to Claude (captured or have a status)
         // — they may be mid-resolution and their DOM is being rewritten
         if (ann.captured || (ann.status && ann.status !== 'pending')) continue;
@@ -497,6 +534,75 @@ export function PopmeltProvider({
       if (timeoutId) clearTimeout(timeoutId);
     };
   }, [dispatch]);
+
+  // Capture-on-leave: screenshot the departing page on SPA navigation
+  // so off-page annotations get their own screenshot at submit time
+  const lastKnownPathnameRef = useRef(typeof window !== 'undefined' ? window.location.pathname : '/');
+  useEffect(() => {
+    const captureAndCache = (prevPath: string) => {
+      if (isProgrammaticNavRef.current) return; // Skip during programmatic navigation
+      const newPath = window.location.pathname;
+      if (prevPath === newPath) return; // No actual navigation
+
+      // Check if any pending annotations belong to the departing page
+      const departing = annotationsRef.current.filter(
+        a => a.pathname === prevPath && (a.status ?? 'pending') === 'pending'
+      );
+      console.log(`[Popmelt] Navigation from ${prevPath} → ${newPath}, ${departing.length} pending annotations on departing page`);
+      if (departing.length === 0) return;
+
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        console.warn('[Popmelt] No canvas ref for capture-on-leave');
+        return;
+      }
+
+      // Initiate capture — domToCanvas clones the DOM synchronously in this tick,
+      // the async rendering operates on that clone, so we capture the old page's state
+      captureScreenshot(document.body, canvas, departing)
+        .then(blobs => stitchBlobs(blobs))
+        .then(blob => {
+          if (blob) {
+            pageScreenshotsRef.current.set(prevPath, blob);
+            console.log(`[Popmelt] Cached screenshot for ${prevPath} (${(blob.size / 1024).toFixed(0)}KB)`);
+          } else {
+            console.warn(`[Popmelt] Capture-on-leave produced no blob for ${prevPath}`);
+          }
+        })
+        .catch((err) => {
+          console.warn('[Popmelt] Capture-on-leave failed:', err);
+        });
+
+      // Safety: limit cache size to prevent memory buildup
+      if (pageScreenshotsRef.current.size > 20) {
+        const entries = [...pageScreenshotsRef.current.entries()];
+        pageScreenshotsRef.current = new Map(entries.slice(-10));
+      }
+    };
+
+    // pushState/replaceState — CustomEvent with prevPath in detail
+    const handleLocationChange = (e: Event) => {
+      const prevPath = (e as CustomEvent<{ prevPath: string }>).detail?.prevPath;
+      if (prevPath) {
+        captureAndCache(prevPath);
+        lastKnownPathnameRef.current = window.location.pathname;
+      }
+    };
+
+    // popstate (back/forward) — no prevPath in event, use tracked pathname
+    const handlePopState = () => {
+      const prevPath = lastKnownPathnameRef.current;
+      captureAndCache(prevPath);
+      lastKnownPathnameRef.current = window.location.pathname;
+    };
+
+    window.addEventListener('popmelt:locationchange', handleLocationChange);
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popmelt:locationchange', handleLocationChange);
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, []); // No deps — uses refs for current state
 
   // Clear specific job's annotations when it completes or errors
   useEffect(() => {
@@ -644,13 +750,62 @@ export function PopmeltProvider({
       return false;
     }
 
-    // Capture screenshot
-    const blobs = await captureScreenshot(document.body, canvas, state.annotations);
-    if (blobs.length === 0) return false;
+    // Group annotations by pathname to determine which pages need screenshots
+    const annotationsByPage = new Map<string, typeof activeAnnotations>();
+    for (const ann of activeAnnotations) {
+      const page = ann.pathname || currentPathname;
+      if (!annotationsByPage.has(page)) annotationsByPage.set(page, []);
+      annotationsByPage.get(page)!.push(ann);
+    }
 
-    // Stitch into single image
-    const stitchedBlob = await stitchBlobs(blobs);
-    if (!stitchedBlob) return false;
+    // Build per-page screenshot map
+    const screenshotMap = new Map<string, Blob>();
+    const offPages = [...annotationsByPage.keys()].filter(p => p !== currentPathname);
+
+    if (offPages.length > 0) {
+      // Programmatic navigation: visit each off-page, capture, return
+      const originalPath = currentPathname;
+      const originalScroll = { x: window.scrollX, y: window.scrollY };
+      isProgrammaticNavRef.current = true;
+
+      for (const page of offPages) {
+        try {
+          console.log(`[Popmelt] Navigating to ${page} for screenshot capture`);
+          await softNavigate(page, navigateProp);
+
+          if (window.location.pathname !== page) {
+            console.warn(`[Popmelt] Navigation to ${page} did not take effect (at ${window.location.pathname})`);
+          }
+
+          const pageAnnotations = annotationsByPage.get(page) || [];
+          const blobs = await captureScreenshot(document.body, canvas, pageAnnotations);
+          const stitched = await stitchBlobs(blobs);
+          if (stitched) {
+            screenshotMap.set(page, stitched);
+            console.log(`[Popmelt] Captured ${page} (${(stitched.size / 1024).toFixed(0)}KB)`);
+          }
+        } catch (err) {
+          console.warn(`[Popmelt] Failed to capture ${page}:`, err);
+        }
+      }
+
+      // Navigate back to the original page
+      await softNavigate(originalPath, navigateProp);
+      window.scrollTo(originalScroll.x, originalScroll.y);
+      isProgrammaticNavRef.current = false;
+    }
+
+    // Capture the current page (always fresh)
+    const currentPageAnnotations = activeAnnotations.filter(
+      a => (a.pathname || currentPathname) === currentPathname
+    );
+    const currentBlobs = await captureScreenshot(document.body, canvas, currentPageAnnotations.length > 0 ? state.annotations : []);
+    if (currentBlobs.length > 0) {
+      const stitched = await stitchBlobs(currentBlobs);
+      if (stitched) screenshotMap.set(currentPathname, stitched);
+    }
+
+    if (screenshotMap.size === 0) return false;
 
     // Build feedback data (include uncaptured spacing token changes)
     const feedbackData = buildFeedbackData(activeAnnotations, state.styleModifications, undefined, uncapturedSpacingChanges.length > 0 ? uncapturedSpacingChanges : undefined);
@@ -676,11 +831,19 @@ export function PopmeltProvider({
       }
     }
 
+    // Send to bridge — use Map when annotations span multiple pages (even if some screenshots are missing),
+    // single Blob for single-page backward compat
+    const isMultiPage = annotationsByPage.size > 1;
+    console.log(`[Popmelt] Submit: ${annotationsByPage.size} page(s), ${screenshotMap.size} screenshot(s), pages: [${[...annotationsByPage.keys()].join(', ')}], cached: [${[...pageScreenshotsRef.current.keys()].join(', ')}]`);
+    const screenshots: Blob | Map<string, Blob> = isMultiPage
+      ? screenshotMap
+      : screenshotMap.get(currentPathname) ?? screenshotMap;
+
     // Send to bridge
     try {
       const hexColor = cssColorToHex(state.activeColor);
       const { jobId, threadId: assignedThreadId } = await sendToBridge(
-        stitchedBlob, feedbackJson, resolvedBridgeUrl, hexColor, provider, currentModel.id,
+        screenshots, feedbackJson, resolvedBridgeUrl, hexColor, provider, currentModel.id,
         pastedImages.size > 0 ? pastedImages : undefined,
         getSourceId(),
       );
@@ -688,6 +851,11 @@ export function PopmeltProvider({
       // Clean up sent image blobs from the side-channel
       for (const annId of pastedImages.keys()) {
         annotationImagesRef.current.delete(annId);
+      }
+
+      // Clear used page screenshot cache entries
+      for (const page of annotationsByPage.keys()) {
+        pageScreenshotsRef.current.delete(page);
       }
 
       // Track which annotations and style modifications are in-flight for this job
@@ -721,7 +889,7 @@ export function PopmeltProvider({
       console.error('[Pare] Failed to send to bridge:', err);
       return false;
     }
-  }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, resolvedBridgeUrl, provider, currentModel.id]);
+  }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, resolvedBridgeUrl, provider, currentModel.id, currentPathname, navigateProp]);
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
@@ -729,13 +897,18 @@ export function PopmeltProvider({
       const hexColor = cssColorToHex(state.activeColor);
       const { jobId } = await sendReplyToBridge(threadId, reply, resolvedBridgeUrl, hexColor, provider, currentModel.id, images, getSourceId());
 
+      // Inherit the thread's original color so the toolbar stays in sync with the annotation
+      const threadColor = Object.values(inFlightJobsRef.current).find(j => j.threadId === threadId)?.color
+        ?? state.annotations.find(a => a.threadId === threadId)?.color
+        ?? state.activeColor;
+
       // Track the new continuation job (no specific annotations — reuses thread context)
       setInFlightJobs(prev => ({
         ...prev,
         [jobId]: {
           annotationIds: [],
           styleSelectors: [],
-          color: state.activeColor,
+          color: threadColor,
           threadId,
         },
       }));
@@ -898,7 +1071,9 @@ export function PopmeltProvider({
     bridge.clearEvents();
     setOpenThreadId(null);
     setDismissedThreadIds(new Set());
-  }, [bridge.clearEvents]);
+    // Kill all active jobs on the bridge
+    handleCancelJob();
+  }, [bridge.clearEvents, handleCancelJob]);
 
   // Cleanup hide timeout
   useEffect(() => {
@@ -993,7 +1168,12 @@ export function PopmeltProvider({
               onClose={() => setOpenThreadId(null)}
               onReply={handleReply}
               onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}
-              lastError={bridge.lastErrorByJob?.[threadActiveJobId ?? ''] ?? undefined}
+              lastError={
+                bridge.lastErrorByJob?.[threadActiveJobId ?? '']
+                ?? (bridge.lastCompletedJobId && jobThreadMapRef.current.get(bridge.lastCompletedJobId) === openThreadId
+                  ? bridge.lastErrorByJob?.[bridge.lastCompletedJobId]
+                  : undefined)
+              }
               toolbarRef={toolbarRef}
               currentModel={currentModel.id}
               currentProvider={provider}

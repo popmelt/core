@@ -16,6 +16,8 @@ export type ParsedMultipart = {
   sourceId?: string;
   // Pasted images (from annotation comments)
   pastedImages: { annotationId: string; index: number; data: Buffer }[];
+  // Per-page screenshots (pathname → binary data)
+  pageScreenshots: { pathname: string; data: Buffer }[];
 };
 
 /**
@@ -47,6 +49,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   let tasks: string | undefined;
   let sourceId: string | undefined;
   const pastedImages: { annotationId: string; index: number; data: Buffer }[] = [];
+  const pageScreenshots: { pathname: string; data: Buffer }[] = [];
 
   // Split body by delimiter
   let offset = 0;
@@ -117,6 +120,15 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
       tasks = part.body.toString('utf-8');
     } else if (name === 'sourceId') {
       sourceId = part.body.toString('utf-8');
+    } else if (name!.startsWith('screenshot-')) {
+      // screenshot-{encodedPathname} — per-page screenshot
+      const encodedPathname = name!.slice('screenshot-'.length);
+      try {
+        const pathname = decodeURIComponent(encodedPathname);
+        pageScreenshots.push({ pathname, data: part.body });
+      } catch {
+        // Invalid encoding — skip
+      }
     } else if (name!.startsWith('image-')) {
       // image-{annotationId}-{index}
       const segments = name!.split('-');
@@ -133,7 +145,7 @@ export async function parseMultipart(req: IncomingMessage): Promise<ParsedMultip
   // feedback is optional for plan endpoints
   if (!feedback) feedback = '';
 
-  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks, sourceId, pastedImages };
+  return { screenshot, feedback, color, provider, model, goal, pageUrl, viewport, planId, manifest, tasks, sourceId, pastedImages, pageScreenshots };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

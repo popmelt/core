@@ -3,7 +3,7 @@
 import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { FONT_FAMILY, LINE_HEIGHT, MAX_DISPLAY_WIDTH, PADDING, getEffectiveMaxWidth, wrapLines } from '../tools/text';
+import { FONT_FAMILY, LINE_HEIGHT, PADDING, getEffectiveMaxWidth, truncateWithEllipsis } from '../tools/text';
 import type { Annotation, AnnotationLifecycleStatus } from '../tools/types';
 import { findElementBySelector } from '../utils/dom';
 
@@ -145,37 +145,31 @@ export function AnnotationBadges({
     const point = annotation.points[0];
     const fontSize = annotation.fontSize || 12;
     const lineHeightPx = fontSize * LINE_HEIGHT;
-    const lines = annotation.text.split('\n');
 
     const groupNumber = annotationGroupMap.get(annotation.id);
-    const displayLines = groupNumber !== undefined
-      ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
-      : lines;
+    const flat = annotation.text.replace(/\n/g, ' ');
+    const displayText = groupNumber !== undefined
+      ? groupNumber + '. ' + flat
+      : flat;
 
-    // Reuse the display canvas context for text measurement so DPR scaling
-    // and font hinting match the actual rendered text (avoids wrapping drift).
     const ctx = canvasRef?.current?.getContext('2d') ?? document.createElement('canvas').getContext('2d');
     if (!ctx) continue;
 
     ctx.font = `${fontSize}px ${FONT_FAMILY}`;
 
-    // Account for viewport-constrained wrapping
+    // Single-line truncated width (matches drawText ellipsis)
     const viewportX = point.x - scrollX;
-    const effectiveMax = getEffectiveMaxWidth(viewportX);
-    const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : MAX_DISPLAY_WIDTH;
-    const wrapped = wrapLines(ctx, displayLines, capWidth);
-    const maxWidth = Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)));
-    const wrappedHeight = wrapped.length * lineHeightPx;
-    const originalHeight = displayLines.length * lineHeightPx;
-    const yShift = wrappedHeight - originalHeight;
+    const capWidth = getEffectiveMaxWidth(viewportX);
+    const truncated = truncateWithEllipsis(ctx, displayText, capWidth);
+    const textWidth = ctx.measureText(truncated).width;
 
     badges.push({
       id: annotation.id,
       threadId,
       linkedSelector: annotation.linkedSelector || groupAnns.find(a => a.linkedSelector)?.linkedSelector,
-      x: point.x + maxWidth + PADDING,
-      y: point.y - PADDING - yShift,
-      size: wrappedHeight + PADDING * 2,
+      x: point.x + textWidth + PADDING,
+      y: point.y - PADDING,
+      size: lineHeightPx + PADDING * 2,
       color: annotation.color,
       isInFlight,
       isNeedsReview,
@@ -403,13 +397,6 @@ export function MarchingAntsBorders({
 
   if (borders.length === 0) return null;
 
-  const cornerDotStyle: CSSProperties = {
-    position: 'absolute',
-    width: 2,
-    height: 2,
-    pointerEvents: 'none',
-  };
-
   return (
     <>
       {animated && <style>{`@keyframes popmelt-march { to { stroke-dashoffset: -6; } }`}</style>}
@@ -441,10 +428,6 @@ export function MarchingAntsBorders({
               style={animated ? { animation: 'popmelt-march 0.5s steps(2) infinite' } : undefined}
             />
           </svg>
-          <div style={{ ...cornerDotStyle, top: -1, left: -1, backgroundColor: border.color }} />
-          <div style={{ ...cornerDotStyle, top: -1, right: -1, backgroundColor: border.color }} />
-          <div style={{ ...cornerDotStyle, bottom: -1, left: -1, backgroundColor: border.color }} />
-          <div style={{ ...cornerDotStyle, bottom: -1, right: -1, backgroundColor: border.color }} />
         </div>
       ))}
     </>
@@ -494,12 +477,12 @@ export function QuestionBadges({
       const point = textAnn.points[0];
       const fontSize = textAnn.fontSize || 12;
       const lineHeightPx = fontSize * LINE_HEIGHT;
-      const lines = textAnn.text.split('\n');
 
       const groupNumber = annotationGroupMap.get(textAnn.id);
-      const displayLines = groupNumber !== undefined
-        ? [groupNumber + '. ' + (lines[0] || ''), ...lines.slice(1)]
-        : lines;
+      const flat = textAnn.text.replace(/\n/g, ' ');
+      const displayText = groupNumber !== undefined
+        ? groupNumber + '. ' + flat
+        : flat;
 
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
@@ -508,20 +491,15 @@ export function QuestionBadges({
       ctx.font = `${fontSize}px ${FONT_FAMILY}`;
 
       const viewportX = point.x - scrollX;
-      const effectiveMax = getEffectiveMaxWidth(viewportX);
-      const capWidth = effectiveMax !== undefined ? Math.min(MAX_DISPLAY_WIDTH, effectiveMax) : MAX_DISPLAY_WIDTH;
-      const wrapped = wrapLines(ctx, displayLines, capWidth);
-      const maxWidth = Math.min(capWidth, Math.max(...wrapped.map(l => ctx.measureText(l).width)));
-      const wrappedHeight = wrapped.length * lineHeightPx;
-      const originalHeight = displayLines.length * lineHeightPx;
-      const yShift = wrappedHeight - originalHeight;
-      const annotationHeight = wrappedHeight + PADDING * 2;
+      const capWidth = getEffectiveMaxWidth(viewportX);
+      const truncated = truncateWithEllipsis(ctx, displayText, capWidth);
+      const textWidth = ctx.measureText(truncated).width;
 
       badges.push({
         annotation,
-        x: point.x + maxWidth + PADDING,
-        y: point.y - PADDING - yShift,
-        size: annotationHeight,
+        x: point.x + textWidth + PADDING,
+        y: point.y - PADDING,
+        size: lineHeightPx + PADDING * 2,
       });
     }
   }

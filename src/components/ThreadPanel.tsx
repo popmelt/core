@@ -18,6 +18,12 @@ type ThreadMessage = {
   replyToQuestion?: string;
   toolsUsed?: string[];
   cancelled?: boolean;
+  error?: string;
+  // Image URLs (converted from filesystem paths by the server)
+  screenshotUrl?: string;
+  screenshotUrls?: Record<string, string>; // pathname → /files/ URL
+  imageUrls?: Record<string, string[]>; // annotationId → /files/ URLs
+  replyImageUrls?: string[]; // images attached to a reply
   resolutions?: {
     annotationId: string;
     status: string;
@@ -27,6 +33,8 @@ type ThreadMessage = {
     inferredScope?: { breadth: string; target: string } | null;
     finalScope?: { breadth: string; target: string } | null;
   }[];
+  model?: string;
+  provider?: string;
 };
 
 type ThreadPanelProps = {
@@ -197,6 +205,100 @@ function ThinkingBadge({ color }: { color: string }) {
   );
 }
 
+const THUMB_SIZE = 32;
+
+const thumbStyle: CSSProperties = {
+  width: THUMB_SIZE,
+  height: THUMB_SIZE,
+  objectFit: 'cover',
+  cursor: 'pointer',
+  border: '1px solid rgba(0,0,0,0.1)',
+};
+
+/** Parse multi-page feedbackSummary into per-route sections.
+ *  Format: `` `/{path}`\n- annotation text\n`/{path2}`\n- text ``
+ *  Returns null if no route sections found (single-page). */
+function parseRouteSections(summary: string): { route: string; text: string }[] | null {
+  const routeRe = /^`(\/[^`]*)`$/gm;
+  const matches = [...summary.matchAll(routeRe)];
+  if (matches.length === 0) return null;
+
+  const sections: { route: string; text: string }[] = [];
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i]!;
+    const route = m[1]!;
+    const start = m.index! + m[0].length;
+    const end = i + 1 < matches.length ? matches[i + 1]!.index! : summary.length;
+    const text = summary.slice(start, end).trim();
+    sections.push({ route, text });
+  }
+  return sections;
+}
+
+/** Collect reply image URLs (for reply messages only) */
+function collectReplyImages(msg: ThreadMessage, bridgeUrl: string): { url: string; label: string }[] {
+  const images: { url: string; label: string }[] = [];
+  if (msg.replyImageUrls) {
+    for (const url of msg.replyImageUrls) {
+      const full = url.startsWith('blob:') || url.startsWith('http') ? url : `${bridgeUrl}${url}`;
+      images.push({ url: full, label: 'pasted image' });
+    }
+  }
+  return images;
+}
+
+/** Collect pasted annotation images (not screenshots) */
+function collectPastedImages(msg: ThreadMessage, bridgeUrl: string): { url: string; label: string }[] {
+  const images: { url: string; label: string }[] = [];
+  if (msg.imageUrls) {
+    for (const [, urls] of Object.entries(msg.imageUrls)) {
+      for (const relUrl of urls) {
+        images.push({ url: `${bridgeUrl}${relUrl}`, label: 'pasted image' });
+      }
+    }
+  }
+  return images;
+}
+
+/** Full-screen lightbox overlay */
+function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); onClose(); }
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 100000,
+        backgroundColor: 'rgba(0,0,0,0.8)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        cursor: 'zoom-out',
+      }}
+    >
+      <img
+        src={src}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: '90vw',
+          maxHeight: '90vh',
+          objectFit: 'contain',
+          cursor: 'default',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.4)',
+        }}
+      />
+    </div>
+  );
+}
+
 /** Format a single tool_use event into a step label */
 function formatToolEvent(event: BridgeEvent): string | null {
   const tool = String(event.data.tool || '');
@@ -291,6 +393,7 @@ export function ThreadPanel({
   const [loading, setLoading] = useState(true);
   const [replyText, setReplyText] = useState('');
   const [replyImages, setReplyImages] = useState<Blob[]>([]);
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
@@ -319,11 +422,25 @@ export function ThreadPanel({
     } catch { /* ignore */ }
   }, []);
 
-  // Recalculate on resize
+  // Recalculate on resize — clamp saved position to stay within viewport.
+  // If the panel is at the home position (top-right edge), snap to default
+  // so it tracks the right edge as the viewport expands.
   useEffect(() => {
     const onResize = () => {
       if (!hasSavedPosition.current) {
         positionRef.current = getDefaultPosition();
+      } else {
+        const pos = positionRef.current;
+        const maxLeft = window.innerWidth - PANEL_BOX_WIDTH - EDGE_PAD;
+        // Home = top-right corner (top at edge, left at or beyond right edge)
+        if (pos.top === EDGE_PAD && pos.left >= maxLeft) {
+          positionRef.current = getDefaultPosition();
+        } else {
+          positionRef.current = {
+            top: Math.max(EDGE_PAD, Math.min(pos.top, window.innerHeight - EDGE_PAD - 200)),
+            left: Math.max(EDGE_PAD, Math.min(pos.left, maxLeft)),
+          };
+        }
       }
       forceUpdate(n => n + 1);
     };
@@ -456,12 +573,15 @@ export function ThreadPanel({
     if (!replyText.trim() || !onReply) return;
     const text = replyText.trim();
     const images = replyImages.length > 0 ? replyImages : undefined;
+    // Create object URLs for immediate thumbnail display
+    const localImageUrls = images ? images.map(b => URL.createObjectURL(b)) : undefined;
     // Optimistically show the reply immediately
     setMessages(prev => [...prev, {
       role: 'human' as const,
       timestamp: Date.now(),
       jobId: 'pending',
-      replyToQuestion: images ? `${text} [${images.length} image${images.length > 1 ? 's' : ''}]` : text,
+      replyToQuestion: text,
+      ...(localImageUrls ? { replyImageUrls: localImageUrls } : {}),
     }]);
     onReply(threadId, text, images);
     setReplyText('');
@@ -666,14 +786,107 @@ export function ThreadPanel({
                   {formatTimestamp(msg.timestamp)}
                 </span>
               </div>
-              {text && (
-                <div style={{
-                  lineHeight: 1.5,
-                  wordBreak: 'break-word',
-                }}>
-                  {isHuman ? text : renderMarkdown(text)}
+              {/* Human messages: inline thumbnails next to route/annotation */}
+              {isHuman && !msg.replyToQuestion && (() => {
+                const routeSections = text ? parseRouteSections(text) : null;
+
+                if (routeSections && msg.screenshotUrls) {
+                  // Multi-page: render each route section with thumbnail to the left
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {routeSections.map((sec, j) => {
+                        const relUrl = msg.screenshotUrls?.[sec.route];
+                        const thumbUrl = relUrl ? `${bridgeUrl}${relUrl}` : null;
+                        return (
+                          <div key={j} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                            {thumbUrl ? (
+                              <img
+                                src={thumbUrl}
+                                title={sec.route}
+                                style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }}
+                                onClick={() => setLightboxSrc(thumbUrl)}
+                              />
+                            ) : (
+                              <div style={{ width: THUMB_SIZE, height: THUMB_SIZE, flexShrink: 0 }} />
+                            )}
+                            <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
+                              <code style={{
+                                fontSize: 10,
+                                backgroundColor: 'rgba(0,0,0,0.06)',
+                                padding: '1px 4px',
+                              }}>{sec.route}</code>
+                              {sec.text && <div style={{ marginTop: 2 }}>{renderMarkdown(sec.text)}</div>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                }
+
+                // Single-page: thumbnail left, text right
+                const thumbUrl = msg.screenshotUrl ? `${bridgeUrl}${msg.screenshotUrl}` : null;
+                if (thumbUrl && text) {
+                  return (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                      <img
+                        src={thumbUrl}
+                        title="screenshot"
+                        style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }}
+                        onClick={() => setLightboxSrc(thumbUrl)}
+                      />
+                      <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
+                        {text.includes('\n') ? renderMarkdown(text) : text}
+                      </div>
+                    </div>
+                  );
+                }
+
+                // No screenshot — plain text
+                if (text) {
+                  return (
+                    <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
+                      {text.includes('\n') ? renderMarkdown(text) : text}
+                    </div>
+                  );
+                }
+                return null;
+              })()}
+              {/* Reply messages or assistant: plain text */}
+              {isHuman && msg.replyToQuestion && text && (
+                <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
+                  {text.includes('\n') ? renderMarkdown(text) : text}
                 </div>
               )}
+              {!isHuman && text && (
+                <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
+                  {renderMarkdown(text)}
+                </div>
+              )}
+              {/* Reply image thumbnails */}
+              {isHuman && msg.replyToQuestion && (() => {
+                const images = collectReplyImages(msg, bridgeUrl);
+                if (images.length === 0) return null;
+                return (
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
+                    {images.map((img, j) => (
+                      <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => setLightboxSrc(img.url)} />
+                    ))}
+                  </div>
+                );
+              })()}
+              {/* Pasted annotation images (not screenshots) */}
+              {isHuman && !msg.replyToQuestion && (() => {
+                const images = collectPastedImages(msg, bridgeUrl);
+                if (images.length === 0) return null;
+                return (
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
+                    {images.map((img, j) => (
+                      <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => setLightboxSrc(img.url)} />
+                    ))}
+                  </div>
+                );
+              })()}
               {questionText && (
                 <div style={{
                   marginTop: text ? 4 : 0,
@@ -907,6 +1120,7 @@ export function ThreadPanel({
       )}
       </div>{/* end inner clip wrapper */}
     </div>
+    {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </>
   );
 }

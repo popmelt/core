@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { buildCanvasHtml } from './canvas-html';
@@ -251,13 +251,23 @@ export async function createPopmelt(
         provider,
         imagePaths: job.imagePaths,
         designModel: designModel ?? undefined,
+        screenshotPaths: job.screenshotPaths,
       });
     }
 
     const tag = ansiColor(job.color, `[⊹ ${boundPort}:${job.id}]`);
-    console.log(`${tag} Reviewing feedback ${job.screenshotPath} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
+    const screenshotInfo = job.screenshotPaths && Object.keys(job.screenshotPaths).length > 0
+      ? `${Object.keys(job.screenshotPaths).length} pages [${Object.keys(job.screenshotPaths).join(', ')}]`
+      : job.screenshotPath;
+    console.log(`${tag} Reviewing ${screenshotInfo} (provider: ${provider})${job.threadId ? ` (thread: ${job.threadId})` : ''}${resumeSessionId ? ` (resuming: ${resumeSessionId.slice(0, 8)})` : ''}`);
 
     const onEvent = (event: SSEEvent, jobId: string) => {
+      // Accumulate text server-side for reconnect backfill
+      if (event.type === 'delta' && 'text' in event) {
+        queue.accumulateText(jobId, 'response', event.text);
+      } else if (event.type === 'thinking' && 'text' in event) {
+        queue.accumulateText(jobId, 'thinking', event.text);
+      }
       queue.broadcast(event, jobId, job.sourceId);
     };
 
@@ -467,7 +477,9 @@ export async function createPopmelt(
       return;
     }
 
-    const url = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
+    const rawUrl = req.url || '/';
+    const rawPath = rawUrl.split('?')[0]!; // preserves %2F encoding
+    const url = new URL(rawUrl, `http://127.0.0.1:${boundPort}`);
     const path = url.pathname;
 
     try {
@@ -498,6 +510,18 @@ export async function createPopmelt(
       } else if (req.method === 'GET' && path === '/model') {
         const model = await materializer.loadModel();
         sendJson(res, 200, { model });
+      } else if (req.method === 'GET' && path.startsWith('/jobs/') && path.endsWith('/events')) {
+        // GET /jobs/:id/events?afterSeq=-1
+        const jobId = path.slice('/jobs/'.length, path.length - '/events'.length);
+        const afterSeq = parseInt(url.searchParams.get('afterSeq') ?? '-1', 10);
+        const backfill = queue.getBufferedEvents(jobId, isNaN(afterSeq) ? -1 : afterSeq);
+        if (backfill) {
+          sendJson(res, 200, backfill);
+        } else {
+          sendJson(res, 404, { error: 'Unknown job' });
+        }
+      } else if (req.method === 'GET' && rawPath.startsWith('/files/')) {
+        await handleServeFile(rawPath.slice('/files/'.length), res);
       } else if (req.method === 'GET' && path.startsWith('/thread/')) {
         const threadId = path.slice('/thread/'.length);
         await handleGetThread(threadId, res);
@@ -519,7 +543,7 @@ export async function createPopmelt(
   });
 
   async function handleSend(req: IncomingMessage, res: ServerResponse) {
-    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr, sourceId: sourceIdStr, pastedImages } = await parseMultipart(req);
+    const { screenshot, feedback: feedbackStr, color, provider: providerStr, model: modelStr, sourceId: sourceIdStr, pastedImages, pageScreenshots } = await parseMultipart(req);
 
     let feedback: FeedbackPayload;
     try {
@@ -529,8 +553,20 @@ export async function createPopmelt(
       return;
     }
 
-    // Write screenshot to temp dir
     const jobId = randomUUID().slice(0, 8);
+
+    // Write per-page screenshots to temp dir (keyed by pathname)
+    const screenshotPaths: Record<string, string> = {};
+    if (pageScreenshots.length > 0) {
+      for (const ps of pageScreenshots) {
+        const encoded = encodeURIComponent(ps.pathname);
+        const path = join(tempDir, `screenshot-${jobId}-${encoded}.png`);
+        await writeFile(path, ps.data);
+        screenshotPaths[ps.pathname] = path;
+      }
+    }
+
+    // Write fallback single screenshot (always present for backward compat)
     const screenshotPath = join(tempDir, `screenshot-${jobId}.png`);
     await writeFile(screenshotPath, screenshot);
 
@@ -545,9 +581,12 @@ export async function createPopmelt(
       }
     }
 
-    // Extract linkedSelector values for thread matching
+    // Extract linkedSelector values for thread matching, qualified with pathname
     const linkedSelectors = feedback.annotations
-      .map(a => a.linkedSelector)
+      .map(a => {
+        if (!a.linkedSelector) return null;
+        return a.pathname ? `${a.pathname}:${a.linkedSelector}` : a.linkedSelector;
+      })
       .filter((s): s is string => !!s);
 
     // Find or create thread (always create one so the chip can open the thread panel)
@@ -568,6 +607,7 @@ export async function createPopmelt(
     }
 
     const annotationIds = feedback.annotations.map(a => a.id);
+    const hasPageScreenshots = Object.keys(screenshotPaths).length > 0;
 
     const job: Job = {
       id: jobId,
@@ -582,12 +622,29 @@ export async function createPopmelt(
       model: modelStr || undefined,
       ...(Object.keys(imagePaths).length > 0 ? { imagePaths } : {}),
       sourceId: sourceIdStr || undefined,
+      ...(hasPageScreenshots ? { screenshotPaths } : {}),
     };
 
-    // Append human message to thread
-    const feedbackSummary = feedback.annotations
-      .map(a => a.instruction || `[${a.type}]`)
-      .join('; ');
+    // Append human message to thread — group by page when multi-page
+    const annotationPages = new Set(feedback.annotations.map(a => a.pathname).filter(Boolean));
+    let feedbackSummary: string;
+    if (annotationPages.size > 1) {
+      const byPage = new Map<string, string[]>();
+      for (const a of feedback.annotations) {
+        const page = a.pathname || '(unknown)';
+        if (!byPage.has(page)) byPage.set(page, []);
+        byPage.get(page)!.push(a.instruction || `[${a.type}]`);
+      }
+      // Format as markdown: page as inline code heading, annotations as bullet list
+      feedbackSummary = [...byPage.entries()]
+        .map(([page, instructions]) =>
+          `\`${page}\`\n${instructions.map(i => `- ${i}`).join('\n')}`)
+        .join('\n');
+    } else {
+      feedbackSummary = feedback.annotations
+        .map(a => a.instruction || `[${a.type}]`)
+        .join('; ');
+    }
     const feedbackContext = formatFeedbackContext(feedback, Object.keys(imagePaths).length > 0 ? imagePaths : undefined);
 
     await threadStore.appendMessage(threadId, {
@@ -595,6 +652,8 @@ export async function createPopmelt(
       timestamp: Date.now(),
       jobId,
       screenshotPath,
+      ...(hasPageScreenshots ? { screenshotPaths } : {}),
+      ...(Object.keys(imagePaths).length > 0 ? { imagePaths } : {}),
       annotationIds,
       feedbackSummary,
       feedbackContext: feedbackContext || undefined,
@@ -700,6 +759,7 @@ export async function createPopmelt(
       jobId,
       replyToQuestion: reply,
       screenshotPath,
+      ...(replyImagePaths.length > 0 ? { replyImagePaths } : {}),
     });
 
     // Get full thread history (including the reply we just appended)
@@ -1018,14 +1078,47 @@ export async function createPopmelt(
     sendJson(res, 404, { error: 'Canvas bundle not found' });
   }
 
+  async function handleServeFile(filename: string, res: ServerResponse) {
+    // Filename arrives raw (not URL-decoded) so %2F stays literal — matching what's on disk.
+    // Security: reject if it contains a real slash or path traversal.
+    if (!filename || filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+      sendJson(res, 400, { error: 'Invalid filename' });
+      return;
+    }
+    try {
+      const data = await readFile(join(tempDir, filename));
+      const ext = filename.split('.').pop()?.toLowerCase();
+      const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
+      res.end(data);
+    } catch {
+      sendJson(res, 404, { error: 'File not found' });
+    }
+  }
+
+  /** Convert a filesystem path to a /files/ URL (basename only) */
+  function toFileUrl(fsPath: string): string {
+    return `/files/${basename(fsPath)}`;
+  }
+
   async function handleGetThread(threadId: string, res: ServerResponse) {
     const thread = await threadStore.getThread(threadId);
     if (!thread) {
       sendJson(res, 404, { error: 'Thread not found' });
       return;
     }
-    // Strip screenshotPath from messages (local filesystem path)
-    const messages = thread.messages.map(({ screenshotPath, ...rest }) => rest);
+    // Convert filesystem paths to /files/ URLs for client consumption
+    const messages = thread.messages.map(({ screenshotPath, screenshotPaths, imagePaths, replyImagePaths, ...rest }) => ({
+      ...rest,
+      ...(screenshotPath ? { screenshotUrl: toFileUrl(screenshotPath) } : {}),
+      ...(screenshotPaths ? { screenshotUrls: Object.fromEntries(
+        Object.entries(screenshotPaths).map(([page, p]) => [page, toFileUrl(p)])
+      ) } : {}),
+      ...(imagePaths ? { imageUrls: Object.fromEntries(
+        Object.entries(imagePaths).map(([annId, paths]) => [annId, paths.map(toFileUrl)])
+      ) } : {}),
+      ...(replyImagePaths ? { replyImageUrls: replyImagePaths.map(toFileUrl) } : {}),
+    }));
     sendJson(res, 200, { id: thread.id, createdAt: thread.createdAt, messages });
   }
 

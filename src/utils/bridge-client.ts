@@ -157,8 +157,34 @@ export async function discoverBridge(
   return null;
 }
 
+export type BackfillResponse = {
+  jobId: string;
+  events: Array<Record<string, unknown> & { seq: number; type: string }>;
+  currentSeq: number;
+  accumulated: { response: string; thinking: string };
+  jobActive: boolean;
+};
+
+export async function fetchJobEvents(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  jobId: string,
+  afterSeq = -1,
+): Promise<BackfillResponse | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `${bridgeUrl}/jobs/${jobId}/events?afterSeq=${afterSeq}`,
+      {},
+      5000,
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as BackfillResponse;
+  } catch {
+    return null;
+  }
+}
+
 export async function sendToBridge(
-  screenshotBlob: Blob,
+  screenshots: Blob | Map<string, Blob>,
   feedbackJson: string,
   bridgeUrl = DEFAULT_BRIDGE_URL,
   color?: string,
@@ -168,7 +194,28 @@ export async function sendToBridge(
   sourceId?: string,
 ): Promise<{ jobId: string; position: number; threadId?: string }> {
   const formData = new FormData();
-  formData.append('screenshot', screenshotBlob, 'screenshot.png');
+
+  if (screenshots instanceof Map) {
+    // Per-page screenshots keyed by pathname
+    let first = true;
+    for (const [pathname, blob] of screenshots) {
+      const encoded = encodeURIComponent(pathname);
+      formData.append(`screenshot-${encoded}`, blob, `screenshot-${encoded}.png`);
+      // Backward compat: also send the first one as 'screenshot'
+      if (first) {
+        formData.append('screenshot', blob, 'screenshot.png');
+        first = false;
+      }
+    }
+    // Edge case: empty map — send a placeholder
+    if (first) {
+      formData.append('screenshot', new Blob([], { type: 'image/png' }), 'screenshot.png');
+    }
+  } else {
+    // Single blob (backward compat)
+    formData.append('screenshot', screenshots, 'screenshot.png');
+  }
+
   formData.append('feedback', feedbackJson);
   if (color) formData.append('color', color);
   if (provider) formData.append('provider', provider);

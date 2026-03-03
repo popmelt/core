@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import type { AnnotationResolution } from '../tools/types';
-import { checkBridgeHealth, discoverBridge } from '../utils/bridge-client';
+import { checkBridgeHealth, discoverBridge, fetchJobEvents } from '../utils/bridge-client';
 
 export type BridgeEvent = {
   type: string;
@@ -111,6 +111,135 @@ if (_hot?.data) {
     connectionGeneration: { get: () => connectionGeneration, configurable: true },
     discoveredBridgeUrl: { get: () => discoveredBridgeUrl, configurable: true },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect backfill state
+// ---------------------------------------------------------------------------
+
+/** Job IDs currently being backfilled (fetch in-flight). */
+const backfillPending = new Set<string>();
+
+/** SSE events buffered during an in-flight backfill fetch, keyed by jobId. */
+const backfillBuffer = new Map<string, Array<{ type: string; data: Record<string, unknown> }>>();
+
+/** Highest seq per job from the last backfill — events with seq <= this are skipped. */
+const backfilledSeqs: Record<string, number> = {};
+
+/**
+ * Check if an incoming SSE event should be buffered (backfill in progress)
+ * or skipped (already covered by backfill). Returns true if the event
+ * should NOT be processed by the normal handler.
+ */
+function shouldBufferOrSkip(jobId: string | undefined, data: Record<string, unknown>): boolean {
+  if (!jobId) return false;
+
+  // Backfill in progress — buffer the event for later replay
+  if (backfillPending.has(jobId)) {
+    let buf = backfillBuffer.get(jobId);
+    if (!buf) { buf = []; backfillBuffer.set(jobId, buf); }
+    buf.push({ type: (data.type as string) ?? '', data });
+    return true;
+  }
+
+  // Dedup: skip events already covered by backfill
+  const watermark = backfilledSeqs[jobId];
+  if (watermark !== undefined && typeof data.seq === 'number' && data.seq <= watermark) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Run backfill for a set of active job IDs after reconnect.
+ * Fetches buffered events from the server, seeds client state,
+ * then replays any SSE events that arrived during the fetch.
+ */
+async function runBackfill(bridgeUrl: string, jobIds: string[], gen: number) {
+  const isStale = () => gen !== connectionGeneration;
+
+  for (const jobId of jobIds) {
+    if (isStale()) return;
+    backfillPending.add(jobId);
+    backfillBuffer.set(jobId, []);
+  }
+
+  await Promise.all(jobIds.map(async (jobId) => {
+    try {
+      const result = await fetchJobEvents(bridgeUrl, jobId);
+      if (isStale()) return;
+
+      const buffered = backfillBuffer.get(jobId) ?? [];
+
+      if (result) {
+        // Seed state from the backfill response
+        update((prev) => {
+          const newJobResponses = { ...prev.jobResponses, [jobId]: result.accumulated.response };
+          const newJobThinking = { ...prev.jobThinking, [jobId]: result.accumulated.thinking };
+          const newEvents = [...prev.events];
+
+          // Add backfilled events to the event log
+          for (const evt of result.events) {
+            newEvents.push({ type: evt.type, data: evt as Record<string, unknown>, timestamp: Date.now() });
+          }
+
+          return {
+            ...prev,
+            jobResponses: newJobResponses,
+            jobThinking: newJobThinking,
+            currentResponse: jobId === prev.activeJobId ? result.accumulated.response : prev.currentResponse,
+            currentThinking: jobId === prev.activeJobId ? result.accumulated.thinking : prev.currentThinking,
+            events: newEvents,
+          };
+        });
+
+        // Set watermark — skip SSE events already covered by backfill
+        backfilledSeqs[jobId] = result.currentSeq;
+
+        // Replay buffered SSE events that arrived during the fetch (only those with seq > watermark)
+        for (const evt of buffered) {
+          if (typeof evt.data.seq === 'number' && evt.data.seq <= result.currentSeq) continue;
+          applyBackfilledEvent(evt.type, evt.data, jobId);
+        }
+      } else {
+        // Fetch failed (404 / timeout) — replay all buffered events so nothing is lost
+        for (const evt of buffered) {
+          applyBackfilledEvent(evt.type, evt.data, jobId);
+        }
+      }
+    } finally {
+      backfillPending.delete(jobId);
+      backfillBuffer.delete(jobId);
+    }
+  }));
+}
+
+/** Apply a single replayed event to the store (used for events buffered during backfill). */
+function applyBackfilledEvent(type: string, data: Record<string, unknown>, jobId: string) {
+  if (type === 'delta') {
+    const text = (data.text || '') as string;
+    update((prev) => ({
+      ...prev,
+      jobResponses: { ...prev.jobResponses, [jobId]: (prev.jobResponses[jobId] || '') + text },
+      currentResponse: jobId === prev.activeJobId ? prev.currentResponse + text : prev.currentResponse,
+      events: [...prev.events, { type: 'delta', data, timestamp: Date.now() }],
+    }));
+  } else if (type === 'thinking') {
+    const text = (data.text || '') as string;
+    update((prev) => ({
+      ...prev,
+      jobThinking: { ...prev.jobThinking, [jobId]: (prev.jobThinking[jobId] || '') + text },
+      currentThinking: jobId === prev.activeJobId ? prev.currentThinking + text : prev.currentThinking,
+      events: [...prev.events, { type: 'thinking', data, timestamp: Date.now() }],
+    }));
+  } else {
+    // tool_use, question, etc. — just append to events
+    update((prev) => ({
+      ...prev,
+      events: [...prev.events, { type, data, timestamp: Date.now() }],
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +353,12 @@ function connectBridge(bridgeUrl: string) {
           lastCompletedJobId: staleJobIds.length > 0 ? staleJobIds[staleJobIds.length - 1]! : prev.lastCompletedJobId,
         };
       });
+
+      // Backfill active jobs to recover events missed during disconnect
+      if (hasActiveJobs) {
+        const jobIds = Array.from(serverActiveIds);
+        runBackfill(bridgeUrl, jobIds, gen).catch(() => {});
+      }
     });
   });
 
@@ -231,15 +366,16 @@ function connectBridge(bridgeUrl: string) {
     if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string;
+    if (shouldBufferOrSkip(jobId, data)) return;
     update((prev) => ({
       ...prev,
       status: 'streaming',
       activeJobId: jobId,
-      activeJobIds: [...prev.activeJobIds, jobId],
-      jobResponses: { ...prev.jobResponses, [jobId]: '' },
-      jobThinking: { ...prev.jobThinking, [jobId]: '' },
-      currentResponse: '',
-      currentThinking: '',
+      activeJobIds: prev.activeJobIds.includes(jobId) ? prev.activeJobIds : [...prev.activeJobIds, jobId],
+      jobResponses: { ...prev.jobResponses, [jobId]: prev.jobResponses[jobId] ?? '' },
+      jobThinking: { ...prev.jobThinking, [jobId]: prev.jobThinking[jobId] ?? '' },
+      currentResponse: prev.jobResponses[jobId] ?? '',
+      currentThinking: prev.jobThinking[jobId] ?? '',
       lastResponseText: null,
       lastThreadId: null,
       events: [
@@ -253,6 +389,7 @@ function connectBridge(bridgeUrl: string) {
     if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string | undefined;
+    if (shouldBufferOrSkip(jobId, data)) return;
     const text = (data.text || '') as string;
     update((prev) => ({
       ...prev,
@@ -273,6 +410,7 @@ function connectBridge(bridgeUrl: string) {
     if (isStale()) return;
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string | undefined;
+    if (shouldBufferOrSkip(jobId, data)) return;
     const text = (data.text || '') as string;
     update((prev) => ({
       ...prev,
@@ -292,6 +430,8 @@ function connectBridge(bridgeUrl: string) {
   es.addEventListener('tool_use', (e) => {
     if (isStale()) return;
     const data = JSON.parse(e.data);
+    const jobId = data.jobId as string | undefined;
+    if (shouldBufferOrSkip(jobId, data)) return;
     update((prev) => ({
       ...prev,
       events: [
@@ -305,6 +445,9 @@ function connectBridge(bridgeUrl: string) {
     if (isStale()) return;
     const data = JSON.parse(e.data);
     const completedJobId = data.jobId as string | undefined;
+    if (shouldBufferOrSkip(completedJobId, data)) return;
+    // Clean up backfill state for completed job
+    if (completedJobId) delete backfilledSeqs[completedJobId];
     update((prev) => {
       const newActiveJobIds = completedJobId
         ? prev.activeJobIds.filter(id => id !== completedJobId)
@@ -346,6 +489,8 @@ function connectBridge(bridgeUrl: string) {
   es.addEventListener('question', (e) => {
     if (isStale()) return;
     const data = JSON.parse(e.data);
+    const jobId = data.jobId as string | undefined;
+    if (shouldBufferOrSkip(jobId, data)) return;
     update((prev) => ({
       ...prev,
       pendingQuestions: [
@@ -375,6 +520,10 @@ function connectBridge(bridgeUrl: string) {
 
   es.addEventListener('queue_drained', () => {
     if (isStale()) return;
+    // Clean up all backfill state
+    for (const key of Object.keys(backfilledSeqs)) delete backfilledSeqs[key];
+    backfillPending.clear();
+    backfillBuffer.clear();
     update((prev) => ({
       ...prev,
       status: prev.status === 'error' ? 'error' : 'idle',
@@ -406,6 +555,8 @@ function connectBridge(bridgeUrl: string) {
     } else if (e instanceof MessageEvent) {
       const data = JSON.parse(e.data);
       const errorJobId = (data.jobId ?? null) as string | null;
+      if (shouldBufferOrSkip(errorJobId ?? undefined, data)) return;
+      if (errorJobId) delete backfilledSeqs[errorJobId];
       const errorMessage = (data.message ?? '') as string;
       update((prev) => {
         const newActiveJobIds = errorJobId

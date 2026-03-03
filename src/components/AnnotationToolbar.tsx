@@ -16,7 +16,8 @@ import {
 
 import { useLocalStorageBatch } from '../hooks/useLocalStorageBatch';
 import type { StorageKeys } from '../hooks/useLocalStorageBatch';
-import { useSpinner } from '../hooks/useSpinner';
+import { usePathname } from '../hooks/usePathname';
+
 import { POPMELT_BORDER } from '../styles/border';
 import type { Annotation, AnnotationAction, AnnotationState, SpacingTokenChange, ToolType } from '../tools/types';
 import { computeSupersededAnnotations } from '../utils/superseded';
@@ -374,13 +375,13 @@ export function AnnotationToolbar({
   );
 
   // Spinner animation for crosshair when jobs are active
-  const { charIndex: spinnerCharIndex } = useSpinner(!!hasActiveJobs);
 
   // Tool guidance hover state
   const [guidanceTool, setGuidanceTool] = useState<string | null>(null);
   const guidanceVisibleRef = useRef(false);
   const guidanceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const guidanceHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const guidancePanelRef = useRef<HTMLDivElement | null>(null);
 
   // Mouse-position prediction cone refs (Amazon mega-menu pattern)
   const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -435,6 +436,32 @@ export function AnnotationToolbar({
       setGuidanceTool(null);
     }, 150);
   }, [clearPrediction]);
+
+  // Native mouseenter/mouseleave on guidance panel — React synthetic events
+  // don't fire reliably inside Shadow DOM (event retargeting at shadow boundary).
+  useEffect(() => {
+    const el = guidancePanelRef.current;
+    if (!el) return;
+    const onEnter = () => {
+      clearPrediction();
+      if (guidanceHideTimerRef.current) {
+        clearTimeout(guidanceHideTimerRef.current);
+        guidanceHideTimerRef.current = null;
+      }
+    };
+    const onLeave = () => {
+      guidanceHideTimerRef.current = setTimeout(() => {
+        guidanceVisibleRef.current = false;
+        setGuidanceTool(null);
+      }, 150);
+    };
+    el.addEventListener('mouseenter', onEnter);
+    el.addEventListener('mouseleave', onLeave);
+    return () => {
+      el.removeEventListener('mouseenter', onEnter);
+      el.removeEventListener('mouseleave', onLeave);
+    };
+  }, [guidanceTool, clearPrediction]);
 
   const handleToolbarMouseMove = useCallback((e: React.MouseEvent) => {
     lastMouseRef.current = { x: e.clientX, y: e.clientY };
@@ -558,6 +585,45 @@ export function AnnotationToolbar({
               const restoredInfo = info || { ...extractElementInfo(el), selector };
               dispatch({ type: 'SELECT_ELEMENT', payload: { el, info: restoredInfo } });
             }
+          }
+        } catch {
+          // Invalid JSON, ignore
+        }
+      }
+
+      // Check for cross-page pending focus (set by off-page cycle navigation)
+      const pendingFocus = sessionStorage.getItem('popmelt-pending-focus');
+      if (pendingFocus) {
+        sessionStorage.removeItem('popmelt-pending-focus');
+        try {
+          const { annotationId } = JSON.parse(pendingFocus);
+          if (annotationId) {
+            // Read restored annotations from localStorage directly since state
+            // hasn't been updated yet (RESTORE_ANNOTATIONS dispatch is batched)
+            const restoredAnns: Annotation[] = stored ? (JSON.parse(stored) ?? []) : [];
+            // Defer to allow DOM to settle after restore
+            requestAnimationFrame(() => {
+              dispatch({ type: 'SELECT_ANNOTATION', payload: { id: annotationId } });
+
+              const target = restoredAnns.find((a: Annotation) => a.id === annotationId);
+              if (target) {
+                const groupAnns = target.groupId
+                  ? restoredAnns.filter((a: Annotation) => a.groupId === target.groupId)
+                  : [target];
+                const allPoints = groupAnns.flatMap((a: Annotation) => a.points);
+                if (allPoints.length > 0) {
+                  const minX = Math.min(...allPoints.map(p => p.x));
+                  const maxX = Math.max(...allPoints.map(p => p.x));
+                  const minY = Math.min(...allPoints.map(p => p.y));
+                  const maxY = Math.max(...allPoints.map(p => p.y));
+                  window.scrollTo({
+                    left: (minX + maxX) / 2 - window.innerWidth / 2,
+                    top: (minY + maxY) / 2 - window.innerHeight / 2,
+                    behavior: 'smooth',
+                  });
+                }
+              }
+            });
           }
         } catch {
           // Invalid JSON, ignore
@@ -699,7 +765,13 @@ export function AnnotationToolbar({
   }, [dispatch, state.styleModifications, onClear]);
 
   // Color hue state (OKLCH hue, 0-360, red ≈ 29)
-  const [hue, setHue] = useState(29);
+  const [hue, setHue] = useState(() => {
+    if (savedColorAtInit.current) {
+      const match = savedColorAtInit.current.match(/oklch\([^)]*\s+([\d.]+)\s*\)/);
+      if (match?.[1]) return parseFloat(match[1]);
+    }
+    return 29;
+  });
   const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const counterRef = useRef<HTMLButtonElement>(null);
   const isInternalColorChange = useRef(false);
@@ -789,39 +861,60 @@ export function AnnotationToolbar({
     };
   }, []);
 
+  // Filter annotations to current page (annotations without pathname are visible everywhere for backward compat)
+  const currentPathname = usePathname();
+  const pageAnnotations = useMemo(
+    () => state.annotations.filter(a => !a.pathname || a.pathname === currentPathname),
+    [state.annotations, currentPathname],
+  );
+
   // Compute superseded annotations (older rounds on the same element)
+  // Uses all annotations (not just page) so off-page superseded are correctly excluded
   const supersededAnnotations = useMemo(
     () => computeSupersededAnnotations(state.annotations),
     [state.annotations],
   );
 
-  // Group annotations by groupId (linked annotations count as one), excluding superseded
-  const annotationGroups = useMemo(() => {
-    const groups: { id: string; annotations: typeof state.annotations }[] = [];
+  // Global annotation groups sorted by creation time (timestamp).
+  // Each group knows its pathname so cycling can navigate cross-page.
+  type AnnotationGroup = { id: string; pathname: string | undefined; annotations: Annotation[]; timestamp: number };
+  const allAnnotationGroups = useMemo(() => {
+    const groups: AnnotationGroup[] = [];
     const seenGroupIds = new Set<string>();
+    const sorted = [...state.annotations].sort((a, b) => a.timestamp - b.timestamp);
 
-    for (const annotation of state.annotations) {
+    for (const annotation of sorted) {
       if (supersededAnnotations.has(annotation)) continue;
       if (annotation.groupId) {
         if (!seenGroupIds.has(annotation.groupId)) {
           seenGroupIds.add(annotation.groupId);
-          const groupAnnotations = state.annotations.filter(a => a.groupId === annotation.groupId && !supersededAnnotations.has(a));
+          const groupAnnotations = state.annotations.filter(
+            a => a.groupId === annotation.groupId && !supersededAnnotations.has(a),
+          );
           const primary = groupAnnotations.find(a => a.type !== 'text') || groupAnnotations[0]!;
-          groups.push({ id: primary.id, annotations: groupAnnotations });
+          const earliest = Math.min(...groupAnnotations.map(a => a.timestamp));
+          groups.push({ id: primary.id, pathname: annotation.pathname, annotations: groupAnnotations, timestamp: earliest });
         }
       } else {
-        groups.push({ id: annotation.id, annotations: [annotation] });
+        groups.push({ id: annotation.id, pathname: annotation.pathname, annotations: [annotation], timestamp: annotation.timestamp });
       }
     }
+    // Already in timestamp order since we iterated sorted annotations
     return groups;
   }, [state.annotations, supersededAnnotations]);
 
+  // On-page subset (for badge display count and on-page focusing)
+  const annotationGroups = useMemo(
+    () => allAnnotationGroups.filter(g => !g.pathname || g.pathname === currentPathname),
+    [allAnnotationGroups, currentPathname],
+  );
+
   // Track focused item index (null = showing total, 0+ = focused on that item)
-  // Items are: annotation groups first, then style modifications
+  // Cycle order: all annotation groups (global, by timestamp) then style modifications
   const [focusedGroupIndex, setFocusedGroupIndex] = useState<number | null>(null);
 
-  // Total focusable items count
-  const totalFocusableItems = annotationGroups.length + state.styleModifications.length;
+  // Total focusable items count (global annotations + style modifications)
+  const totalFocusableItems = allAnnotationGroups.length + state.styleModifications.length;
 
   // Reset focused index when items change significantly or selection is cleared
   useEffect(() => {
@@ -841,36 +934,55 @@ export function AnnotationToolbar({
     }
     if (state.selectedAnnotationIds.length > 0) {
       const selectedId = state.selectedAnnotationIds[0];
-      const groupIdx = annotationGroups.findIndex(g =>
+      const groupIdx = allAnnotationGroups.findIndex(g =>
         g.id === selectedId || g.annotations.some(a => a.id === selectedId)
       );
       if (groupIdx >= 0 && groupIdx !== focusedGroupIndex) {
         setFocusedGroupIndex(groupIdx);
       }
     }
-  }, [state.selectedAnnotationIds, state.inspectedElement, annotationGroups]);
+  }, [state.selectedAnnotationIds, state.inspectedElement, allAnnotationGroups]);
 
   // Cycle through annotations and style modifications
   const handleCycleAnnotation = useCallback(() => {
     if (totalFocusableItems === 0) return;
 
-    let nextIndex: number;
+    let nextIndex: number | null;
     if (focusedGroupIndex === null) {
-      // Currently showing total, go to first
+      // Currently showing total, go to first global item
       nextIndex = 0;
+    } else if (focusedGroupIndex + 1 >= totalFocusableItems) {
+      // Past the last item — wrap to null (total display)
+      nextIndex = null;
     } else {
-      // Go to next, or wrap to first
-      nextIndex = (focusedGroupIndex + 1) % totalFocusableItems;
+      nextIndex = focusedGroupIndex + 1;
     }
 
     setFocusedGroupIndex(nextIndex);
 
-    // Check if this is an annotation group or a style modification
-    if (nextIndex < annotationGroups.length) {
-      // Focus on annotation group
-      const group = annotationGroups[nextIndex];
-      if (!group) return;
+    if (nextIndex === null) {
+      // Wrapped back to total display — clear selection
+      dispatch({ type: 'SELECT_ANNOTATION', payload: { id: null } });
+      dispatch({ type: 'SELECT_ELEMENT', payload: null });
+      return;
+    }
 
+    // Check if this is an annotation group or a style modification
+    if (nextIndex < allAnnotationGroups.length) {
+      const group = allAnnotationGroups[nextIndex]!;
+      const isOnPage = !group.pathname || group.pathname === currentPathname;
+
+      if (!isOnPage) {
+        // Off-page — navigate to the target page
+        sessionStorage.setItem('popmelt-pending-focus', JSON.stringify({
+          annotationId: group.id,
+          pathname: group.pathname,
+        }));
+        window.location.href = group.pathname!;
+        return;
+      }
+
+      // On-page annotation group
       // Clear inspected element when switching to annotation
       dispatch({ type: 'SELECT_ELEMENT', payload: null });
 
@@ -883,7 +995,6 @@ export function AnnotationToolbar({
 
       // Switch to the annotation's tool type
       if (isLinkedAnnotation) {
-        // Inspector-created annotations — switch to inspector
         dispatch({ type: 'SET_TOOL', payload: 'inspector' });
       } else if (primaryAnnotation?.type && primaryAnnotation.type !== 'text' && primaryAnnotation.type !== 'inspector') {
         dispatch({ type: 'SET_TOOL', payload: primaryAnnotation.type });
@@ -894,7 +1005,6 @@ export function AnnotationToolbar({
       // Set active color to match the selected annotation's color
       if (primaryAnnotation?.color) {
         dispatch({ type: 'SET_COLOR', payload: primaryAnnotation.color });
-        // Also update hue state if it's an OKLCH color
         const parsedHue = parseHueFromColor(primaryAnnotation.color);
         if (parsedHue !== null) {
           setHue(parsedHue);
@@ -912,7 +1022,6 @@ export function AnnotationToolbar({
       const centerX = (minX + maxX) / 2;
       const centerY = (minY + maxY) / 2;
 
-      // Scroll to center the annotation in the viewport
       window.scrollTo({
         left: centerX - window.innerWidth / 2,
         top: centerY - window.innerHeight / 2,
@@ -925,26 +1034,21 @@ export function AnnotationToolbar({
         if (threadId) onViewThread(threadId);
       }
     } else {
-      // Focus on style modification
-      const modIndex = nextIndex - annotationGroups.length;
+      // Style modification (always on-page)
+      const modIndex = nextIndex - allAnnotationGroups.length;
       const modification = state.styleModifications[modIndex];
       if (!modification) return;
 
-      // Find the element
       const el = findElementBySelector(modification.selector);
       if (!el) return;
 
-      // Clear annotation selection when switching to style modification
       dispatch({ type: 'SELECT_ANNOTATION', payload: { id: null } });
-
-      // Switch to inspector tool and select the element (use stored info to preserve selector)
       dispatch({ type: 'SET_TOOL', payload: 'inspector' });
       dispatch({
         type: 'SELECT_ELEMENT',
         payload: { el, info: modification.element },
       });
 
-      // Scroll element into view
       const rect = el.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2 + window.scrollX;
       const centerY = rect.top + rect.height / 2 + window.scrollY;
@@ -955,7 +1059,7 @@ export function AnnotationToolbar({
         behavior: 'smooth',
       });
     }
-  }, [annotationGroups, state.styleModifications, totalFocusableItems, focusedGroupIndex, dispatch, parseHueFromColor, isThreadPanelOpen, onViewThread]);
+  }, [allAnnotationGroups, currentPathname, state.styleModifications, totalFocusableItems, focusedGroupIndex, dispatch, parseHueFromColor, isThreadPanelOpen, onViewThread]);
 
   // Keyboard shortcuts for tools (only when expanded and not editing text)
   useEffect(() => {
@@ -1078,16 +1182,10 @@ export function AnnotationToolbar({
     if (!el) return;
     const onEnter = () => {
       onCrosshairHover?.(true);
-      el.style.opacity = '1';
-      const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
-      if (logo) logo.style.fill = '#000';
       handleToolHoverStart('collapse');
     };
     const onLeave = () => {
       onCrosshairHover?.(false);
-      el.style.opacity = hasActiveJobs ? '1' : '0.5';
-      const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
-      if (logo) logo.style.fill = 'none';
       handleToolHoverEnd();
     };
     el.addEventListener('mouseenter', onEnter);
@@ -1102,23 +1200,22 @@ export function AnnotationToolbar({
     const el = collapsedRef.current;
     if (!el) return;
     const logo = el.querySelector('[data-popmelt-logo]') as SVGElement | null;
-    const onEnter = () => { el.style.opacity = '1'; if (logo) logo.style.fill = '#000'; onToolbarMouseEnter?.(); };
-    const onLeave = () => { el.style.opacity = '0.5'; if (logo) logo.style.fill = 'none'; };
+    const onEnter = () => { el.style.opacity = '1'; if (!hasActiveJobs && logo) logo.style.fill = '#000'; onToolbarMouseEnter?.(); };
+    const onLeave = () => { el.style.opacity = hasActiveJobs ? '1' : '0.5'; if (!hasActiveJobs && logo) logo.style.fill = 'none'; };
     el.addEventListener('mouseenter', onEnter);
     el.addEventListener('mouseleave', onLeave);
     return () => { el.removeEventListener('mouseenter', onEnter); el.removeEventListener('mouseleave', onLeave); };
-  }, [isExpanded, onToolbarMouseEnter]);
+  }, [isExpanded, hasActiveJobs, onToolbarMouseEnter]);
   if (!isExpanded) {
     return (
       <>
         <style>{`
-          @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
           @keyframes popmelt-border-march { to { background-position: 0 -5px; } }
         `}</style>
         <div
           ref={(el) => { collapsedRef.current = el; if (externalToolbarRef) externalToolbarRef.current = el; }}
           id="devtools-toolbar"
-          style={{ ...toolbarStyle, overflow: 'visible', opacity: 0.5, transition: 'opacity 150ms ease' }}
+          style={{ ...toolbarStyle, overflow: 'visible', opacity: hasActiveJobs ? 1 : 0.5, transition: 'opacity 150ms ease' }}
         >
           {borderOverlay}
           <button
@@ -1143,29 +1240,9 @@ export function AnnotationToolbar({
             onMouseLeave={() => onCrosshairHover?.(false)}
             title="Open annotation toolbar (⌘⌘)"
           >
-            {hasActiveJobs ? (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill={crosshairColor}>
-                {spinnerCharIndex === 1 ? (
-                  <>
-                    <circle cx="7" cy="7" r="2" />
-                    <circle cx="17" cy="7" r="2" />
-                    <circle cx="7" cy="17" r="2" />
-                    <circle cx="17" cy="17" r="2" />
-                  </>
-                ) : (
-                  <>
-                    <circle cx="12" cy="6" r="2" />
-                    <circle cx="6" cy="12" r="2" />
-                    <circle cx="18" cy="12" r="2" />
-                    <circle cx="12" cy="18" r="2" />
-                  </>
-                )}
-              </svg>
-            ) : (
-              <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill="none" stroke={crosshairColor} strokeWidth="1" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg">
+            <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill="none" stroke={crosshairColor} strokeWidth="1" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg">
                 <path d="M20.25 8.00293H20.249C21.5098 8.0286 22.7219 8.25094 23.8584 8.63672L23.8604 8.63574C23.8961 8.64787 23.9312 8.66145 23.9668 8.67383C24.0611 8.70686 24.1548 8.74106 24.248 8.77637C24.2915 8.79273 24.3357 8.80727 24.3789 8.82422L24.376 8.82617C27.6145 10.0955 30.1646 12.7301 31.3213 16.0234L31.3232 16.0225C31.3327 16.0493 31.3404 16.0766 31.3496 16.1035C31.7691 17.3256 32 18.6356 32 20C32 20.8726 31.9366 21.6706 31.7598 22.4902L31.7197 22.6328C31.6412 23.0066 31.5136 23.6108 31.3408 24.2217L31.3398 24.2246C31.2967 24.377 31.251 24.5299 31.2021 24.6797C30.9215 25.5403 30.5473 26.2998 30.0879 26.2998C29.7613 26.2996 29.5995 25.9674 29.4316 25.6221C29.2501 25.2487 29.0614 24.8605 28.6484 24.8604C27.8532 24.8604 27.2081 25.5046 27.208 26.2998V27.0771C27.2079 27.6079 26.9661 28.112 26.5205 28.4004C25.9146 28.7925 25.2357 28.6462 24.7959 28.2061L24.7949 28.208C24.7897 28.2028 24.7854 28.1967 24.7803 28.1914C24.7654 28.1761 24.7507 28.1606 24.7363 28.1445C24.7105 28.1156 24.6858 28.0857 24.6621 28.0547C24.6461 28.0339 24.6302 28.013 24.6152 27.9912C24.5931 27.9591 24.5726 27.9257 24.5527 27.8916C24.5392 27.8685 24.5261 27.8452 24.5137 27.8213C24.5093 27.8128 24.5043 27.8045 24.5 27.7959L24.501 27.7939C24.3932 27.5763 24.3282 27.3276 24.3281 27.0576V26.2998C24.328 25.5993 23.8278 25.0158 23.165 24.8867V24.8877C23.0752 24.8702 22.9826 24.8604 22.8877 24.8604C22.8446 24.8604 22.8019 24.8624 22.7598 24.8662C22.0247 24.9312 21.4483 25.5479 21.4482 26.2998C21.4482 26.9127 21.4608 27.5305 21.4736 28.1494L21.4951 29.3135C21.5 29.7013 21.5015 30.089 21.4971 30.4756C21.4874 31.3103 20.8426 32 20.0078 32C19.1732 31.9998 18.5292 31.3102 18.5195 30.4756C18.5159 30.1613 18.5176 29.8464 18.5205 29.5312V29.5322C18.5212 29.4593 18.5206 29.3864 18.5215 29.3135L18.5303 28.8154V28.8145C18.5343 28.5927 18.5384 28.371 18.543 28.1494C18.5558 27.5305 18.5684 28.1129 18.5684 27.5C18.5684 26.7047 17.9232 26.0596 17.1279 26.0596C16.907 26.0596 16.6978 26.1103 16.5107 26.1992C16.2161 26.3393 15.9767 26.5769 15.834 26.8701C15.8269 26.8846 15.8201 26.8993 15.8135 26.9141C15.7821 26.9845 15.7562 27.0579 15.7363 27.1338C15.7243 27.1798 15.7155 27.2267 15.708 27.2744C15.7012 27.3175 15.6953 27.361 15.6924 27.4053C15.6903 27.4366 15.6885 27.4681 15.6885 27.5V28.7383C15.6883 29.9234 14.4911 30.7248 13.4961 30.0811C13.0505 29.7926 12.8086 29.2886 12.8086 28.7578V26.2998C12.8086 25.9737 12.6984 25.674 12.5156 25.4326C12.4437 25.3381 12.3612 25.2521 12.2686 25.1777V25.1768C12.0219 24.9788 11.709 24.8604 11.3682 24.8604C10.9892 24.8604 10.8622 24.8872 10.7295 25.2295C10.5837 25.6055 10.4302 26 9.92773 26C9.33081 25.9996 8.95963 25.2403 8.71484 24.3799C8.5591 23.8325 8.45907 23.571 8.3623 23.0107C8.3501 22.9401 8.33284 22.8403 8.31738 22.7529C8.12812 21.9466 8.02043 21.1089 8.00293 20.249V20.25L8 20C8 19.8617 8.00317 19.724 8.00781 19.5869C8.00837 19.5703 8.00816 19.5537 8.00879 19.5371L8.00977 19.5352C8.0998 17.1716 8.87444 14.9844 10.1396 13.1631C10.1488 13.1499 10.1587 13.1372 10.168 13.124C12.255 10.1453 15.6582 8.15745 19.5352 8.00977L19.5371 8.00879C19.5537 8.00816 19.5703 8.00837 19.5869 8.00781C19.724 8.00317 19.8617 8 20 8L20.25 8.00293Z" />
               </svg>
-            )}
           </button>
         </div>
       </>
@@ -1218,14 +1295,7 @@ export function AnnotationToolbar({
         const g = guidanceTool === 'provider' ? providerGuidance : TOOL_GUIDANCE[guidanceTool]!;
         return (
           <div
-            onMouseEnter={guidanceTool === 'collapse' ? () => {
-              clearPrediction();
-              if (guidanceHideTimerRef.current) {
-                clearTimeout(guidanceHideTimerRef.current);
-                guidanceHideTimerRef.current = null;
-              }
-            } : undefined}
-            onMouseLeave={guidanceTool === 'collapse' ? handleToolHoverEnd : undefined}
+            ref={guidancePanelRef}
             style={{
             position: 'fixed',
             bottom: 80,
@@ -1239,7 +1309,7 @@ export function AnnotationToolbar({
             fontSize: 12,
             color: '#1f2937',
             padding: 12,
-            ...(guidanceTool !== 'collapse' ? { pointerEvents: 'none' as const } : {}),
+            ...(guidanceTool !== 'collapse' && guidanceTool !== 'counter' ? { pointerEvents: 'none' as const } : {}),
           }}>
             {guidanceTool === 'collapse' && (
               <div style={{ marginBottom: 10 }}>
@@ -1356,6 +1426,91 @@ export function AnnotationToolbar({
                 ))}
               </div>
             )}
+            {/* Annotation quick-nav list (counter guidance only) */}
+            {guidanceTool === 'counter' && allAnnotationGroups.length > 0 && (() => {
+              // Group by pathname
+              const byRoute = new Map<string, AnnotationGroup[]>();
+              for (const g of allAnnotationGroups) {
+                const route = g.pathname || currentPathname;
+                if (!byRoute.has(route)) byRoute.set(route, []);
+                byRoute.get(route)!.push(g);
+              }
+              const routes = [...byRoute.entries()];
+              const multiRoute = routes.length > 1;
+
+              return (
+                <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8, maxHeight: 200, overflowY: 'auto', scrollbarWidth: 'thin' }}>
+                  {routes.map(([route, groups]) => (
+                    <div key={route} style={{ marginBottom: multiRoute ? 4 : 0 }}>
+                      {groups.map((group) => {
+                        const textAnn = group.annotations.find(a => a.type === 'text' && a.text);
+                        const preview = textAnn?.text || `[${group.annotations[0]?.type ?? 'annotation'}]`;
+                        const isSelected = state.selectedAnnotationIds.includes(group.id);
+                        const groupIndex = allAnnotationGroups.indexOf(group);
+                        const groupNumber = groupIndex + 1;
+                        const groupColor = group.annotations[0]?.color ?? state.activeColor;
+
+                        return (
+                          <div
+                            key={group.id}
+                            onClick={() => {
+                              const isOnPage = !group.pathname || group.pathname === currentPathname;
+                              if (!isOnPage) {
+                                sessionStorage.setItem('popmelt-pending-focus', JSON.stringify({
+                                  annotationId: group.id,
+                                  pathname: group.pathname,
+                                }));
+                                window.location.href = group.pathname!;
+                                return;
+                              }
+                              setFocusedGroupIndex(groupIndex);
+                              dispatch({ type: 'SELECT_ELEMENT', payload: null });
+                              dispatch({ type: 'SELECT_ANNOTATION', payload: { id: group.id } });
+                              guidanceVisibleRef.current = false;
+                              setGuidanceTool(null);
+                            }}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'baseline',
+                              gap: 4,
+                              padding: '2px 0',
+                              cursor: 'pointer',
+                            }}
+                            onMouseEnter={(e) => {
+                              const badge = e.currentTarget.querySelector('[data-route-badge]') as HTMLElement;
+                              if (badge) { badge.style.backgroundColor = groupColor; badge.style.color = '#fff'; }
+                            }}
+                            onMouseLeave={(e) => {
+                              if (isSelected) return;
+                              const badge = e.currentTarget.querySelector('[data-route-badge]') as HTMLElement;
+                              if (badge) { badge.style.backgroundColor = 'rgba(0,0,0,0.06)'; badge.style.color = '#6b7280'; }
+                            }}
+                          >
+                            <code data-route-badge style={{
+                              fontSize: 10,
+                              color: isSelected ? '#fff' : '#6b7280',
+                              backgroundColor: isSelected ? groupColor : 'rgba(0,0,0,0.06)',
+                              padding: '1px 4px',
+                              flexShrink: 0,
+                              whiteSpace: 'nowrap',
+                            }}>{groupNumber}. {multiRoute ? route : ''}</code>
+                            <span style={{
+                              fontSize: 11,
+                              color: isSelected ? '#1f2937' : '#6b7280',
+                              fontWeight: isSelected ? 600 : 400,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                              minWidth: 0,
+                            }}>{preview}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
           </div>
         );
       })()}
@@ -1367,20 +1522,6 @@ export function AnnotationToolbar({
         onMouseMove={handleToolbarMouseMove}
       >
         {borderOverlay}
-        {(state.annotations.length > 0 || state.styleModifications.length > 0) && (
-          <>
-            <span onMouseEnter={() => handleToolHoverStart('clear')} onMouseLeave={handleToolHoverEnd}>
-              <ToolButton
-                onClick={handleClear}
-                title="Clear all (⌘⌫)"
-              >
-                <Trash2 size={17} strokeWidth={1.5} />
-              </ToolButton>
-            </span>
-            <ToolSeparator />
-          </>
-        )}
-
         <div style={{ display: 'flex', flexDirection: 'row', gap: 4, alignItems: 'center' }}>
           {/* Comment tool (first position) */}
           <span onMouseEnter={() => handleToolHoverStart('inspector')} onMouseLeave={handleToolHoverEnd}>
@@ -1512,10 +1653,10 @@ export function AnnotationToolbar({
         <ToolSeparator />
 
         <div style={{ display: 'flex', flexDirection: 'row', gap: 4, alignItems: 'center' }}>
-          {(annotationGroups.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0) && (() => {
+          {(allAnnotationGroups.length > 0 || state.styleModifications.length > 0 || state.spacingTokenChanges.filter(c => !c.captured).length > 0) && (() => {
             // Check if focused on an annotation group (vs style modification)
-            const focusedGroup = focusedGroupIndex !== null && focusedGroupIndex < annotationGroups.length
-              ? annotationGroups[focusedGroupIndex]
+            const focusedGroup = focusedGroupIndex !== null && focusedGroupIndex < allAnnotationGroups.length
+              ? allAnnotationGroups[focusedGroupIndex]
               : null;
             const allCaptured = state.annotations.length > 0 && state.annotations.every(a => a.status && a.status !== 'pending');
             // Style modifications are never "captured", only annotations
@@ -1545,9 +1686,9 @@ export function AnnotationToolbar({
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  width: 20,
+                  minWidth: 20,
                   height: 20,
-                  padding: 0,
+                  padding: '0 8px',
                   marginRight: 4,
                   border: 'none',
                   borderRadius: 0,
@@ -1560,12 +1701,36 @@ export function AnnotationToolbar({
                   transition: 'background 150ms ease',
                 }}
               >
-                {focusedGroupIndex !== null ? focusedGroupIndex + 1 : annotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length}
+                {(() => {
+                  const totalCount = allAnnotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length;
+                  if (focusedGroupIndex !== null) {
+                    return <>{focusedGroupIndex + 1}<span style={{ opacity: 0.4 }}>{` / ${totalCount}`}</span></>;
+                  }
+                  // Unfocused: "pageCount / totalCount" when there are off-page items
+                  const pageCount = annotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length;
+                  if (totalCount > pageCount) {
+                    return <>{pageCount}<span style={{ opacity: 0.4 }}>{` / ${totalCount}`}</span></>;
+                  }
+                  return totalCount;
+                })()}
               </button>
               </span>
             );
           })()}
+          {(state.annotations.length > 0 || state.styleModifications.length > 0) && (
+            <span onMouseEnter={() => handleToolHoverStart('clear')} onMouseLeave={handleToolHoverEnd}>
+              <ToolButton
+                siblingActive={state.isAnnotating}
+                onClick={handleClear}
+                title="Clear all (⌘⌫)"
+              >
+                <Trash2 size={17} strokeWidth={1.5} />
+              </ToolButton>
+            </span>
+          )}
           {onProviderChange && (
+            <>
+            <div style={{ width: 1, height: 20, backgroundColor: 'rgba(0, 0, 0, 0.05)', margin: '0 2px' }} />
             <span onMouseEnter={() => handleToolHoverStart('provider')} onMouseLeave={handleToolHoverEnd} style={{ display: 'contents' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
               <ToolButton
@@ -1617,35 +1782,16 @@ export function AnnotationToolbar({
               </button>
             </div>
             </span>
+            </>
           )}
           <div
             ref={expandedCollapseRef}
-            style={{ display: 'inline-flex', opacity: hasActiveJobs ? 1 : 0.5, transition: 'opacity 150ms ease', cursor: 'pointer' }}
+            style={{ display: 'inline-flex', cursor: 'pointer' }}
           >
             <button type="button" onClick={handleCollapse} title="Collapse (⌘⌘)" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 32, height: 32, border: 'none', background: 'none', padding: 0, cursor: 'inherit' }}>
-              {hasActiveJobs ? (
-                <svg width="30" height="30" viewBox="0 0 24 24" fill={crosshairColor}>
-                  {spinnerCharIndex === 1 ? (
-                    <>
-                      <circle cx="7" cy="7" r="2" />
-                      <circle cx="17" cy="7" r="2" />
-                      <circle cx="7" cy="17" r="2" />
-                      <circle cx="17" cy="17" r="2" />
-                    </>
-                  ) : (
-                    <>
-                      <circle cx="12" cy="6" r="2" />
-                      <circle cx="6" cy="12" r="2" />
-                      <circle cx="18" cy="12" r="2" />
-                      <circle cx="12" cy="18" r="2" />
-                    </>
-                  )}
-                </svg>
-              ) : (
-                <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill="none" stroke="#000" strokeWidth="1" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg">
+              <svg data-popmelt-logo width="30" height="30" viewBox="0 0 40 40" fill={crosshairColor} stroke="none" xmlns="http://www.w3.org/2000/svg">
                   <path d="M20.25 8.00293H20.249C21.5098 8.0286 22.7219 8.25094 23.8584 8.63672L23.8604 8.63574C23.8961 8.64787 23.9312 8.66145 23.9668 8.67383C24.0611 8.70686 24.1548 8.74106 24.248 8.77637C24.2915 8.79273 24.3357 8.80727 24.3789 8.82422L24.376 8.82617C27.6145 10.0955 30.1646 12.7301 31.3213 16.0234L31.3232 16.0225C31.3327 16.0493 31.3404 16.0766 31.3496 16.1035C31.7691 17.3256 32 18.6356 32 20C32 20.8726 31.9366 21.6706 31.7598 22.4902L31.7197 22.6328C31.6412 23.0066 31.5136 23.6108 31.3408 24.2217L31.3398 24.2246C31.2967 24.377 31.251 24.5299 31.2021 24.6797C30.9215 25.5403 30.5473 26.2998 30.0879 26.2998C29.7613 26.2996 29.5995 25.9674 29.4316 25.6221C29.2501 25.2487 29.0614 24.8605 28.6484 24.8604C27.8532 24.8604 27.2081 25.5046 27.208 26.2998V27.0771C27.2079 27.6079 26.9661 28.112 26.5205 28.4004C25.9146 28.7925 25.2357 28.6462 24.7959 28.2061L24.7949 28.208C24.7897 28.2028 24.7854 28.1967 24.7803 28.1914C24.7654 28.1761 24.7507 28.1606 24.7363 28.1445C24.7105 28.1156 24.6858 28.0857 24.6621 28.0547C24.6461 28.0339 24.6302 28.013 24.6152 27.9912C24.5931 27.9591 24.5726 27.9257 24.5527 27.8916C24.5392 27.8685 24.5261 27.8452 24.5137 27.8213C24.5093 27.8128 24.5043 27.8045 24.5 27.7959L24.501 27.7939C24.3932 27.5763 24.3282 27.3276 24.3281 27.0576V26.2998C24.328 25.5993 23.8278 25.0158 23.165 24.8867V24.8877C23.0752 24.8702 22.9826 24.8604 22.8877 24.8604C22.8446 24.8604 22.8019 24.8624 22.7598 24.8662C22.0247 24.9312 21.4483 25.5479 21.4482 26.2998C21.4482 26.9127 21.4608 27.5305 21.4736 28.1494L21.4951 29.3135C21.5 29.7013 21.5015 30.089 21.4971 30.4756C21.4874 31.3103 20.8426 32 20.0078 32C19.1732 31.9998 18.5292 31.3102 18.5195 30.4756C18.5159 30.1613 18.5176 29.8464 18.5205 29.5312V29.5322C18.5212 29.4593 18.5206 29.3864 18.5215 29.3135L18.5303 28.8154V28.8145C18.5343 28.5927 18.5384 28.371 18.543 28.1494C18.5558 27.5305 18.5684 28.1129 18.5684 27.5C18.5684 26.7047 17.9232 26.0596 17.1279 26.0596C16.907 26.0596 16.6978 26.1103 16.5107 26.1992C16.2161 26.3393 15.9767 26.5769 15.834 26.8701C15.8269 26.8846 15.8201 26.8993 15.8135 26.9141C15.7821 26.9845 15.7562 27.0579 15.7363 27.1338C15.7243 27.1798 15.7155 27.2267 15.708 27.2744C15.7012 27.3175 15.6953 27.361 15.6924 27.4053C15.6903 27.4366 15.6885 27.4681 15.6885 27.5V28.7383C15.6883 29.9234 14.4911 30.7248 13.4961 30.0811C13.0505 29.7926 12.8086 29.2886 12.8086 28.7578V26.2998C12.8086 25.9737 12.6984 25.674 12.5156 25.4326C12.4437 25.3381 12.3612 25.2521 12.2686 25.1777V25.1768C12.0219 24.9788 11.709 24.8604 11.3682 24.8604C10.9892 24.8604 10.8622 24.8872 10.7295 25.2295C10.5837 25.6055 10.4302 26 9.92773 26C9.33081 25.9996 8.95963 25.2403 8.71484 24.3799C8.5591 23.8325 8.45907 23.571 8.3623 23.0107C8.3501 22.9401 8.33284 22.8403 8.31738 22.7529C8.12812 21.9466 8.02043 21.1089 8.00293 20.249V20.25L8 20C8 19.8617 8.00317 19.724 8.00781 19.5869C8.00837 19.5703 8.00816 19.5537 8.00879 19.5371L8.00977 19.5352C8.0998 17.1716 8.87444 14.9844 10.1396 13.1631C10.1488 13.1499 10.1587 13.1372 10.168 13.124C12.255 10.1453 15.6582 8.15745 19.5352 8.00977L19.5371 8.00879C19.5537 8.00816 19.5703 8.00837 19.5869 8.00781C19.724 8.00317 19.8617 8 20 8L20.25 8.00293Z" />
                 </svg>
-              )}
             </button>
           </div>
         </div>

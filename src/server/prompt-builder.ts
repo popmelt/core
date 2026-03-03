@@ -86,13 +86,18 @@ export function buildPrompt(
     provider?: Provider;
     imagePaths?: Record<string, string[]>;
     designModel?: Record<string, unknown>;
+    screenshotPaths?: Record<string, string>;
   },
 ): string {
   const lines: string[] = [];
 
+  // Determine if annotations span multiple pages (by annotation pathname, not screenshot count)
+  const annotationPages = new Set(feedback.annotations.map(a => a.pathname).filter(Boolean));
+  const isMultiPage = annotationPages.size > 1;
+
   lines.push('You are reviewing a UI screenshot with developer annotations.');
   lines.push('');
-  if (options?.provider !== 'codex') {
+  if (!isMultiPage && options?.provider !== 'codex') {
     lines.push(`IMPORTANT: First, use the Read tool to view the screenshot at: ${screenshotPath}`);
     lines.push('');
   }
@@ -198,10 +203,53 @@ export function buildPrompt(
     lines.push('This project uses Popmelt for design governance. Design decisions are stored in .popmelt/decisions/ (JSON files). A materialized design model may exist at .popmelt/model.json. When the developer asks about design tokens, patterns, or past decisions, check these files first before searching source code.');
   }
 
-  const feedbackContext = formatFeedbackContext(feedback, options?.imagePaths);
-  if (feedbackContext) {
+  if (isMultiPage) {
+    // Group annotations by page
+    const ssMap = options?.screenshotPaths ?? {};
+    const byPage = new Map<string, FeedbackPayload['annotations']>();
+    for (const ann of feedback.annotations) {
+      const page = ann.pathname || new URL(feedback.url).pathname;
+      if (!byPage.has(page)) byPage.set(page, []);
+      byPage.get(page)!.push(ann);
+    }
+
     lines.push('');
-    lines.push(feedbackContext);
+    lines.push('The developer annotated multiple pages. Each page section includes its own screenshot where available.');
+
+    for (const [page, pageAnnotations] of byPage) {
+      lines.push('');
+      lines.push(`## Page: ${page}`);
+      const pageSsPath = ssMap[page];
+      if (pageSsPath && options?.provider !== 'codex') {
+        lines.push(`IMPORTANT: Use the Read tool to view the screenshot at: ${pageSsPath}`);
+      } else if (!pageSsPath && options?.provider !== 'codex') {
+        // No per-page screenshot — fall back to main screenshot if it's the only one
+        if (Object.keys(ssMap).length === 0) {
+          lines.push(`IMPORTANT: Use the Read tool to view the screenshot at: ${screenshotPath}`);
+          lines.push('(This screenshot shows the page the developer was on when submitting — not this page)');
+        } else {
+          lines.push('(No screenshot available for this page — work from the annotation text and selectors)');
+        }
+      }
+
+      // Build a per-page feedback payload for formatFeedbackContext
+      const pageFeedback: FeedbackPayload = {
+        ...feedback,
+        annotations: pageAnnotations,
+        styleModifications: feedback.styleModifications,
+      };
+      const ctx = formatFeedbackContext(pageFeedback, options?.imagePaths);
+      if (ctx) {
+        lines.push('');
+        lines.push(ctx);
+      }
+    }
+  } else {
+    const feedbackContext = formatFeedbackContext(feedback, options?.imagePaths);
+    if (feedbackContext) {
+      lines.push('');
+      lines.push(feedbackContext);
+    }
   }
 
   lines.push('');
