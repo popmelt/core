@@ -1,7 +1,7 @@
 'use client';
 
 import type { CSSProperties } from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { BridgeConnectionState } from '../hooks/useBridgeConnection';
 import { POPMELT_BORDER } from '../styles/border';
@@ -45,6 +45,7 @@ const stackContainerStyle: CSSProperties = {
   zIndex: 9999,
   display: 'flex',
   flexDirection: 'column',
+  alignItems: 'flex-end',
 };
 
 // Stacking constants — row height must approximate actual rendered height
@@ -189,6 +190,45 @@ function ErrorDot() {
 }
 
 
+// Native-listener buttons for shadow DOM compat (stopPropagation + click)
+function CancelButton({ onCancel }: { onCancel: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const handler = (e: MouseEvent) => { e.stopPropagation(); onCancel(); };
+    el.addEventListener('click', handler);
+    return () => el.removeEventListener('click', handler);
+  }, [onCancel]);
+  return (
+    <button
+      ref={ref}
+      style={{ background: 'none', border: 'none', cursor: 'pointer',
+               color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+      title="Cancel"
+    >×</button>
+  );
+}
+
+function DismissButton({ onDismiss }: { onDismiss: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const handler = (e: MouseEvent) => { e.stopPropagation(); onDismiss(); };
+    el.addEventListener('click', handler);
+    return () => el.removeEventListener('click', handler);
+  }, [onDismiss]);
+  return (
+    <button
+      ref={ref}
+      style={{ background: 'none', border: 'none', cursor: 'pointer',
+               color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+      title="Dismiss"
+    >×</button>
+  );
+}
+
 export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onCancel, onHoverJob, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
   const [isHovered, setIsHovered] = useState(false);
@@ -290,16 +330,67 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
     );
   }, [bridge.lastCompletedJobId, bridge.events, bridge.status]);
 
-  if (!isVisible || (entries.length === 0 && isConnected !== false)) return null;
+  // Whether the stack will actually render (used as effect dep so native
+  // listeners re-attach when the component transitions from null → visible).
+  const isRendered = isVisible && (entries.length > 0 || isConnected === false);
+
+  // Native event listeners for shadow DOM compat (React synthetic events
+  // don't reliably cross the shadow boundary in this portal setup).
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isRendered) return;
+    const el = containerRef.current;
+    if (!el) return;
+    const onEnter = () => { setIsHovered(true); onHover(true); };
+    const onLeave = () => { setIsHovered(false); onHover(false); onHoverJob?.(null); };
+    el.addEventListener('mouseenter', onEnter);
+    el.addEventListener('mouseleave', onLeave);
+    return () => { el.removeEventListener('mouseenter', onEnter); el.removeEventListener('mouseleave', onLeave); };
+  }, [isRendered, onHover, onHoverJob]);
+
+  // Ref map for row-level native listeners
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const setRowRef = useCallback((jobId: string, el: HTMLDivElement | null) => {
+    if (el) rowRefs.current.set(jobId, el);
+    else rowRefs.current.delete(jobId);
+  }, []);
+
+  // Attach native click/hover listeners to each row
+  useEffect(() => {
+    if (!isRendered) return;
+    const cleanups: (() => void)[] = [];
+    for (const entry of entries) {
+      const el = rowRefs.current.get(entry.jobId);
+      if (!el) continue;
+
+      if (entry.threadId && onViewThread) {
+        const threadId = entry.threadId;
+        const onClick = () => onViewThread(threadId);
+        el.addEventListener('click', onClick);
+        cleanups.push(() => el.removeEventListener('click', onClick));
+      }
+
+      if (onHoverJob) {
+        const jobId = entry.jobId;
+        const onEnter = () => onHoverJob(jobId);
+        const onLeave = () => onHoverJob(null);
+        el.addEventListener('mouseenter', onEnter);
+        el.addEventListener('mouseleave', onLeave);
+        cleanups.push(() => { el.removeEventListener('mouseenter', onEnter); el.removeEventListener('mouseleave', onLeave); });
+      }
+    }
+    return () => cleanups.forEach(fn => fn());
+  }, [isRendered, entries, onViewThread, onHoverJob]);
+
+  if (!isRendered) return null;
 
   const collapsed = !isHovered && entries.length > 1;
 
   return (
     <div
+      ref={containerRef}
       style={stackContainerStyle}
       data-devtools
-      onMouseEnter={() => { setIsHovered(true); onHover(true); }}
-      onMouseLeave={() => { setIsHovered(false); onHover(false); onHoverJob?.(null); }}
     >
       {[...entries].reverse().map((entry, i) => {
         const isLast = i === entries.length - 1;
@@ -336,32 +427,20 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
             }}
           >
               <div
+                ref={(el) => setRowRef(entry.jobId, el)}
                 style={{ ...rowStyle, cursor: entry.threadId && onViewThread ? 'pointer' : undefined }}
-                onClick={entry.threadId && onViewThread ? () => onViewThread(entry.threadId!) : undefined}
-                onMouseEnter={onHoverJob ? () => onHoverJob(entry.jobId) : undefined}
-                onMouseLeave={onHoverJob ? () => onHoverJob(null) : undefined}
                 title={entry.errorMessage || undefined}
               >
                 {entry.status === 'working' && <DotSpinner color={entry.color} />}
                 {entry.status === 'queued' && <ColorSquare color={entry.color} />}
                 {entry.status === 'done' && <Checkmark color={entry.color} />}
                 {entry.status === 'error' && <ErrorDot />}
-                <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937' }}>{label}</span>
+                <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
                 {entry.status === 'working' && onCancel && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onCancel(entry.jobId); }}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer',
-                             color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
-                    title="Cancel"
-                  >×</button>
+                  <CancelButton onCancel={() => onCancel(entry.jobId)} />
                 )}
                 {(entry.status === 'done' || entry.status === 'error') && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setEntries(prev => prev.filter(el => el.jobId !== entry.jobId)); }}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer',
-                             color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
-                    title="Dismiss"
-                  >×</button>
+                  <DismissButton onDismiss={() => setEntries(prev => prev.filter(el => el.jobId !== entry.jobId))} />
                 )}
               </div>
           </div>
