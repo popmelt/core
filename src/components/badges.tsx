@@ -125,13 +125,21 @@ export function AnnotationBadges({
       ? annotations.filter(a => a.groupId === annotation.groupId)
       : [annotation];
 
+    const status: AnnotationLifecycleStatus = annotation.status ?? 'pending';
+    const replyCount = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0);
+
+    // Treat "resolved with zero replies" as stale/in-flight — the annotation was sent
+    // but we lost confirmation of the reply (e.g. refresh before APPLY_RESOLUTIONS persisted).
+    const isStaleResolved = (s: AnnotationLifecycleStatus | undefined) =>
+      s === 'resolved' && replyCount === 0;
+
     const isInFlight = !!(inFlightIds && (
       inFlightIds.has(annotation.id) ||
       groupAnns.some(a => inFlightIds.has(a.id))
-    ));
-    const status: AnnotationLifecycleStatus = annotation.status ?? 'pending';
+    )) || annotation.status === 'in_flight' || groupAnns.some(a => a.status === 'in_flight')
+      || isStaleResolved(annotation.status) || groupAnns.some(a => isStaleResolved(a.status));
     const groupMateResolved = groupAnns.some(
-      a => a.status === 'resolved' || a.status === 'needs_review'
+      a => (a.status === 'resolved' && (a.replyCount ?? 0) > 0) || a.status === 'needs_review'
     );
     const hasThread = groupAnns.some(a => a.threadId);
 
@@ -140,7 +148,6 @@ export function AnnotationBadges({
 
     const threadId = annotation.threadId || groupAnns.find(a => a.threadId)?.threadId;
     const isNeedsReview = status === 'needs_review' || groupAnns.some(a => a.status === 'needs_review');
-    const replyCount = groupAnns.reduce((n, a) => n + (a.replyCount ?? 0), 0);
 
     const point = annotation.points[0];
     const fontSize = annotation.fontSize || 12;
@@ -190,8 +197,6 @@ export function AnnotationBadges({
       labelText = THINKING_WORDS[wordIndex] ?? 'thinking';
     } else if (pos.replyCount > 0) {
       labelText = `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`;
-    } else if (pos.threadId) {
-      labelText = '1 reply';
     } else {
       labelText = 'Cancelled';
     }
@@ -316,7 +321,7 @@ export function AnnotationBadges({
                 <span style={{ opacity: 0.7 }}>
                   {pos.replyCount > 0
                     ? `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`
-                    : pos.threadId ? '1 reply' : 'Cancelled'}
+                    : 'Cancelled'}
                 </span>
               </>
             )}

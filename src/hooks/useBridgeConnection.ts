@@ -26,6 +26,8 @@ export type BridgeConnectionState = {
   jobResponses: Record<string, string>;
   jobThinking: Record<string, string>;
   activeJobIds: string[];
+  // Map of active jobId → threadId (from enriched /status response)
+  activeJobThreads: Record<string, string>;
   // Backward-compat single-job fields (track most recently started job)
   currentResponse: string;
   currentThinking: string;
@@ -49,13 +51,18 @@ const _hotEarly: { data?: Record<string, unknown> } | undefined = typeof import.
 
 const SOURCE_ID: string =
   (_hotEarly?.data?.sourceId as string) ??
+  // Survive page refreshes (localStorage persists across navigations and tabs)
+  (typeof localStorage !== 'undefined' && localStorage.getItem('popmelt-source-id')) ??
   (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2));
 
+// Persist for Vite HMR
 if (_hotEarly?.data) {
   (_hotEarly.data as Record<string, unknown>).sourceId = SOURCE_ID;
 }
+// Persist for page refresh recovery
+try { if (typeof localStorage !== 'undefined') localStorage.setItem('popmelt-source-id', SOURCE_ID); } catch {}
 
 /** Return this client's stable sourceId (for tagging bridge requests). */
 export function getSourceId(): string {
@@ -80,6 +87,7 @@ const INITIAL_STATE: BridgeConnectionState = {
   jobResponses: {},
   jobThinking: {},
   activeJobIds: [],
+  activeJobThreads: {},
   currentResponse: '',
   currentThinking: '',
   events: [],
@@ -179,8 +187,9 @@ async function runBackfill(bridgeUrl: string, jobIds: string[], gen: number) {
           const newJobThinking = { ...prev.jobThinking, [jobId]: result.accumulated.thinking };
           const newEvents = [...prev.events];
 
-          // Add backfilled events to the event log
+          // Add backfilled events to the event log (skip done/error — handled below)
           for (const evt of result.events) {
+            if (evt.type === 'done' || evt.type === 'error') continue;
             newEvents.push({ type: evt.type, data: evt as Record<string, unknown>, timestamp: Date.now() });
           }
 
@@ -196,6 +205,14 @@ async function runBackfill(bridgeUrl: string, jobIds: string[], gen: number) {
 
         // Set watermark — skip SSE events already covered by backfill
         backfilledSeqs[jobId] = result.currentSeq;
+
+        // Job completed server-side during disconnect — apply the done/error event
+        if (!result.jobActive) {
+          const terminal = result.events.find(evt => evt.type === 'done' || evt.type === 'error');
+          if (terminal) {
+            applyBackfilledEvent(terminal.type, terminal as Record<string, unknown>, jobId);
+          }
+        }
 
         // Replay buffered SSE events that arrived during the fetch (only those with seq > watermark)
         for (const evt of buffered) {
@@ -233,6 +250,53 @@ function applyBackfilledEvent(type: string, data: Record<string, unknown>, jobId
       currentThinking: jobId === prev.activeJobId ? prev.currentThinking + text : prev.currentThinking,
       events: [...prev.events, { type: 'thinking', data, timestamp: Date.now() }],
     }));
+  } else if (type === 'done') {
+    delete backfilledSeqs[jobId];
+    update((prev) => {
+      const newActiveJobIds = prev.activeJobIds.filter(id => id !== jobId);
+      const newJobResponses = { ...prev.jobResponses };
+      const newJobThinking = { ...prev.jobThinking };
+      const completedResponse = newJobResponses[jobId];
+      delete newJobResponses[jobId];
+      delete newJobThinking[jobId];
+
+      const newActiveJobId = jobId === prev.activeJobId
+        ? (newActiveJobIds.length > 0 ? newActiveJobIds[newActiveJobIds.length - 1]! : null)
+        : prev.activeJobId;
+
+      return {
+        ...prev,
+        activeJobIds: newActiveJobIds,
+        activeJobId: newActiveJobId,
+        jobResponses: newJobResponses,
+        jobThinking: newJobThinking,
+        lastCompletedJobId: jobId,
+        lastResponseText: completedResponse || prev.currentResponse || (data.responseText as string) || null,
+        lastThreadId: (data.threadId as string) ?? null,
+        ...(jobId === prev.activeJobId ? {
+          currentResponse: newActiveJobId ? (newJobResponses[newActiveJobId] || '') : '',
+          currentThinking: newActiveJobId ? (newJobThinking[newActiveJobId] || '') : '',
+        } : {}),
+        events: [...prev.events, { type: 'done', data, timestamp: Date.now() }],
+      };
+    });
+  } else if (type === 'error') {
+    delete backfilledSeqs[jobId];
+    const errorMessage = (data.message ?? '') as string;
+    update((prev) => {
+      const newActiveJobIds = prev.activeJobIds.filter(id => id !== jobId);
+      const newStatus = newActiveJobIds.length > 0 ? prev.status : 'error';
+      return {
+        ...prev,
+        status: newStatus,
+        activeJobIds: newActiveJobIds,
+        lastCompletedJobId: jobId,
+        lastErrorByJob: errorMessage
+          ? { ...prev.lastErrorByJob, [jobId]: errorMessage }
+          : prev.lastErrorByJob,
+        events: [...prev.events, { type: 'error', data, timestamp: Date.now() }],
+      };
+    });
   } else {
     // tool_use, question, etc. — just append to events
     update((prev) => ({
@@ -320,8 +384,9 @@ function connectBridge(bridgeUrl: string) {
     if (isStale()) return;
     checkBridgeHealth(bridgeUrl).then((health) => {
       if (isStale()) return;
-      const activeJobs = health?.activeJobs ?? (health?.activeJob ? [health.activeJob] : []);
-      const serverActiveIds = new Set(activeJobs.map((j: { id: string }) => j.id));
+      const activeJobs: Array<{ id: string; status: string; threadId?: string }> =
+        health?.activeJobs ?? (health?.activeJob ? [health.activeJob] : []);
+      const serverActiveIds = new Set(activeJobs.map(j => j.id));
       const serverRecentJobs: Array<{ id: string; status: string; error?: string }> =
         (health as Record<string, unknown>)?.recentJobs as Array<{ id: string; status: string; error?: string }> ?? [];
       const recentById = new Map(serverRecentJobs.map(j => [j.id, j]));
@@ -343,21 +408,29 @@ function connectBridge(bridgeUrl: string) {
           if (!reconciledActiveIds.includes(id)) reconciledActiveIds.push(id);
         }
 
+        // Build jobId → threadId map from enriched /status response
+        const jobThreads: Record<string, string> = {};
+        for (const j of activeJobs) {
+          if (j.threadId) jobThreads[j.id] = j.threadId;
+        }
+
         return {
           ...prev,
           isConnected: true,
           status: hasActiveJobs ? 'streaming' : (staleJobIds.length > 0 ? 'idle' : (prev.status === 'disconnected' ? 'idle' : prev.status)),
           activeJobId: hasActiveJobs ? activeJobs[activeJobs.length - 1]!.id : (reconciledActiveIds.length > 0 ? reconciledActiveIds[reconciledActiveIds.length - 1]! : null),
           activeJobIds: reconciledActiveIds,
+          activeJobThreads: jobThreads,
           lastErrorByJob: reconciledErrors,
           lastCompletedJobId: staleJobIds.length > 0 ? staleJobIds[staleJobIds.length - 1]! : prev.lastCompletedJobId,
         };
       });
 
-      // Backfill active jobs to recover events missed during disconnect
-      if (hasActiveJobs) {
-        const jobIds = Array.from(serverActiveIds);
-        runBackfill(bridgeUrl, jobIds, gen).catch(() => {});
+      // Backfill active jobs AND recently-stale jobs to recover events missed during disconnect
+      const staleJobIds = store.activeJobIds.filter(id => !serverActiveIds.has(id));
+      const backfillIds = [...Array.from(serverActiveIds), ...staleJobIds];
+      if (backfillIds.length > 0) {
+        runBackfill(bridgeUrl, backfillIds, gen).catch(() => {});
       }
     });
   });
@@ -367,11 +440,13 @@ function connectBridge(bridgeUrl: string) {
     const data = JSON.parse(e.data);
     const jobId = data.jobId as string;
     if (shouldBufferOrSkip(jobId, data)) return;
+    const threadId = data.threadId as string | undefined;
     update((prev) => ({
       ...prev,
       status: 'streaming',
       activeJobId: jobId,
       activeJobIds: prev.activeJobIds.includes(jobId) ? prev.activeJobIds : [...prev.activeJobIds, jobId],
+      activeJobThreads: threadId ? { ...prev.activeJobThreads, [jobId]: threadId } : prev.activeJobThreads,
       jobResponses: { ...prev.jobResponses, [jobId]: prev.jobResponses[jobId] ?? '' },
       jobThinking: { ...prev.jobThinking, [jobId]: prev.jobThinking[jobId] ?? '' },
       currentResponse: prev.jobResponses[jobId] ?? '',
@@ -455,10 +530,12 @@ function connectBridge(bridgeUrl: string) {
 
       const newJobResponses = { ...prev.jobResponses };
       const newJobThinking = { ...prev.jobThinking };
+      const newActiveJobThreads = { ...prev.activeJobThreads };
       const completedResponse = completedJobId ? newJobResponses[completedJobId] : undefined;
       if (completedJobId) {
         delete newJobResponses[completedJobId];
         delete newJobThinking[completedJobId];
+        delete newActiveJobThreads[completedJobId];
       }
 
       const newActiveJobId = completedJobId === prev.activeJobId
@@ -529,6 +606,7 @@ function connectBridge(bridgeUrl: string) {
       status: prev.status === 'error' ? 'error' : 'idle',
       activeJobId: null,
       activeJobIds: [],
+      activeJobThreads: {},
       currentResponse: '',
       currentThinking: '',
       jobResponses: {},

@@ -15,9 +15,9 @@ export type BridgeStatus = {
   projectId?: string;
   devOrigin?: string;
   activeJob: { id: string; status: string } | null;
-  activeJobs?: { id: string; status: string }[];
+  activeJobs?: { id: string; status: string; threadId?: string; annotationIds?: string[]; color?: string }[];
   queueDepth: number;
-  recentJobs?: { id: string; status: string; completedAt: number; error?: string; threadId?: string }[];
+  recentJobs?: { id: string; status: string; completedAt: number; error?: string; threadId?: string; annotationIds?: string[] }[];
 };
 
 export type McpDetectionResult = {

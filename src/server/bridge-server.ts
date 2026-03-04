@@ -175,7 +175,7 @@ export async function createPopmelt(
   // Recent completed jobs (for reconnect state recovery)
   const RECENT_JOBS_MAX = 20;
   const RECENT_JOBS_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  type RecentJob = { id: string; status: 'done' | 'error'; completedAt: number; error?: string; threadId?: string };
+  type RecentJob = { id: string; status: 'done' | 'error'; completedAt: number; error?: string; threadId?: string; annotationIds?: string[] };
   const recentJobs: RecentJob[] = [];
 
   // Canvas manifest cache (5-second TTL)
@@ -427,7 +427,7 @@ export async function createPopmelt(
       );
 
       // Track for reconnect recovery
-      recentJobs.push({ id: job.id, status: 'done', completedAt: Date.now(), threadId: job.threadId });
+      recentJobs.push({ id: job.id, status: 'done', completedAt: Date.now(), threadId: job.threadId, annotationIds: job.annotationIds });
     } else {
       console.error(`${tag} Error: ${spawnResult.error}`);
       job.status = 'error';
@@ -457,7 +457,7 @@ export async function createPopmelt(
       );
 
       // Track for reconnect recovery
-      recentJobs.push({ id: job.id, status: 'error', completedAt: Date.now(), error: spawnResult.error, threadId: job.threadId });
+      recentJobs.push({ id: job.id, status: 'error', completedAt: Date.now(), error: spawnResult.error, threadId: job.threadId, annotationIds: job.annotationIds });
     }
 
     // Prune old entries
@@ -841,7 +841,7 @@ export async function createPopmelt(
       activeJob: allActive[0]
         ? { id: allActive[0].id, status: allActive[0].status }
         : null,
-      activeJobs: allActive.map(j => ({ id: j.id, status: j.status })),
+      activeJobs: allActive.map(j => ({ id: j.id, status: j.status, threadId: j.threadId, annotationIds: j.annotationIds, color: j.color })),
       queueDepth: queue.depth,
       recentJobs,
     });

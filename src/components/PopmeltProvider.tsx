@@ -16,7 +16,7 @@ import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hoo
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import { usePathname } from '../hooks/usePathname';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
-import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
+import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchJobEvents, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
@@ -348,27 +348,41 @@ export function PopmeltProvider({
   }, [openThreadId]);
 
   // Per-job in-flight tracking: jobId → { annotationIds, styleSelectors, color, threadId }
-  // Persisted in sessionStorage so state survives HMR remounts (Astro/Vite tear down React islands).
+  // Persisted in localStorage so state is shared across tabs on the same origin
+  // and survives both HMR remounts and full page refreshes.
   const IN_FLIGHT_STORAGE_KEY = 'popmelt-in-flight-jobs';
   const [inFlightJobs, setInFlightJobs] = useState<Record<string, { annotationIds: string[]; styleSelectors: string[]; color: string; threadId?: string }>>(() => {
     try {
-      const stored = sessionStorage.getItem(IN_FLIGHT_STORAGE_KEY);
+      const stored = localStorage.getItem(IN_FLIGHT_STORAGE_KEY);
       return stored ? JSON.parse(stored) : {};
     } catch {
       return {};
     }
   });
 
-  // Sync inFlightJobs to sessionStorage
+  // Sync inFlightJobs to localStorage
   useEffect(() => {
     try {
       if (Object.keys(inFlightJobs).length > 0) {
-        sessionStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(inFlightJobs));
+        localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(inFlightJobs));
       } else {
-        sessionStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
+        localStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
       }
     } catch {}
   }, [inFlightJobs]);
+
+  // Cross-tab sync: pick up changes made by other tabs
+  useEffect(() => {
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key !== IN_FLIGHT_STORAGE_KEY) return;
+      try {
+        const updated = e.newValue ? JSON.parse(e.newValue) : {};
+        setInFlightJobs(updated);
+      } catch {}
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
 
   // Persistent map of jobId→annotationIds (survives job completion, used for hover highlight)
   const jobAnnotationMapRef = useRef<Map<string, string[]>>(new Map());
@@ -617,9 +631,12 @@ export function PopmeltProvider({
     }
   }, [bridge.lastCompletedJobId]);
 
+  // Track which done events have been processed (shared by reconciliation + live SSE handler)
+  const processedDoneJobIdsRef = useRef(new Set<string>());
+
   // Safety net: reconcile inFlightJobs against the bridge server after (re)connect.
   // When Vite HMR re-executes useBridgeConnection.ts, the module-level store resets
-  // (no lastCompletedJobId, no events), but sessionStorage still has stale inFlightJobs.
+  // (no lastCompletedJobId, no events), but localStorage may still have stale inFlightJobs.
   // Validate once per connection by checking the server's actual active job list.
   const hasReconciledJobsRef = useRef(false);
   useEffect(() => {
@@ -630,31 +647,94 @@ export function PopmeltProvider({
     if (hasReconciledJobsRef.current) return;
     hasReconciledJobsRef.current = true;
 
-    const inFlightIds = Object.keys(inFlightJobs);
-    if (inFlightIds.length === 0) return;
+    // Reconcile immediately — the SSE layer handles its own job tracking independently,
+    // so there's no need to delay for job_started events.
+    checkBridgeHealth(resolvedBridgeUrl).then(async (health) => {
+      if (!health) return;
+      const activeJobs = health.activeJobs ?? [];
+      const recentJobs = health.recentJobs ?? [];
+      const serverActiveIds = new Set<string>(
+        activeJobs.map((j: { id: string }) => j.id),
+      );
 
-    // Small delay: let job_started SSE events arrive before checking
-    const timer = setTimeout(() => {
-      checkBridgeHealth(resolvedBridgeUrl).then(health => {
-        if (!health) return;
-        const serverActiveIds = new Set<string>(
-          (health.activeJobs ?? []).map((j: { id: string }) => j.id),
-        );
-        setInFlightJobs(prev => {
-          const staleIds = Object.keys(prev).filter(id => !serverActiveIds.has(id));
-          if (staleIds.length === 0) return prev;
-          const next = { ...prev };
-          for (const id of staleIds) delete next[id];
-          return next;
-        });
+      // Collect locally-tracked job IDs (including provisional _pending_ keys)
+      // before we mutate state, so we know which recentJobs to recover.
+      const localSnapshot: Record<string, { annotationIds: string[] }> =
+        JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+
+      // Build a set of annotation IDs from local in-flight entries for matching
+      const localAnnotationIds = new Set<string>();
+      for (const entry of Object.values(localSnapshot)) {
+        if (entry.annotationIds) for (const id of entry.annotationIds) localAnnotationIds.add(id);
+      }
+
+      setInFlightJobs(prev => {
+        const next = { ...prev };
+        // Prune stale entries (locally tracked but no longer active on server).
+        // Keep provisional `_pending_` entries — they represent HTTP requests still in flight.
+        for (const id of Object.keys(next)) {
+          if (id.startsWith('_pending_')) continue;
+          if (!serverActiveIds.has(id)) delete next[id];
+        }
+        // Adopt server-active jobs missing locally (e.g. after refresh or from another tab)
+        for (const j of activeJobs) {
+          if (!next[j.id] && (j.annotationIds?.length || j.threadId)) {
+            next[j.id] = {
+              annotationIds: j.annotationIds ?? [],
+              styleSelectors: [],
+              color: j.color ?? '#888',
+              threadId: j.threadId,
+            };
+          }
+        }
+        // Clean up _pending_ entries whose annotations are covered by a recentJob
+        // (the HTTP request completed, job ran, and finished during refresh window)
+        const recentAnnotationIds = new Set<string>();
+        for (const rj of recentJobs) {
+          if (rj.annotationIds) for (const id of rj.annotationIds) recentAnnotationIds.add(id);
+        }
+        for (const id of Object.keys(next)) {
+          if (!id.startsWith('_pending_')) continue;
+          const entry = next[id];
+          if (entry && entry.annotationIds.some(aid => recentAnnotationIds.has(aid))) {
+            delete next[id];
+          }
+        }
+        return next;
       });
-    }, 500);
 
-    return () => clearTimeout(timer);
-  }, [bridge.isConnected, resolvedBridgeUrl]);
+      // Recover resolutions for jobs that completed during the refresh window.
+      // These appear in recentJobs but their done event was never processed.
+      for (const recent of recentJobs) {
+        if (recent.status !== 'done') continue;
+        if (!recent.annotationIds?.length) continue;
+        // Only recover if we were tracking this job locally (by annotationId overlap)
+        if (!recent.annotationIds.some(id => localAnnotationIds.has(id))) continue;
+        // Skip if already processed (e.g. from SSE backfill)
+        if (processedDoneJobIdsRef.current.has(recent.id)) continue;
+
+        try {
+          const result = await fetchJobEvents(resolvedBridgeUrl, recent.id);
+          if (!result) continue;
+          const doneEvent = result.events.find(e => e.type === 'done');
+          if (doneEvent && Array.isArray(doneEvent.resolutions)) {
+            processedDoneJobIdsRef.current.add(recent.id);
+            dispatch({
+              type: 'APPLY_RESOLUTIONS',
+              payload: {
+                resolutions: doneEvent.resolutions as AnnotationResolution[],
+                threadId: (doneEvent.threadId as string) ?? undefined,
+              },
+            });
+          }
+        } catch {
+          // Event buffer may have expired — thread panel will still show persisted data
+        }
+      }
+    });
+  }, [bridge.isConnected, resolvedBridgeUrl, dispatch]);
 
   // Handle resolutions from done events (process ALL unprocessed, not just latest)
-  const processedDoneJobIdsRef = useRef(new Set<string>());
   useEffect(() => {
     const doneEvents = bridge.events.filter(e => e.type === 'done' && e.data.resolutions);
     for (const event of doneEvents) {
@@ -711,16 +791,9 @@ export function PopmeltProvider({
     }
   }, [bridge.incrementalResolutions.length]);
 
-  // On reconnect to idle bridge, clear any stale in-flight state
-  const prevBridgeStatus = useRef(bridge.status);
-  useEffect(() => {
-    const prev = prevBridgeStatus.current;
-    prevBridgeStatus.current = bridge.status;
-
-    if (prev === 'disconnected' && bridge.status === 'idle') {
-      setInFlightJobs({});
-    }
-  }, [bridge.status]);
+  // (Stale in-flight cleanup is handled by the reconciliation effect above —
+  // a blanket clear on disconnected→idle was racing with reconciliation and
+  // preventing resolution recovery for jobs that completed during refresh.)
 
   const handleScreenshot = useCallback(async (): Promise<boolean> => {
     const canvas = canvasRef.current;
@@ -842,9 +915,30 @@ export function PopmeltProvider({
       ? screenshotMap
       : screenshotMap.get(currentPathname) ?? screenshotMap;
 
+    // Pre-compute annotation/style IDs before the async send
+    const sentAnnotationIds = activeAnnotations.map(a => a.id);
+    const sentStyleSelectors = state.styleModifications.filter(m => !m.captured).map(m => m.selector);
+    const hexColor = cssColorToHex(state.activeColor);
+
+    // Write a provisional in-flight entry BEFORE the HTTP request so badge state
+    // survives even if the user refreshes during the roundtrip. Uses a temp key
+    // that gets swapped for the real jobId after the response.
+    const provisionalKey = `_pending_${Date.now()}`;
+    const provisionalEntry = {
+      annotationIds: sentAnnotationIds,
+      styleSelectors: sentStyleSelectors,
+      color: state.activeColor,
+      threadId: undefined as string | undefined,
+    };
+    try {
+      const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+      prev[provisionalKey] = provisionalEntry;
+      localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+    } catch {}
+    setInFlightJobs(prev => ({ ...prev, [provisionalKey]: provisionalEntry }));
+
     // Send to bridge
     try {
-      const hexColor = cssColorToHex(state.activeColor);
       const { jobId, threadId: assignedThreadId } = await sendToBridge(
         screenshots, feedbackJson, resolvedBridgeUrl, hexColor, provider, currentModel.id,
         pastedImages.size > 0 ? pastedImages : undefined,
@@ -861,18 +955,19 @@ export function PopmeltProvider({
         pageScreenshotsRef.current.delete(page);
       }
 
-      // Track which annotations and style modifications are in-flight for this job
-      const sentAnnotationIds = activeAnnotations.map(a => a.id);
-      const sentStyleSelectors = state.styleModifications.filter(m => !m.captured).map(m => m.selector);
-      setInFlightJobs((prev) => ({
-        ...prev,
-        [jobId]: {
-          annotationIds: sentAnnotationIds,
-          styleSelectors: sentStyleSelectors,
-          color: state.activeColor,
-          threadId: assignedThreadId,
-        },
-      }));
+      // Swap provisional key for real jobId
+      const jobEntry = { ...provisionalEntry, threadId: assignedThreadId };
+      try {
+        const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+        delete prev[provisionalKey];
+        prev[jobId] = jobEntry;
+        localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+      } catch {}
+
+      setInFlightJobs(prev => {
+        const { [provisionalKey]: _, ...rest } = prev;
+        return { ...rest, [jobId]: jobEntry };
+      });
 
       dispatch({ type: 'MARK_CAPTURED' });
 
@@ -889,6 +984,16 @@ export function PopmeltProvider({
 
       return true;
     } catch (err) {
+      // Clean up provisional entry on failure
+      try {
+        const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+        delete prev[provisionalKey];
+        localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+      } catch {}
+      setInFlightJobs(prev => {
+        const { [provisionalKey]: _, ...rest } = prev;
+        return rest;
+      });
       console.error('[Pare] Failed to send to bridge:', err);
       return false;
     }
@@ -896,51 +1001,69 @@ export function PopmeltProvider({
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
+    // Inherit the thread's original color
+    const threadColor = Object.values(inFlightJobsRef.current).find(j => j.threadId === threadId)?.color
+      ?? state.annotations.find(a => a.threadId === threadId)?.color
+      ?? state.activeColor;
+
+    // Identify thread annotations to re-track
+    const threadAnnotations = state.annotations.filter(
+      a => a.threadId === threadId && (a.status === 'waiting_input' || a.status === 'resolved' || a.status === 'needs_review')
+    );
+    const reTrackedIds = threadAnnotations.map(a => a.id);
+
+    // Provisional entry BEFORE the HTTP request
+    const provisionalKey = `_pending_reply_${Date.now()}`;
+    const provisionalEntry = {
+      annotationIds: reTrackedIds,
+      styleSelectors: [] as string[],
+      color: threadColor,
+      threadId,
+    };
+    try {
+      const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+      prev[provisionalKey] = provisionalEntry;
+      localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+    } catch {}
+    setInFlightJobs(prev => ({ ...prev, [provisionalKey]: provisionalEntry }));
+
     try {
       const hexColor = cssColorToHex(state.activeColor);
       const { jobId } = await sendReplyToBridge(threadId, reply, resolvedBridgeUrl, hexColor, provider, currentModel.id, images, getSourceId());
 
-      // Inherit the thread's original color so the toolbar stays in sync with the annotation
-      const threadColor = Object.values(inFlightJobsRef.current).find(j => j.threadId === threadId)?.color
-        ?? state.annotations.find(a => a.threadId === threadId)?.color
-        ?? state.activeColor;
+      // Swap provisional key for real jobId
+      const replyJobEntry = { ...provisionalEntry };
+      try {
+        const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+        delete prev[provisionalKey];
+        prev[jobId] = replyJobEntry;
+        localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+      } catch {}
 
-      // Track the new continuation job (no specific annotations — reuses thread context)
-      setInFlightJobs(prev => ({
-        ...prev,
-        [jobId]: {
-          annotationIds: [],
-          styleSelectors: [],
-          color: threadColor,
-          threadId,
-        },
-      }));
+      setInFlightJobs(prev => {
+        const { [provisionalKey]: _, ...rest } = prev;
+        return { ...rest, [jobId]: replyJobEntry };
+      });
 
-      // Transition thread annotations back to in_flight (from waiting_input, resolved, or needs_review)
-      const threadAnnotations = state.annotations.filter(
-        a => a.threadId === threadId && (a.status === 'waiting_input' || a.status === 'resolved' || a.status === 'needs_review')
-      );
       if (threadAnnotations.length > 0) {
         dispatch({
           type: 'SET_ANNOTATION_STATUS',
-          payload: { ids: threadAnnotations.map(a => a.id), status: 'in_flight' },
-        });
-        // Re-track them as in-flight for the new job
-        setInFlightJobs(prev => {
-          const job = prev[jobId];
-          if (!job) return prev;
-          return {
-            ...prev,
-            [jobId]: {
-              ...job,
-              annotationIds: [...job.annotationIds, ...threadAnnotations.map(a => a.id)],
-            },
-          };
+          payload: { ids: reTrackedIds, status: 'in_flight' },
         });
       }
 
       bridge.dismissQuestion(threadId);
     } catch (err) {
+      // Clean up provisional entry on failure
+      try {
+        const prev = JSON.parse(localStorage.getItem(IN_FLIGHT_STORAGE_KEY) || '{}');
+        delete prev[provisionalKey];
+        localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(prev));
+      } catch {}
+      setInFlightJobs(prev => {
+        const { [provisionalKey]: _, ...rest } = prev;
+        return rest;
+      });
       console.error('[Pare] Failed to send reply:', err);
     }
   }, [state.activeColor, state.annotations, resolvedBridgeUrl, bridge.dismissQuestion, dispatch, provider, currentModel.id]);
@@ -1048,11 +1171,16 @@ export function PopmeltProvider({
   // Only matches jobs belonging to this thread — no fallback to avoid cross-thread leaking
   const threadActiveJobId = useMemo(() => {
     if (!openThreadId) return null;
+    // Check inFlightJobs first (has richer data from the submit callback)
     for (const [jobId, job] of Object.entries(inFlightJobs)) {
       if (job.threadId === openThreadId) return jobId;
     }
+    // Fall back to bridge store's activeJobThreads (populated from enriched /status on reconnect)
+    for (const [jobId, threadId] of Object.entries(bridge.activeJobThreads)) {
+      if (threadId === openThreadId) return jobId;
+    }
     return null;
-  }, [openThreadId, inFlightJobs]);
+  }, [openThreadId, inFlightJobs, bridge.activeJobThreads]);
 
   const threadAnnotation = openThreadId ? state.annotations.find(a => a.threadId === openThreadId) : undefined;
   const threadAnnotationNumber = threadAnnotation ? state.annotations.indexOf(threadAnnotation) + 1 : undefined;
