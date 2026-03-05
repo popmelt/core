@@ -3,7 +3,7 @@
   "version": "0.6.3",
   "description": "The design collaboration layer for AI coding agents",
   "license": "PolyForm-Shield-1.0.0",
-  "author": "Popmelt <hello@popmelt.com> (https://popmelt.com)",
+  "author": "Popmelt <reb@popmelt.com> (https://popmelt.com)",
   "homepage": "https://github.com/popmelt/core",
   "bugs": {
     "url": "https://github.com/popmelt/core/issues"
