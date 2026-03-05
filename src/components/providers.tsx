@@ -39,9 +39,9 @@ export const CLAUDE_MODELS = [
 ] as const;
 
 export const CODEX_MODELS = [
+  { id: 'gpt-5.4', label: 'GPT 5.4' },
   { id: 'gpt-5.3-codex', label: 'Codex 5.3' },
   { id: 'gpt-5.3-codex-spark', label: 'Spark 5.3' },
-  { id: 'gpt-5.1-codex-mini', label: 'Mini 5.1' },
 ] as const;
 
 export const MODEL_MAP = { claude: CLAUDE_MODELS, codex: CODEX_MODELS } as const;

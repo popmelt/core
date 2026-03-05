@@ -11,7 +11,17 @@ const BASE_RESET = `
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
-/* Break :host font inheritance for component previews — let mirrored host
+/* Direct reset for all Popmelt chrome elements.
+   Beats broad selectors from mirrored host stylesheets (e.g. div, span, *).
+   Inline styles on individual elements still win (higher specificity). */
+:host *:not([data-popmelt-panel]):not([data-popmelt-panel] *) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #1f2937;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+/* Break font inheritance for component previews — let mirrored host
    page styles (Tailwind, globals) apply instead of Popmelt's monospace. */
 [data-popmelt-panel] {
   font: 16px / 1.5 system-ui, -apple-system, sans-serif;

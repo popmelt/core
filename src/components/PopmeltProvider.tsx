@@ -65,10 +65,20 @@ async function softNavigate(page: string, navigateFn?: (url: string) => void | P
   });
 }
 
-// Cross-provider equivalence: index 0 = fast, index 1 = thorough
+// Cross-provider equivalence map (by index → index)
+// Claude:  0 Opus 4.6,  1 Sonn 4.6
+// Codex:   0 GPT 5.4,   1 Codex 5.3,  2 Spark 5.3
+const EQUIV_CLAUDE_TO_CODEX: Record<number, number> = { 0: 0, 1: 1 };
+const EQUIV_CODEX_TO_CLAUDE: Record<number, number> = { 0: 0, 1: 1, 2: 1 };
+
 function equivalentModelIndex(fromProvider: string, toProvider: string, currentIndex: number): number {
-  const fromModels = fromProvider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
   const toModels = toProvider === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  if (fromProvider === 'claude' && toProvider === 'codex') {
+    return EQUIV_CLAUDE_TO_CODEX[currentIndex] ?? Math.min(currentIndex, toModels.length - 1);
+  }
+  if (fromProvider === 'codex' && toProvider === 'claude') {
+    return EQUIV_CODEX_TO_CLAUDE[currentIndex] ?? Math.min(currentIndex, toModels.length - 1);
+  }
   return Math.min(currentIndex, toModels.length - 1);
 }
 
