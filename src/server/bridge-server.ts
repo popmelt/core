@@ -18,6 +18,7 @@ import { buildPrompt, buildReplyPrompt, formatFeedbackContext, parseNovelPattern
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
 import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, PersistedSegment, Provider, SSEClient, SSEEvent } from './types';
+import { VERSION } from '../version';
 
 const DEFAULT_PORT = 1111;
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
@@ -537,6 +538,11 @@ export async function createPopmelt(
         handleEvents(req, res);
       } else if (req.method === 'GET' && path === '/status') {
         handleStatus(res);
+      } else if (req.method === 'PATCH' && path === '/config') {
+        await handlePatchConfig(req, res);
+      } else if (req.method === 'POST' && path === '/shutdown') {
+        sendJson(res, 200, { ok: true });
+        setTimeout(() => process.exit(0), 100);
       } else if (req.method === 'GET' && path === '/capabilities') {
         sendJson(res, 200, { providers: capabilities });
       } else if (req.method === 'POST' && path === '/mcp/install') {
@@ -869,8 +875,8 @@ export async function createPopmelt(
     // Send initial connection event
     res.write(`event: connected\ndata: {"status":"connected"}\n\n`);
 
-    // Infer devOrigin from first SSE connection if not yet set
-    if (!devOrigin && req.headers.origin && isLocalhostOrigin(req.headers.origin)) {
+    // Infer/update devOrigin from SSE connection origin
+    if (req.headers.origin && isLocalhostOrigin(req.headers.origin) && devOrigin !== req.headers.origin) {
       devOrigin = req.headers.origin;
     }
 
@@ -888,6 +894,7 @@ export async function createPopmelt(
     const allActive = queue.allActive;
     sendJson(res, 200, {
       ok: true,
+      version: VERSION,
       projectId,
       devOrigin,
       activeJob: allActive[0]
@@ -897,6 +904,23 @@ export async function createPopmelt(
       queueDepth: queue.depth,
       recentJobs,
     });
+  }
+
+  async function handlePatchConfig(req: IncomingMessage, res: ServerResponse) {
+    const body = await new Promise<string>((resolve) => {
+      let data = '';
+      req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      req.on('end', () => resolve(data));
+    });
+    try {
+      const config = JSON.parse(body);
+      if (typeof config.devOrigin === 'string') {
+        devOrigin = config.devOrigin || null;
+      }
+      sendJson(res, 200, { ok: true, devOrigin });
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' });
+    }
   }
 
   async function handleCancel(req: IncomingMessage, res: ServerResponse) {

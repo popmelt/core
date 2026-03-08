@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createPopmelt, probeBridge } from './bridge-server';
 import type { PopmeltHandle, PopmeltOptions } from './types';
+import { VERSION } from '../version';
 
 export type { PopmeltHandle, PopmeltOptions };
 
@@ -39,6 +40,23 @@ async function startDetached(
   for (let p = basePort; p < basePort + 10; p++) {
     const status = await probeBridge(p);
     if (status && status.projectId === projectId) {
+      // Version mismatch — shut down stale bridge and spawn fresh
+      if (status.version && status.version !== VERSION) {
+        try { await fetch(`http://127.0.0.1:${p}/shutdown`, { method: 'POST' }); } catch {}
+        await new Promise((r) => setTimeout(r, 500));
+        break;
+      }
+      // Refresh devOrigin if the app came back on a different port
+      const wantedOrigin = options.devOrigin;
+      if (wantedOrigin && status.devOrigin !== wantedOrigin) {
+        try {
+          await fetch(`http://127.0.0.1:${p}/config`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ devOrigin: wantedOrigin }),
+          });
+        } catch {}
+      }
       process.env.POPMELT_BRIDGE_PORT = String(p);
       return { port: p, projectId, close: async () => {} };
     }
