@@ -49,20 +49,13 @@ export function popmelt(options?: PopmeltPluginOptions): Plugin {
             projectRoot: options?.projectRoot,
             devOrigin,
             force: true, // We know we're in dev — skip NODE_ENV check
+            detached: true, // Bridge survives Vite restarts
           });
 
           bridgePort = handle.port;
           bridgeClose = handle.close;
 
           console.log(`[popmelt] bridge ready at http://localhost:${bridgePort}`);
-
-          // Clean shutdown when Vite server closes
-          server.httpServer?.on('close', () => {
-            if (bridgeClose) {
-              bridgeClose().catch(() => {});
-              bridgeClose = null;
-            }
-          });
         } catch (err) {
           // Don't break the dev server if bridge fails to start
           console.warn('[popmelt] bridge failed to start:', (err as Error).message ?? err);

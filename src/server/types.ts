@@ -137,6 +137,16 @@ export type SSEClient = {
   sourceId?: string;
 };
 
+// Persisted segment types — chronological tool/text interleaving in thread messages
+export type ToolGroupItem = {
+  label: string;    // "Reading package.json", "rg -n pattern"
+  detail?: string;  // full command or full file path
+};
+
+export type PersistedSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool_group'; tool: string; items: ToolGroupItem[] };
+
 // Thread model types
 export type ThreadMessage = {
   role: 'human' | 'assistant';
@@ -153,6 +163,7 @@ export type ThreadMessage = {
   responseText?: string;
   resolutions?: AnnotationResolution[];
   toolsUsed?: string[];
+  segments?: PersistedSegment[];
   sessionId?: string;
   question?: string;         // assistant asks a question
   replyToQuestion?: string;  // human replies to a question

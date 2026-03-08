@@ -24,6 +24,7 @@ export type SpawnResult = {
   success: boolean;
   error?: string;
   fileEdits?: FileEdit[];
+  toolsUsed?: string[];
 };
 
 const TEXT_EXTENSIONS = new Set([

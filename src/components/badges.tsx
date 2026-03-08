@@ -307,18 +307,18 @@ export function AnnotationBadges({
                     </>
                   )}
                 </svg>
-                <span style={{ opacity: 0.7 }}>{THINKING_WORDS[wordIndex]}</span>
+                <span style={{ opacity: 0.7, color: 'inherit' }}>{THINKING_WORDS[wordIndex]}</span>
               </>
             ) : (
               <>
                 {pos.isNeedsReview ? (
-                  <span style={{ fontWeight: 700 }}>?</span>
+                  <span style={{ fontWeight: 700, color: 'inherit' }}>?</span>
                 ) : (
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <polyline points="4 12 10 18 20 6" />
                   </svg>
                 )}
-                <span style={{ opacity: 0.7 }}>
+                <span style={{ opacity: 0.7, color: 'inherit' }}>
                   {pos.replyCount > 0
                     ? `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`
                     : 'Cancelled'}

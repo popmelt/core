@@ -61,6 +61,17 @@ export default defineConfig([
     clean: false,
     tsconfig: 'tsconfig.build.json',
   },
+  // Detached bridge entry (Node.js)
+  {
+    entry: { 'bridge-entry': 'src/server/bridge-entry.ts' },
+    format: 'esm',
+    dts: false,
+    minify: true,
+    platform: 'node',
+    outDir: 'dist',
+    clean: false,
+    tsconfig: 'tsconfig.build.json',
+  },
   // Vite + Astro plugins (Node.js)
   {
     entry: {

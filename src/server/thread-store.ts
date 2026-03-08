@@ -92,6 +92,18 @@ export class ThreadFileStore {
     await this.persist();
   }
 
+  async listRecent(limit = 5): Promise<Array<{ id: string; createdAt: number; updatedAt: number; preview: string; messageCount: number; elementIdentifiers: string[] }>> {
+    const store = await this.load();
+    const threads = Object.values(store.threads);
+    threads.sort((a, b) => b.updatedAt - a.updatedAt);
+
+    return threads.slice(0, limit).map(t => {
+      const firstHuman = t.messages.find(m => m.role === 'human');
+      const preview = firstHuman?.feedbackSummary || '[thread]';
+      return { id: t.id, createdAt: t.createdAt, updatedAt: t.updatedAt, preview, messageCount: t.messages.length, elementIdentifiers: t.elementIdentifiers };
+    });
+  }
+
   async getThreadHistory(threadId: string, maxMessages = 6): Promise<ThreadMessage[]> {
     const thread = await this.getThread(threadId);
     if (!thread || thread.messages.length === 0) return [];

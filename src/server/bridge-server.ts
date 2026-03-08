@@ -17,7 +17,7 @@ import { parseMultipart } from './multipart';
 import { buildPrompt, buildReplyPrompt, formatFeedbackContext, parseNovelPatterns, parseQuestion, parseResolutions } from './prompt-builder';
 import { JobQueue } from './queue';
 import { ThreadFileStore } from './thread-store';
-import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, Provider, SSEClient, SSEEvent } from './types';
+import type { McpDetection, PopmeltHandle, PopmeltOptions, FeedbackPayload, Job, PersistedSegment, Provider, SSEClient, SSEEvent } from './types';
 
 const DEFAULT_PORT = 1111;
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'Bash(curl:*)'];
@@ -32,6 +32,49 @@ function isLocalhostOrigin(origin: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+/** Build chronological PersistedSegment[] from buffered SSE events */
+function buildPersistedSegments(events: Array<SSEEvent & { seq: number }>): PersistedSegment[] {
+  const segments: PersistedSegment[] = [];
+  for (const e of events) {
+    if (e.type === 'delta') {
+      const text = e.text;
+      if (!text) continue;
+      const last = segments[segments.length - 1];
+      if (last && last.kind === 'text') {
+        last.text += text;
+      } else {
+        segments.push({ kind: 'text', text });
+      }
+    } else if (e.type === 'tool_use') {
+      const tool = e.tool || '';
+      const file = e.file ?? undefined;
+      const content = e.content ?? undefined;
+      const basename = file ? file.split('/').pop() ?? file : undefined;
+      let label: string;
+      switch (tool) {
+        case 'Read': label = basename ? `Reading ${basename}` : 'Reading file'; break;
+        case 'Edit': label = basename ? `Editing ${basename}` : 'Editing file'; break;
+        case 'Write': label = basename ? `Writing ${basename}` : 'Writing file'; break;
+        case 'Bash': label = content ? content.split('\n')[0]!.trim().slice(0, 60) : 'Running command'; break;
+        case 'Glob': label = 'Searching files'; break;
+        case 'Grep': label = 'Searching code'; break;
+        case 'WebFetch': label = 'Fetching page'; break;
+        case 'WebSearch': label = 'Searching web'; break;
+        default: label = tool ? `Using ${tool}` : 'tool'; break;
+      }
+      const detail = file ?? content ?? undefined;
+      const last = segments[segments.length - 1];
+      if (last && last.kind === 'tool_group' && last.tool === tool) {
+        last.items.push({ label, detail });
+      } else {
+        segments.push({ kind: 'tool_group', tool, items: [{ label, detail }] });
+      }
+    }
+    // Skip thinking, job_started, done, error, etc.
+  }
+  return segments;
 }
 
 function setCors(req: IncomingMessage, res: ServerResponse) {
@@ -65,7 +108,7 @@ function sendSSE(client: SSEClient, event: SSEEvent) {
 }
 
 /** Probe a running bridge at the given port. Returns parsed /status JSON or null. */
-async function probeBridge(port: number): Promise<Record<string, unknown> | null> {
+export async function probeBridge(port: number): Promise<Record<string, unknown> | null> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 500);
@@ -322,10 +365,14 @@ export async function createPopmelt(
         }
       }
 
-      // Derive toolsUsed from file edits for the thread record
+      // Derive toolsUsed from file edits (Claude) or spawner-collected labels (Codex)
       const toolsUsed = spawnResult.fileEdits && spawnResult.fileEdits.length > 0
         ? spawnResult.fileEdits.map(e => `${e.tool} ${e.file_path.split('/').pop()}`)
-        : undefined;
+        : spawnResult.toolsUsed;
+
+      // Build chronological segments from buffered events
+      const buffered = queue.getBufferedEvents(job.id);
+      const segments = buffered ? buildPersistedSegments(buffered.events) : undefined;
 
       // Append assistant message to thread store
       if (job.threadId) {
@@ -338,6 +385,7 @@ export async function createPopmelt(
           question: question ?? undefined,
           sessionId: spawnResult.sessionId,
           toolsUsed,
+          segments: segments && segments.length > 0 ? segments : undefined,
           model: job.model,
           provider: job.provider,
         });
@@ -522,6 +570,10 @@ export async function createPopmelt(
         }
       } else if (req.method === 'GET' && rawPath.startsWith('/files/')) {
         await handleServeFile(rawPath.slice('/files/'.length), res);
+      } else if (req.method === 'GET' && path === '/threads/recent') {
+        const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '5', 10) || 5, 1), 20);
+        const recent = await threadStore.listRecent(limit);
+        sendJson(res, 200, recent);
       } else if (req.method === 'GET' && path.startsWith('/thread/')) {
         const threadId = path.slice('/thread/'.length);
         await handleGetThread(threadId, res);

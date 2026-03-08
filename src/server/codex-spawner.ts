@@ -8,6 +8,20 @@ export type CodexSpawnOptions = SpawnOptions & {
   screenshotPath?: string;
 };
 
+/**
+ * Strip the `/bin/bash -lc "..."` wrapper that Codex adds around commands,
+ * returning just the inner command for display purposes.
+ */
+function extractShellCommand(raw: string): string {
+  // Codex wraps commands as: /bin/bash -lc "actual command here"
+  const match = raw.match(/^\/bin\/(?:ba)?sh\s+-\w+\s+"(.*)"$/s);
+  if (match) {
+    // Unescape the inner command (Codex double-escapes quotes)
+    return match[1]!.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  return raw;
+}
+
 export function spawnCodex(
   jobId: string,
   options: CodexSpawnOptions,
@@ -51,6 +65,7 @@ export function spawnCodex(
   const result = new Promise<SpawnResult>((resolve) => {
     let capturedSessionId: string | undefined;
     const textChunks: string[] = [];
+    const toolLabels: string[] = [];
     let hadError = false;
     let errorMessage = '';
 
@@ -82,26 +97,35 @@ export function spawnCodex(
           onEvent?.({ type: 'thinking', jobId, text: parsed.delta.text }, jobId);
         }
 
-        // Item started — detect tool use
+        // Item started — detect tool use with rich detail
         if ((eventType === 'item.started' || eventType === 'item/started') && parsed.item) {
           const itemType = parsed.item.type;
           if (itemType === 'command_execution') {
-            onEvent?.({ type: 'tool_use', jobId, tool: 'Bash' }, jobId);
+            // Extract the shell command for display (e.g. "/bin/bash -lc \"sed -n '1,160p' file.ts\"")
+            const rawCmd = parsed.item.command as string | undefined;
+            const content = rawCmd ? extractShellCommand(rawCmd) : undefined;
+            const label = content ? `Bash: ${content.split('\n')[0]!.slice(0, 80)}` : 'Bash';
+            toolLabels.push(label);
+            onEvent?.({ type: 'tool_use', jobId, tool: 'Bash', ...(content ? { content } : {}) }, jobId);
           } else if (itemType === 'file_change') {
             const file = parsed.item.filename || parsed.item.path;
+            toolLabels.push(file ? `Edit ${file.split('/').pop()}` : 'Edit');
             onEvent?.({ type: 'tool_use', jobId, tool: 'Edit', ...(file ? { file } : {}) }, jobId);
           } else if (itemType === 'file_read') {
             const file = parsed.item.filename || parsed.item.path;
+            toolLabels.push(file ? `Read ${file.split('/').pop()}` : 'Read');
             onEvent?.({ type: 'tool_use', jobId, tool: 'Read', ...(file ? { file } : {}) }, jobId);
           } else if (itemType === 'web_search') {
+            toolLabels.push('WebSearch');
             onEvent?.({ type: 'tool_use', jobId, tool: 'WebSearch' }, jobId);
           } else if (itemType === 'mcp_tool_call') {
             const toolName = parsed.item.tool_name || parsed.item.name || 'MCP';
+            toolLabels.push(toolName);
             onEvent?.({ type: 'tool_use', jobId, tool: toolName }, jobId);
           }
         }
 
-        // Item completed — accumulate full text from agent messages and reasoning
+        // Item completed — accumulate text, and enrich tool events with results
         if ((eventType === 'item.completed' || eventType === 'item/completed') && parsed.item) {
           if (parsed.item.type === 'agent_message') {
             const itemText = parsed.item.text;
@@ -113,6 +137,16 @@ export function spawnCodex(
             const reasoningText = parsed.item.text;
             if (typeof reasoningText === 'string' && reasoningText) {
               onEvent?.({ type: 'thinking', jobId, text: reasoningText }, jobId);
+            }
+          } else if (parsed.item.type === 'file_change' && Array.isArray(parsed.item.changes)) {
+            // Emit per-file events for each change
+            for (const change of parsed.item.changes) {
+              const file = change.path || change.filename;
+              const tool = change.kind === 'add' ? 'Write' : 'Edit';
+              if (file) {
+                toolLabels.push(`${tool} ${file.split('/').pop()}`);
+                onEvent?.({ type: 'tool_use', jobId, tool, file }, jobId);
+              }
             }
           }
         }
@@ -151,6 +185,7 @@ export function spawnCodex(
         text: textChunks.join(''),
         success: !hadError,
         error: hadError ? errorMessage : undefined,
+        toolsUsed: toolLabels.length > 0 ? toolLabels : undefined,
       });
     });
 
@@ -162,6 +197,7 @@ export function spawnCodex(
         text: textChunks.join(''),
         success: false,
         error: errorMessage,
+        toolsUsed: toolLabels.length > 0 ? toolLabels : undefined,
       });
     });
   });

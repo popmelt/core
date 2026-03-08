@@ -13,11 +13,14 @@ const BASE_RESET = `
 }
 /* Direct reset for all Popmelt chrome elements.
    Beats broad selectors from mirrored host stylesheets (e.g. div, span, *).
-   Inline styles on individual elements still win (higher specificity). */
+   Inline styles on individual elements still win (higher specificity).
+   color: inherit (not a fixed value) so children properly inherit inline
+   colors set by parents — e.g. thread header sets color:#fff, child spans
+   should get white, not this reset gray. */
 :host *:not([data-popmelt-panel]):not([data-popmelt-panel] *) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
-  color: #1f2937;
+  color: inherit;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }

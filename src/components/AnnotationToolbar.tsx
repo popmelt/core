@@ -383,6 +383,9 @@ export function AnnotationToolbar({
   const guidanceHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const guidancePanelRef = useRef<HTMLDivElement | null>(null);
 
+  // Recent threads (shown in counter guidance)
+  const [recentThreads, setRecentThreads] = useState<Array<{ id: string; createdAt: number; updatedAt: number; preview: string; messageCount: number; elementIdentifiers: string[] }>>([]);
+
   // Mouse-position prediction cone refs (Amazon mega-menu pattern)
   const lastMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const pendingToolRef = useRef<string | null>(null);
@@ -462,6 +465,17 @@ export function AnnotationToolbar({
       el.removeEventListener('mouseleave', onLeave);
     };
   }, [guidanceTool, clearPrediction]);
+
+  // Fetch recent threads when counter guidance opens
+  useEffect(() => {
+    if (guidanceTool !== 'counter' || !bridgeUrl) return;
+    let cancelled = false;
+    fetch(`${bridgeUrl}/threads/recent?limit=5`)
+      .then(r => r.ok ? r.json() : [])
+      .then(data => { if (!cancelled) setRecentThreads(data); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [guidanceTool, bridgeUrl]);
 
   const handleToolbarMouseMove = useCallback((e: React.MouseEvent) => {
     lastMouseRef.current = { x: e.clientX, y: e.clientY };
@@ -657,6 +671,43 @@ export function AnnotationToolbar({
         }
       }
     }
+
+    // Check for cross-page pending thread reopen (set by recent thread click on different page)
+    const pendingThread = sessionStorage.getItem('popmelt-pending-thread');
+    if (pendingThread) {
+      sessionStorage.removeItem('popmelt-pending-thread');
+      try {
+        const { threadId, selector, preview } = JSON.parse(pendingThread);
+        if (threadId) {
+          requestAnimationFrame(() => {
+            // Re-tag the element with an annotation
+            if (selector) {
+              try {
+                const el = document.querySelector(selector);
+                if (el) {
+                  const rect = el.getBoundingClientRect();
+                  const annId = Math.random().toString(36).slice(2, 9);
+                  dispatch({
+                    type: 'ADD_TEXT',
+                    payload: {
+                      id: annId,
+                      point: { x: rect.left + rect.width, y: rect.top },
+                      text: preview || '[thread]',
+                      linkedSelector: selector,
+                      linkedAnchor: 'top-left',
+                    },
+                  });
+                  dispatch({ type: 'SET_ANNOTATION_THREAD', payload: { ids: [annId], threadId } });
+                  dispatch({ type: 'SET_ANNOTATION_STATUS', payload: { ids: [annId], status: 'resolved' } });
+                }
+              } catch { /* invalid selector */ }
+            }
+            if (onViewThread) onViewThread(threadId);
+          });
+        }
+      } catch { /* invalid JSON */ }
+    }
+
     hasRestoredAnnotations.current = true;
     // Cleanup: reset flag so strict mode re-mount doesn't let persist effects
     // write stale initial state (e.g. 'inspector') to localStorage
@@ -857,6 +908,43 @@ export function AnnotationToolbar({
     counter.addEventListener('wheel', handleWheel, { passive: false });
     return () => counter.removeEventListener('wheel', handleWheel);
   }, [hasAnnotations, state.selectedAnnotationIds, state.lastSelectedId, hue, dispatch]);
+
+  // Auto-advance hue after send: pick the hue farthest from all existing annotation hues
+  const prevHadPendingRef = useRef(false);
+  const prevAnnotationCountRef = useRef(0);
+  useEffect(() => {
+    const hasPending = state.annotations.some(a => !a.status || a.status === 'pending');
+    const hadPending = prevHadPendingRef.current;
+    prevHadPendingRef.current = hasPending;
+
+    // Detect restore: went from 0 → N annotations (page reload with persisted annotations)
+    const justRestored = prevAnnotationCountRef.current === 0 && state.annotations.length > 0;
+    prevAnnotationCountRef.current = state.annotations.length;
+
+    // Trigger on: (1) just sent (pending → non-pending), or (2) restored non-pending annotations on load
+    if (((hadPending && !hasPending) || (justRestored && !hasPending)) && state.annotations.length > 0) {
+      const usedHues = state.annotations
+        .map(a => parseHueFromColor(a.color))
+        .filter((h): h is number => h !== null);
+
+      if (usedHues.length > 0) {
+        // Find the hue (0-359, stepping by 1) that maximizes minimum distance to all used hues
+        let bestHue = 0;
+        let bestDist = -1;
+        for (let candidate = 0; candidate < 360; candidate++) {
+          const minDist = Math.min(...usedHues.map(h => {
+            const d = Math.abs(candidate - h);
+            return Math.min(d, 360 - d);
+          }));
+          if (minDist > bestDist) {
+            bestDist = minDist;
+            bestHue = candidate;
+          }
+        }
+        setHue(bestHue);
+      }
+    }
+  }, [state.annotations, parseHueFromColor]);
 
   // Long press to reset to red
   const longPressTriggeredRef = useRef(false);
@@ -1113,7 +1201,10 @@ export function AnnotationToolbar({
       }
 
       // Cmd/Ctrl+C for screenshot (when annotations or style modifications exist)
+      // Skip if user has a text selection — let native copy work
       if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C' || e.code === 'KeyC')) {
+        const sel = window.getSelection();
+        if (sel && sel.toString().length > 0) return; // allow native copy
         if (state.annotations.length > 0 || state.styleModifications.length > 0) {
           e.preventDefault();
           window.focus();
@@ -1455,6 +1546,12 @@ export function AnnotationToolbar({
             )}
             {/* Annotation quick-nav list (counter guidance only) */}
             {guidanceTool === 'counter' && allAnnotationGroups.length > 0 && (() => {
+              // "Active" label
+              const activeLabel = (
+                <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8 }}>
+                  <div style={{ fontSize: 10, color: '#9ca3af', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Active</div>
+                </div>
+              );
               // Group by pathname
               const byRoute = new Map<string, AnnotationGroup[]>();
               for (const g of allAnnotationGroups) {
@@ -1466,7 +1563,9 @@ export function AnnotationToolbar({
               const multiRoute = routes.length > 1;
 
               return (
-                <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8, maxHeight: 200, overflowY: 'auto', scrollbarWidth: 'thin' }}>
+                <div>
+                  {activeLabel}
+                  <div style={{ maxHeight: 200, overflowY: 'auto', scrollbarWidth: 'thin' }}>
                   {routes.map(([route, groups]) => (
                     <div key={route} style={{ marginBottom: multiRoute ? 4 : 0 }}>
                       {groups.map((group) => {
@@ -1493,6 +1592,11 @@ export function AnnotationToolbar({
                               setFocusedGroupIndex(groupIndex);
                               dispatch({ type: 'SELECT_ELEMENT', payload: null });
                               dispatch({ type: 'SELECT_ANNOTATION', payload: { id: group.id } });
+                              // Open thread panel if this annotation has a thread
+                              if (onViewThread) {
+                                const threadId = group.annotations.find(a => a.threadId)?.threadId;
+                                if (threadId) onViewThread(threadId);
+                              }
                               guidanceVisibleRef.current = false;
                               setGuidanceTool(null);
                             }}
@@ -1533,6 +1637,106 @@ export function AnnotationToolbar({
                           </div>
                         );
                       })}
+                    </div>
+                  ))}
+                  </div>
+                </div>
+              );
+            })()}
+            {/* Recent threads (counter guidance only) */}
+            {guidanceTool === 'counter' && (() => {
+              const activeThreadIds = new Set(
+                allAnnotationGroups.flatMap(g => g.annotations.map(a => a.threadId).filter(Boolean))
+              );
+              const filtered = recentThreads.filter(t => !activeThreadIds.has(t.id));
+              if (filtered.length === 0) return null;
+              const timeAgo = (ts: number) => {
+                const sec = Math.floor((Date.now() - ts) / 1000);
+                if (sec < 60) return 'now';
+                const min = Math.floor(sec / 60);
+                if (min < 60) return `${min}m`;
+                const hr = Math.floor(min / 60);
+                if (hr < 24) return `${hr}h`;
+                const d = Math.floor(hr / 24);
+                return `${d}d`;
+              };
+              return (
+                <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 8, paddingTop: 8 }}>
+                  <div style={{ fontSize: 10, color: '#9ca3af', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Recent</div>
+                  {filtered.map(t => (
+                    <div
+                      key={t.id}
+                      onClick={() => {
+                        // Parse first elementIdentifier to re-tag the element
+                        const eid = t.elementIdentifiers[0];
+                        if (eid) {
+                          // Format is "pathname:selector" or just "selector"
+                          const colonIdx = eid.indexOf(':');
+                          // Heuristic: if it starts with / it's pathname-qualified
+                          const hasPathname = colonIdx > 0 && eid[0] === '/';
+                          const pathname = hasPathname ? eid.slice(0, colonIdx) : undefined;
+                          const selector = hasPathname ? eid.slice(colonIdx + 1) : eid;
+                          const isOnPage = !pathname || pathname === currentPathname;
+
+                          if (!isOnPage) {
+                            // Navigate to the page, stash thread info for post-nav pickup
+                            sessionStorage.setItem('popmelt-pending-thread', JSON.stringify({
+                              threadId: t.id, selector, preview: t.preview,
+                            }));
+                            window.location.href = pathname!;
+                            return;
+                          }
+
+                          // Try to find the element and re-create the annotation
+                          try {
+                            const el = document.querySelector(selector);
+                            if (el) {
+                              const rect = el.getBoundingClientRect();
+                              const annId = Math.random().toString(36).slice(2, 9);
+                              dispatch({
+                                type: 'ADD_TEXT',
+                                payload: {
+                                  id: annId,
+                                  point: { x: rect.left + rect.width, y: rect.top },
+                                  text: t.preview,
+                                  linkedSelector: selector,
+                                  linkedAnchor: 'top-left',
+                                },
+                              });
+                              dispatch({ type: 'SET_ANNOTATION_THREAD', payload: { ids: [annId], threadId: t.id } });
+                              dispatch({ type: 'SET_ANNOTATION_STATUS', payload: { ids: [annId], status: 'resolved' } });
+                            }
+                          } catch { /* invalid selector */ }
+                        }
+
+                        if (onViewThread) onViewThread(t.id);
+                        guidanceVisibleRef.current = false;
+                        setGuidanceTool(null);
+                      }}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'baseline',
+                        justifyContent: 'space-between',
+                        gap: 8,
+                        padding: '2px 0',
+                        cursor: 'pointer',
+                        color: '#6b7280',
+                        fontSize: 11,
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.color = '#1f2937'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.color = '#6b7280'; }}
+                    >
+                      <span style={{
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        minWidth: 0,
+                      }}>{t.preview}</span>
+                      <span style={{
+                        flexShrink: 0,
+                        fontSize: 10,
+                        color: '#9ca3af',
+                      }}>{timeAgo(t.createdAt)}</span>
                     </div>
                   ))}
                 </div>
@@ -1708,18 +1912,19 @@ export function AnnotationToolbar({
                 onMouseDown={handleCounterMouseDown}
                 onMouseUp={handleCounterMouseUp}
                 onMouseLeave={handleCounterMouseUp}
-                title="Cycle through annotations • Scroll to change color • Long press to reset"
+                title=""
                 style={{
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
+                  gap: 4,
                   minWidth: 20,
                   height: 20,
                   padding: '0 8px',
                   marginRight: 4,
                   border: 'none',
                   borderRadius: 0,
-                  background: isCaptured ? '#999999' : activeColor,
+                  background: (isCaptured && focusedGroupIndex === null) ? '#999999' : activeColor,
                   cursor: 'pointer',
                   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
                   fontSize: 11,
@@ -1731,12 +1936,12 @@ export function AnnotationToolbar({
                 {(() => {
                   const totalCount = allAnnotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length;
                   if (focusedGroupIndex !== null) {
-                    return <>{focusedGroupIndex + 1}<span style={{ opacity: 0.4 }}>{` / ${totalCount}`}</span></>;
+                    return <>{focusedGroupIndex + 1}<span style={{ opacity: 0.4, display: 'flex', gap: 4 }}><span>/</span><span>{totalCount}</span></span></>;
                   }
                   // Unfocused: "pageCount / totalCount" when there are off-page items
                   const pageCount = annotationGroups.length + state.styleModifications.length + state.spacingTokenChanges.filter(c => !c.captured).length;
                   if (totalCount > pageCount) {
-                    return <>{pageCount}<span style={{ opacity: 0.4 }}>{` / ${totalCount}`}</span></>;
+                    return <>{pageCount}<span style={{ opacity: 0.4, display: 'flex', gap: 4 }}><span>/</span><span>{totalCount}</span></span></>;
                   }
                   return totalCount;
                 })()}

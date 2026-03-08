@@ -681,9 +681,15 @@ export function PopmeltProvider({
       setInFlightJobs(prev => {
         const next = { ...prev };
         // Prune stale entries (locally tracked but no longer active on server).
-        // Keep provisional `_pending_` entries — they represent HTTP requests still in flight.
+        // Keep recent provisional `_pending_` entries — they represent HTTP requests still in flight.
+        // Prune old _pending_ entries (>30s) — they're from crashed/abandoned sessions.
+        const now = Date.now();
         for (const id of Object.keys(next)) {
-          if (id.startsWith('_pending_')) continue;
+          if (id.startsWith('_pending_')) {
+            const ts = parseInt(id.replace(/^_pending_(?:reply_)?/, ''), 10);
+            if (!isNaN(ts) && now - ts > 30_000) delete next[id];
+            continue;
+          }
           if (!serverActiveIds.has(id)) delete next[id];
         }
         // Adopt server-active jobs missing locally (e.g. after refresh or from another tab)

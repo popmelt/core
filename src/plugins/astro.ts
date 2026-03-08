@@ -47,20 +47,13 @@ export function popmelt(options?: PopmeltPluginOptions): AstroIntegration {
               projectRoot: options?.projectRoot,
               devOrigin,
               force: true,
+              detached: true, // Bridge survives Astro restarts
             });
 
             bridgePort = handle.port;
             bridgeClose = handle.close;
 
             console.log(`[popmelt] bridge ready at http://localhost:${bridgePort}`);
-
-            // Clean shutdown when Astro's underlying Vite server closes
-            server.httpServer?.on('close', () => {
-              if (bridgeClose) {
-                bridgeClose().catch(() => {});
-                bridgeClose = null;
-              }
-            });
           } catch (err) {
             console.warn('[popmelt] bridge failed to start:', (err as Error).message ?? err);
           }

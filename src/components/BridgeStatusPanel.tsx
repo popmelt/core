@@ -78,6 +78,7 @@ function formatStepText(events: BridgeConnectionState['events']): string {
   const tool = String(last.data.tool || '');
   const file = last.data.file ? String(last.data.file) : null;
   const basename = file ? file.split('/').pop() ?? file : null;
+  const content = last.data.content ? String(last.data.content) : null;
 
   switch (tool) {
     case 'Read':
@@ -86,8 +87,11 @@ function formatStepText(events: BridgeConnectionState['events']): string {
       return basename ? `Editing ${basename}` : 'Editing file';
     case 'Write':
       return basename ? `Writing ${basename}` : 'Writing file';
-    case 'Bash':
-      return 'Running command';
+    case 'Bash': {
+      if (!content) return 'Running command';
+      const line = content.split('\n')[0]!.trim();
+      return line.length <= 40 ? line : line.slice(0, 37) + '…';
+    }
     case 'Glob':
       return 'Searching files';
     case 'Grep':
@@ -275,19 +279,30 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
           changed = true;
         }
       }
+      // Prune entries that are still "queued" but no longer in inFlightJobs
+      // (job was cleaned up before it ever started on this client)
+      const inFlightIds = new Set(Object.keys(inFlightJobs));
+      const activeIds = new Set(bridge.activeJobIds);
+      const prunedEntries = newEntries.filter(e => {
+        if (e.status !== 'queued') return true;
+        // Keep if still tracked as in-flight or if the bridge says it's active
+        return inFlightIds.has(e.jobId) || activeIds.has(e.jobId);
+      });
+      if (prunedEntries.length !== newEntries.length) changed = true;
       // Safety net: if bridge reports active jobs not tracked by inFlightJobs
       // (e.g. sessionStorage unavailable), create fallback entries
+      const prunedIds = new Set(prunedEntries.map(e => e.jobId));
       for (const jobId of bridge.activeJobIds) {
-        if (!existingIds.has(jobId) && !newEntries.some(e => e.jobId === jobId)) {
+        if (!prunedIds.has(jobId)) {
           const startEvt = bridge.events.find(e => e.type === 'job_started' && e.data.jobId === jobId);
-          newEntries.push({
+          prunedEntries.push({
             jobId, color: '#888', status: 'working',
             threadId: startEvt?.data?.threadId as string | undefined,
           });
           changed = true;
         }
       }
-      return changed ? newEntries : prev;
+      return changed ? prunedEntries : prev;
     });
   }, [inFlightJobs, bridge.activeJobIds]);
 
