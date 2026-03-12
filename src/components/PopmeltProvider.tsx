@@ -28,6 +28,9 @@ import { ThreadPanel } from './ThreadPanel';
 
 export { MODEL_MAP } from './providers';
 
+// Stable empty array for memoized event lists (avoids new reference per render)
+const EMPTY_EVENTS: { type: string; data: Record<string, unknown>; timestamp: number }[] = [];
+
 type PopmeltContextValue = {
   isEnabled: boolean;
 };
@@ -1277,7 +1280,6 @@ export function PopmeltProvider({
 
   // Memoize streamingEvents to avoid creating a new array reference on every render.
   // The bridge.events array grows monotonically, so length is a stable change signal.
-  const EMPTY_EVENTS: typeof bridge.events = [];
   const threadStreamingEvents = useMemo(
     () => threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : EMPTY_EVENTS,
     [threadActiveJobId, bridge.events.length],
@@ -1423,7 +1425,7 @@ export function PopmeltProvider({
             toolbarRef={toolbarRef}
           />
 
-          {openThreadId && bridge.isConnected && (
+          {openThreadId && (
             <ThreadPanel
               threadId={openThreadId}
               bridgeUrl={resolvedBridgeUrl}

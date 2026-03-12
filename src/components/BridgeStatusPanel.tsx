@@ -59,12 +59,11 @@ const rowStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   gap: 3,
-  padding: '4px 5px 4px 10px',
+  padding: 0,
   backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   fontSize: 11,
-  color: '#1f2937',
   whiteSpace: 'nowrap' as const,
   transition: 'transform 200ms ease, opacity 200ms ease',
 };
@@ -199,8 +198,8 @@ function CancelButton({ onCancel }: { onCancel: () => void }) {
     const el = ref.current;
     if (!el) return;
     const handler = (e: MouseEvent) => { e.stopPropagation(); onCancel(); };
-    const enter = () => { el.style.color = '#ef4444'; };
-    const leave = () => { el.style.color = '#9ca3af'; };
+    const enter = () => { el.style.opacity = '0.5'; };
+    const leave = () => { el.style.opacity = '0.7'; };
     el.addEventListener('click', handler);
     el.addEventListener('mouseenter', enter);
     el.addEventListener('mouseleave', leave);
@@ -210,7 +209,7 @@ function CancelButton({ onCancel }: { onCancel: () => void }) {
     <button
       ref={ref}
       style={{ background: 'none', border: 'none', cursor: 'pointer',
-               color: '#9ca3af', fontSize: 14, padding: '0 2px', lineHeight: 1 }}
+               color: '#ffffff', opacity: 0.7, fontSize: 14, padding: '0 2px', lineHeight: 1 }}
       title="Cancel"
     >×</button>
   );
@@ -222,8 +221,8 @@ function DismissButton({ onDismiss }: { onDismiss: () => void }) {
     const el = ref.current;
     if (!el) return;
     const handler = (e: MouseEvent) => { e.stopPropagation(); onDismiss(); };
-    const enter = () => { el.style.color = '#ef4444'; };
-    const leave = () => { el.style.color = '#9ca3af'; };
+    const enter = () => { el.style.opacity = '0.5'; };
+    const leave = () => { el.style.opacity = '0.7'; };
     el.addEventListener('click', handler);
     el.addEventListener('mouseenter', enter);
     el.addEventListener('mouseleave', leave);
@@ -233,7 +232,7 @@ function DismissButton({ onDismiss }: { onDismiss: () => void }) {
     <button
       ref={ref}
       style={{ background: 'none', border: 'none', cursor: 'pointer',
-               color: '#9ca3af', fontSize: 14, padding: '0 2px', lineHeight: 1 }}
+               color: '#ffffff', opacity: 0.7, fontSize: 14, padding: '0 2px', lineHeight: 1 }}
       title="Dismiss"
     >×</button>
   );
@@ -499,27 +498,39 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                     }} />
                   );
                 })()}
-                {entry.status === 'working' && <DotSpinner color={entry.color} />}
-                {entry.status === 'queued' && <ColorSquare color={entry.color} />}
-                {entry.status === 'done' && <Checkmark color={entry.color} />}
-                {entry.status === 'error' && <ErrorDot />}
-                <span style={{ color: entry.status === 'queued' ? '#9ca3af' : '#1f2937', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
-                {entry.status === 'working' && onCancel && (
-                  <CancelButton onCancel={() => onCancel(entry.jobId)} />
-                )}
-                {(entry.status === 'done' || entry.status === 'error') && (
-                  <DismissButton onDismiss={() => setEntries(prev => prev.filter(el =>
-                    entry.threadId ? el.threadId !== entry.threadId : el.jobId !== entry.jobId
-                  ))} />
-                )}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 3,
+                  padding: '3px 5px 3px 8px',
+                  margin: 3,
+                  backgroundColor: entry.status === 'error' ? '#ef4444' : entry.color,
+                  color: '#ffffff',
+                }}>
+                  {entry.status === 'working' && <DotSpinner color="#ffffff" />}
+                  {entry.status === 'queued' && <ColorSquare color="#ffffff" />}
+                  {entry.status === 'done' && <Checkmark color="#ffffff" />}
+                  {entry.status === 'error' && <ErrorDot />}
+                  <span style={{ opacity: entry.status === 'queued' ? 0.6 : 1, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+                  {entry.status === 'working' && onCancel && (
+                    <CancelButton onCancel={() => onCancel(entry.jobId)} />
+                  )}
+                  {(entry.status === 'done' || entry.status === 'error') && (
+                    <DismissButton onDismiss={() => setEntries(prev => prev.filter(el =>
+                      entry.threadId ? el.threadId !== entry.threadId : el.jobId !== entry.jobId
+                    ))} />
+                  )}
+                </div>
               </div>
           </div>
         );
       })}
       {isConnected === false && entries.length > 0 && (
-        <div style={{ ...rowStyle, color: '#9ca3af' }}>
-          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', backgroundColor: '#f59e0b' }} />
-          <span>Reconnecting…</span>
+        <div style={rowStyle}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '3px 5px 3px 8px', margin: 3, backgroundColor: '#f59e0b', color: '#ffffff' }}>
+            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', backgroundColor: '#ffffff', opacity: 0.6 }} />
+            <span>Reconnecting…</span>
+          </div>
         </div>
       )}
     </div>

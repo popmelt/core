@@ -437,6 +437,10 @@ async function captureSingleRegion(
 ): Promise<Blob | null> {
   try {
     // Capture DOM at this scroll position
+    // Read the page background from <html> so dark-mode sites aren't captured on white
+    const htmlBg = getComputedStyle(document.documentElement).backgroundColor;
+    const pageBg = htmlBg && htmlBg !== 'rgba(0, 0, 0, 0)' && htmlBg !== 'transparent' ? htmlBg : '#ffffff';
+
     const domCanvas = await domToCanvas(targetElement, {
       filter: (el) => {
         if (el instanceof HTMLElement) {
@@ -452,7 +456,7 @@ async function captureSingleRegion(
         return true;
       },
       scale: dpr,
-      backgroundColor: '#ffffff',
+      backgroundColor: pageBg,
       width: viewportWidth,
       height: viewportHeight,
       style: {
