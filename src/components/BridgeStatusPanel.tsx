@@ -4,6 +4,8 @@ import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { BridgeConnectionState } from '../hooks/useBridgeConnection';
+import type { ToolbarSnapPosition } from '../hooks/useToolbarLayout';
+import { getStackStyle, isToolbarOnTop, isToolbarOnRight } from '../hooks/useToolbarLayout';
 import { POPMELT_BORDER } from '../styles/border';
 
 type InFlightJob = {
@@ -27,6 +29,7 @@ type BridgeEventStackProps = {
   onHoverJob?: (jobId: string | null) => void;
   isConnected?: boolean;
   dismissedThreadIds?: Set<string>;
+  snapPosition?: ToolbarSnapPosition;
 };
 
 type StreamEntry = {
@@ -39,15 +42,7 @@ type StreamEntry = {
   cancelled?: boolean;
 };
 
-const stackContainerStyle: CSSProperties = {
-  position: 'fixed',
-  bottom: 78,
-  right: 16,
-  zIndex: 9999,
-  display: 'flex',
-  flexDirection: 'column',
-  alignItems: 'flex-end',
-};
+// stackContainerStyle is now computed dynamically via getStackStyle(snapPosition)
 
 // Stacking constants — row height must approximate actual rendered height
 const ROW_HEIGHT = 24; // 4+4 padding + ~14 text + 2 border
@@ -238,9 +233,21 @@ function DismissButton({ onDismiss }: { onDismiss: () => void }) {
   );
 }
 
-export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onClickJob, onCancel, onHoverJob, isConnected, dismissedThreadIds }: BridgeEventStackProps) {
+export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, clearSignal, onViewThread, onClickJob, onCancel, onHoverJob, isConnected, dismissedThreadIds, snapPosition = 'bottom-right' }: BridgeEventStackProps) {
   const [entries, setEntries] = useState<StreamEntry[]>([]);
   const [isHovered, setIsHovered] = useState(false);
+
+  // Viewport size for layout calculations
+  const [viewport, setViewport] = useState(() =>
+    typeof window !== 'undefined' ? { w: window.innerWidth, h: window.innerHeight } : { w: 1920, h: 1080 },
+  );
+  useEffect(() => {
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const stackContainerStyle = getStackStyle(snapPosition, viewport.w, viewport.h);
 
   // Clear on signal
   useEffect(() => {
@@ -427,6 +434,11 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
   });
 
   const collapsed = !isHovered && deduped.length > 1;
+  const onTop = isToolbarOnTop(snapPosition);
+  const onRight = isToolbarOnRight(snapPosition);
+  // When toolbar is on bottom, newest badge is closest to toolbar (reverse order).
+  // When toolbar is on top, newest badge is closest to toolbar (natural order).
+  const ordered = onTop ? deduped : [...deduped].reverse();
 
   return (
     <div
@@ -435,7 +447,7 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       data-devtools
     >
       <style>{`@keyframes popmelt-badge-march { to { background-position: 0 -5px; } }`}</style>
-      {[...deduped].reverse().map((entry, i) => {
+      {ordered.map((entry, i) => {
         const isLast = i === deduped.length - 1;
         const distFromFront = deduped.length - 1 - i;
 
@@ -457,15 +469,15 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
             key={entry.jobId}
             style={{
               position: 'relative',
-              zIndex: i,
+              zIndex: deduped.length - i,
               marginBottom: collapsed
                 ? (isLast ? 0 : -COLLAPSED_OVERLAP)
                 : (isLast ? 0 : EXPANDED_GAP),
               transform: collapsed
                 ? `scale(${Math.max(0.94, 1 - distFromFront * 0.02)})`
                 : 'scale(1)',
-              opacity: collapsed ? Math.max(0.5, 1 - distFromFront * 0.15) : 1,
-              transformOrigin: 'bottom right',
+              opacity: 1,
+              transformOrigin: `${onTop ? 'top' : 'bottom'} ${onRight ? 'right' : 'left'}`,
               transition: 'margin-bottom 250ms ease, transform 250ms ease, opacity 250ms ease',
             }}
           >

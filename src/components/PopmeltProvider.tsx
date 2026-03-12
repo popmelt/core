@@ -15,6 +15,7 @@ import {
 import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hooks/useBridgeConnection';
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import { usePathname } from '../hooks/usePathname';
+import { loadSnapPosition, saveSnapPosition, type ToolbarSnapPosition } from '../hooks/useToolbarLayout';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchJobEvents, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, synthesizeRules, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
@@ -350,6 +351,13 @@ export function PopmeltProvider({
       setModelRefreshKey(k => k + 1);
     }
   }, [state.spacingTokenMods, resolvedBridgeUrl]);
+
+  // Toolbar snap position
+  const [snapPosition, setSnapPosition] = useState<ToolbarSnapPosition>(() => loadSnapPosition());
+  const handleSnapPositionChange = useCallback((pos: ToolbarSnapPosition) => {
+    setSnapPosition(pos);
+    saveSnapPosition(pos);
+  }, []);
 
   // Thread panel state (declared early so callbacks can reference setOpenThreadId)
   const [openThreadId, setOpenThreadId] = useState<string | null>(() => {
@@ -1423,6 +1431,8 @@ export function PopmeltProvider({
             onSynthesizeRules={bridge.isConnected ? handleSynthesizeRules : undefined}
             isSynthesizing={synthesizeJobId !== null}
             toolbarRef={toolbarRef}
+            snapPosition={snapPosition}
+            onSnapPositionChange={handleSnapPositionChange}
           />
 
           {openThreadId && (
@@ -1472,6 +1482,7 @@ export function PopmeltProvider({
             onHoverJob={handleHoverJob}
             isConnected={bridge.isConnected}
             dismissedThreadIds={dismissedThreadIds}
+            snapPosition={snapPosition}
           />
         </ShadowChrome>
       </ShadowHost>

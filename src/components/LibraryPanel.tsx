@@ -4,6 +4,8 @@ import React, { Component, createElement, useCallback, useEffect, useRef, useSta
 
 import { Link2 } from 'lucide-react';
 import { POPMELT_BORDER } from '../styles/border';
+import type { ToolbarSnapPosition } from '../hooks/useToolbarLayout';
+import { getLibraryPanelStyle } from '../hooks/useToolbarLayout';
 import type { SpacingTokenChange, SpacingTokenMod } from '../tools/types';
 import { fetchModel, type DesignModel } from '../utils/bridge-client';
 import { findAllComponentBoundariesByName, getComponentPositions } from '../utils/dom';
@@ -29,6 +31,7 @@ type LibraryPanelProps = {
   onComponentRemoved?: (name: string) => void;
   onSynthesizeRules?: () => void;
   isSynthesizing?: boolean;
+  snapPosition?: ToolbarSnapPosition;
 };
 
 type Tab = 'patterns' | 'principles' | 'rules';
@@ -96,11 +99,7 @@ function classifyEntries(entries: [string, string][]): 'colors' | 'spacing' | 'g
 
 // --- Styles ---
 
-const panelStyle: CSSProperties = {
-  position: 'fixed',
-  top: 16,
-  right: 16,
-  bottom: 80,
+const basePanelStyle: CSSProperties = {
   width: 300,
   backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
@@ -840,7 +839,7 @@ function ComponentsTab({ components, selectedComponent, hoveredComponent, onRemo
 
 // --- Main ---
 
-export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onModifySpacingToken, onDeleteSpacingToken, onComponentAdded, onComponentRemoved, onSynthesizeRules, isSynthesizing }: LibraryPanelProps) {
+export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onModifySpacingToken, onDeleteSpacingToken, onComponentAdded, onComponentRemoved, onSynthesizeRules, isSynthesizing, snapPosition = 'bottom-right' }: LibraryPanelProps) {
   const [model, setModel] = useState<DesignModel>(undefined as unknown as DesignModel);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>(() => {
@@ -906,7 +905,7 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
   }, [onMouseEnter, onMouseLeave]);
 
   return (
-    <div ref={panelRef} style={panelStyle}>
+    <div ref={panelRef} style={{ ...basePanelStyle, ...getLibraryPanelStyle(snapPosition) }}>
       {/* Title */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
         <span>Model</span>

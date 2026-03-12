@@ -17,6 +17,8 @@ import {
 import { useLocalStorageBatch } from '../hooks/useLocalStorageBatch';
 import type { StorageKeys } from '../hooks/useLocalStorageBatch';
 import { usePathname } from '../hooks/usePathname';
+import type { ToolbarSnapPosition } from '../hooks/useToolbarLayout';
+import { getToolbarStyle as getSnapToolbarStyle, getGuidanceStyle, getPanelEdge, SNAP_POSITIONS } from '../hooks/useToolbarLayout';
 
 import { POPMELT_BORDER } from '../styles/border';
 import type { Annotation, AnnotationAction, AnnotationState, SpacingTokenChange, ToolType } from '../tools/types';
@@ -70,6 +72,8 @@ type AnnotationToolbarProps = {
   isSynthesizing?: boolean;
   onMouseEnter?: () => void;
   toolbarRef?: React.MutableRefObject<HTMLDivElement | null>;
+  snapPosition?: ToolbarSnapPosition;
+  onSnapPositionChange?: (pos: ToolbarSnapPosition) => void;
 };
 
 type ToolDef = { type: ToolType; icon: typeof Pen; label: string; shortcut: string };
@@ -97,11 +101,8 @@ function pointInTriangle(
   return !(hasNeg && hasPos);
 }
 
-function getPanelBottomEdge(): { left: number; right: number; y: number } {
-  const panelRight = window.innerWidth - 16;
-  const panelLeft = panelRight - 326; // 300 width + 24 padding + ~2 border
-  const panelBottomY = window.innerHeight - 80;
-  return { left: panelLeft, right: panelRight, y: panelBottomY };
+function getPanelBottomEdge(snapPos: ToolbarSnapPosition = 'bottom-right'): { left: number; right: number; y: number } {
+  return getPanelEdge(snapPos, window.innerWidth, window.innerHeight);
 }
 
 const standaloneTools: ToolDef[] = [
@@ -280,9 +281,6 @@ const TOOL_GUIDANCE: Record<string, GuidanceEntry> = {
 };
 
 const baseToolbarStyle: CSSProperties = {
-  position: 'fixed',
-  bottom: 16,
-  right: 16,
   zIndex: 9999,
   display: 'flex',
   alignItems: 'center',
@@ -294,7 +292,7 @@ const baseToolbarStyle: CSSProperties = {
   cursor: 'pointer',
   overflow: 'visible',
   boxSizing: 'content-box',
-  transition: 'all 0ms cubic-bezier(0.4, 0, 0.2, 1)',
+  transition: 'none',
 };
 
 const STORAGE_KEY = 'devtools-toolbar-expanded';
@@ -355,7 +353,19 @@ export function AnnotationToolbar({
   isSynthesizing,
   onMouseEnter: onToolbarMouseEnter,
   toolbarRef: externalToolbarRef,
+  snapPosition: snapPos = 'bottom-right',
+  onSnapPositionChange,
 }: AnnotationToolbarProps) {
+  // Viewport size for layout calculations
+  const [viewport, setViewport] = useState(() =>
+    typeof window !== 'undefined' ? { w: window.innerWidth, h: window.innerHeight } : { w: 1920, h: 1080 },
+  );
+  useEffect(() => {
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
   const [isExpanded, setIsExpanded] = useState(() => {
     if (typeof window === 'undefined') return false;
     return localStorage.getItem(STORAGE_KEY) === 'true';
@@ -486,13 +496,13 @@ export function AnnotationToolbar({
     lastMouseRef.current = { x: e.clientX, y: e.clientY };
     if (pendingToolRef.current && decisionPointRef.current) {
       const apex = decisionPointRef.current;
-      const edge = getPanelBottomEdge();
+      const edge = getPanelBottomEdge(snapPos);
       if (!pointInTriangle(e.clientX, e.clientY, apex.x, apex.y, edge.left, edge.y, edge.right, edge.y)) {
         setGuidanceTool(pendingToolRef.current);
         clearPrediction();
       }
     }
-  }, [clearPrediction]);
+  }, [clearPrediction, snapPos]);
 
   // Dynamic provider guidance (computed from availableProviders instead of static TOOL_GUIDANCE)
   const providerGuidance = useMemo((): GuidanceEntry => {
@@ -1284,9 +1294,11 @@ export function AnnotationToolbar({
 
 
 
-  // Dynamic styles based on expanded state
+  // Dynamic styles based on expanded state + snap position
+  const snapStyles = getSnapToolbarStyle(snapPos, viewport.w, viewport.h);
   const toolbarStyle: CSSProperties = {
     ...baseToolbarStyle,
+    ...snapStyles,
     borderRadius: 0,
     padding: isExpanded ? '0 8px' : '0',
     width: isExpanded ? 'auto' : 48,
@@ -1359,7 +1371,7 @@ export function AnnotationToolbar({
         <div
           ref={(el) => { collapsedRef.current = el; if (externalToolbarRef) externalToolbarRef.current = el; }}
           id="devtools-toolbar"
-          style={{ ...toolbarStyle, overflow: 'visible', opacity: hasActiveJobs ? 1 : 0.5, transition: 'opacity 150ms ease' }}
+          style={{ ...toolbarStyle, overflow: 'visible', opacity: hasActiveJobs ? 1 : 0.5 }}
         >
           {borderOverlay}
           <button
@@ -1426,6 +1438,7 @@ export function AnnotationToolbar({
           onComponentRemoved={onModelComponentRemoved}
           onSynthesizeRules={onSynthesizeRules}
           isSynthesizing={isSynthesizing}
+          snapPosition={snapPos}
           onMouseEnter={() => {
             clearPrediction();
             if (guidanceHideTimerRef.current) {
@@ -1443,9 +1456,7 @@ export function AnnotationToolbar({
           <div
             ref={guidancePanelRef}
             style={{
-            position: 'fixed',
-            bottom: 80,
-            right: 16,
+            ...getGuidanceStyle(snapPos, viewport.w, viewport.h),
             width: 300,
             backgroundColor: '#eaeaea',
             ...POPMELT_BORDER,
@@ -1489,6 +1500,35 @@ export function AnnotationToolbar({
                 <span>{line}</span>
               </div>
             ))}
+            {guidanceTool === 'collapse' && onSnapPositionChange && (
+              <div style={{ borderTop: '1px solid rgba(0,0,0,0.08)', marginTop: 10, paddingTop: 8 }}>
+                <div style={{ fontSize: 10, color: '#9ca3af', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Position</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 3, width: 'fit-content' }}>
+                  {SNAP_POSITIONS.map(pos => {
+                    const isActive = pos === snapPos;
+                    return (
+                      <button
+                        key={pos}
+                        type="button"
+                        onClick={() => { setGuidanceTool(null); guidanceVisibleRef.current = false; clearPrediction(); onSnapPositionChange(pos); }}
+                        title={pos}
+                        style={{
+                          width: 24,
+                          height: 16,
+                          border: 'none',
+                          cursor: 'pointer',
+                          padding: 0,
+                          backgroundColor: isActive ? '#1f2937' : 'rgba(0,0,0,0.08)',
+                          transition: 'background-color 100ms ease',
+                        }}
+                        onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.backgroundColor = 'rgba(0,0,0,0.15)'; }}
+                        onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.backgroundColor = 'rgba(0,0,0,0.08)'; }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             {guidanceTool === 'collapse' && mcpStatus && Object.keys(mcpStatus).length > 0 && (() => {
               const connected = Object.entries(mcpStatus)
                 .filter(([, s]) => s.found && !s.disabled)
