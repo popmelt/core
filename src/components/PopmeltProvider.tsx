@@ -16,7 +16,7 @@ import { getDiscoveredBridgeUrl, getSourceId, useBridgeConnection } from '../hoo
 import { useAnnotationState } from '../hooks/useAnnotationState';
 import { usePathname } from '../hooks/usePathname';
 import type { AnnotationResolution, SpacingTokenChange, SpacingTokenMod } from '../tools/types';
-import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchJobEvents, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
+import { addComponentToModel, checkBridgeHealth, fetchCapabilities, fetchJobEvents, fetchModel, installMcp, removeComponentFromModel, removeModelToken, sendReplyToBridge, sendToBridge, synthesizeRules, updateModelToken, type McpDetectionResult } from '../utils/bridge-client';
 import { buildFeedbackData, captureFullPage, captureScreenshot, copyToClipboard, cssColorToHex, stitchBlobs } from '../utils/screenshot';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { AnnotationToolbar } from './AnnotationToolbar';
@@ -45,6 +45,7 @@ type PopmeltProviderProps = PropsWithChildren<{
 const PROVIDER_STORAGE_KEY = 'devtools-provider';
 const MODEL_STORAGE_KEY = 'devtools-model';
 const THREAD_ID_STORAGE_KEY = 'devtools-open-thread-id';
+const SYNTHESIZE_THREAD_STORAGE_KEY = 'popmelt-synthesize-thread';
 
 /** Perform a soft (SPA) navigation without causing a full page reload.
  *  When a framework `navigate` function is provided, uses it directly.
@@ -261,6 +262,20 @@ export function PopmeltProvider({
     dispatch({ type: 'DELETE_SPACING_TOKEN', payload: { tokenPath, originalValue } });
   }, [dispatch]);
 
+  // Synthesize rules state (threadId persists across refresh)
+  const [synthesizeJobId, setSynthesizeJobId] = useState<string | null>(null);
+  const [synthesizeThreadId, setSynthesizeThreadId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(SYNTHESIZE_THREAD_STORAGE_KEY) || null;
+  });
+  useEffect(() => {
+    if (synthesizeThreadId) {
+      localStorage.setItem(SYNTHESIZE_THREAD_STORAGE_KEY, synthesizeThreadId);
+    } else {
+      localStorage.removeItem(SYNTHESIZE_THREAD_STORAGE_KEY);
+    }
+  }, [synthesizeThreadId]);
+
   // Sync effect: when spacingTokenMods change (including via undo/redo), reconcile bridge + DOM
   const [modelRefreshKey, setModelRefreshKey] = useState(0);
   const prevTokenModsRef = useRef<SpacingTokenMod[]>([]);
@@ -411,11 +426,16 @@ export function PopmeltProvider({
 
   // Recovery: annotations hydrate from localStorage via PASTE_ANNOTATIONS (after mount).
   // Any annotation stuck in 'in_flight' with no matching active job is a ghost — reset it.
-  const didRecoverRef = useRef(false);
+  // Runs on every inFlightJobs change (not just once) so that reconciliation pruning
+  // triggers ghost cleanup even if it happens after the initial mount.
+  const prevInFlightKeysRef = useRef<string>('');
   useEffect(() => {
-    if (didRecoverRef.current) return;
     if (state.annotations.length === 0) return; // not hydrated yet
-    didRecoverRef.current = true;
+    // Only re-check when inFlightJobs keys actually change (avoids redundant dispatches)
+    const keySig = Object.keys(inFlightJobs).sort().join(',');
+    if (keySig === prevInFlightKeysRef.current) return;
+    prevInFlightKeysRef.current = keySig;
+
     const activeJobAnnotationIds = new Set<string>();
     for (const job of Object.values(inFlightJobs)) {
       for (const id of job.annotationIds) activeJobAnnotationIds.add(id);
@@ -443,6 +463,31 @@ export function PopmeltProvider({
     }
     return ids;
   }, [inFlightJobs]);
+
+  // Annotation IDs whose jobs are actively running (not just queued)
+  const activeAnnotationIds = useMemo(() => {
+    const activeSet = new Set(bridge.activeJobIds);
+    const ids = new Set<string>();
+    for (const [jobId, job] of Object.entries(inFlightJobs)) {
+      if (activeSet.has(jobId)) {
+        for (const id of job.annotationIds) ids.add(id);
+      }
+    }
+    return ids;
+  }, [inFlightJobs, bridge.activeJobIds]);
+
+  // Queue position labels for queued (not active) annotation IDs, e.g. "(1/2)"
+  const queuePositionMap = useMemo(() => {
+    const activeSet = new Set(bridge.activeJobIds);
+    const queuedJobs = Object.entries(inFlightJobs).filter(([id]) => !activeSet.has(id));
+    const total = queuedJobs.length;
+    const map = new Map<string, string>();
+    queuedJobs.forEach(([, job], idx) => {
+      const label = `(${idx + 1}/${total})`;
+      for (const id of job.annotationIds) map.set(id, label);
+    });
+    return map;
+  }, [inFlightJobs, bridge.activeJobIds]);
 
   const inFlightStyleSelectors = useMemo(() => {
     const selectors = new Set<string>();
@@ -586,7 +631,7 @@ export function PopmeltProvider({
 
       // Initiate capture — domToCanvas clones the DOM synchronously in this tick,
       // the async rendering operates on that clone, so we capture the old page's state
-      captureScreenshot(document.body, canvas, departing)
+      captureScreenshot(document.body, canvas, departing, { dpr: 1 })
         .then(blobs => stitchBlobs(blobs))
         .then(blob => {
           if (blob) {
@@ -639,7 +684,12 @@ export function PopmeltProvider({
         return rest;
       });
     }
-  }, [bridge.lastCompletedJobId]);
+    // On synthesize job completion, refresh model and clear synthesize state
+    if (bridge.lastCompletedJobId && bridge.lastCompletedJobId === synthesizeJobId) {
+      setModelRefreshKey(k => k + 1);
+      setSynthesizeJobId(null);
+    }
+  }, [bridge.lastCompletedJobId, synthesizeJobId]);
 
   // Track which done events have been processed (shared by reconciliation + live SSE handler)
   const processedDoneJobIdsRef = useRef(new Set<string>());
@@ -870,7 +920,7 @@ export function PopmeltProvider({
           }
 
           const pageAnnotations = annotationsByPage.get(page) || [];
-          const blobs = await captureScreenshot(document.body, canvas, pageAnnotations);
+          const blobs = await captureScreenshot(document.body, canvas, pageAnnotations, { dpr: 1 });
           const stitched = await stitchBlobs(blobs);
           if (stitched) {
             screenshotMap.set(page, stitched);
@@ -891,7 +941,7 @@ export function PopmeltProvider({
     const currentPageAnnotations = activeAnnotations.filter(
       a => (a.pathname || currentPathname) === currentPathname
     );
-    const currentBlobs = await captureScreenshot(document.body, canvas, currentPageAnnotations.length > 0 ? state.annotations : []);
+    const currentBlobs = await captureScreenshot(document.body, canvas, currentPageAnnotations.length > 0 ? state.annotations : [], { dpr: 1 });
     if (currentBlobs.length > 0) {
       const stitched = await stitchBlobs(currentBlobs);
       if (stitched) screenshotMap.set(currentPathname, stitched);
@@ -1014,6 +1064,30 @@ export function PopmeltProvider({
       return false;
     }
   }, [state.annotations, state.styleModifications, state.spacingTokenChanges, state.activeColor, dispatch, resolvedBridgeUrl, provider, currentModel.id, currentPathname, navigateProp]);
+
+  // Handle synthesize rules request — reopen existing thread if one exists
+  const handleSynthesizeRules = useCallback(async () => {
+    // If we already have a synthesize thread, just reopen it
+    if (synthesizeThreadId) {
+      setOpenThreadId(synthesizeThreadId);
+      return;
+    }
+
+    try {
+      const { jobId, threadId } = await synthesizeRules(resolvedBridgeUrl, provider, currentModel.id);
+      setSynthesizeJobId(jobId);
+      setSynthesizeThreadId(threadId);
+
+      // Track in inFlightJobs so the thread panel gets streaming data
+      const entry = { annotationIds: [], styleSelectors: [], color: '#6b7280', threadId };
+      setInFlightJobs(prev => ({ ...prev, [jobId]: entry }));
+
+      // Open the thread panel
+      setOpenThreadId(threadId);
+    } catch (err) {
+      console.error('[Popmelt] Failed to start synthesize:', err);
+    }
+  }, [resolvedBridgeUrl, provider, currentModel.id, synthesizeThreadId]);
 
   // Handle reply to a question from Claude
   const handleReply = useCallback(async (threadId: string, reply: string, images?: Blob[]) => {
@@ -1159,8 +1233,9 @@ export function PopmeltProvider({
   }, [resolvedBridgeUrl]);
 
   // Mutual exclusion: close thread panel when model/library panel opens
+  // (except synthesize threads — keep both panels visible for reference)
   useEffect(() => {
-    if (state.activeTool === 'model' && openThreadId) {
+    if (state.activeTool === 'model' && openThreadId && openThreadId !== synthesizeThreadId) {
       setOpenThreadId(null);
     }
   }, [state.activeTool]);
@@ -1199,7 +1274,29 @@ export function PopmeltProvider({
   }, [openThreadId, inFlightJobs, bridge.activeJobThreads]);
 
   const threadAnnotation = openThreadId ? state.annotations.find(a => a.threadId === openThreadId) : undefined;
+
+  // Memoize streamingEvents to avoid creating a new array reference on every render.
+  // The bridge.events array grows monotonically, so length is a stable change signal.
+  const EMPTY_EVENTS: typeof bridge.events = [];
+  const threadStreamingEvents = useMemo(
+    () => threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : EMPTY_EVENTS,
+    [threadActiveJobId, bridge.events.length],
+  );
+
+  // Memoize accentColor to avoid reference churn on every render
+  const threadAccentColor = useMemo(
+    () => threadAnnotation?.color ?? threadColorFallbackRef.current ?? state.activeColor,
+    [threadAnnotation?.color, state.activeColor],
+  );
   const threadAnnotationNumber = threadAnnotation ? state.annotations.indexOf(threadAnnotation) + 1 : undefined;
+
+  // Sync toolbar color to match the open thread's annotation color
+  useEffect(() => {
+    const color = threadAnnotation?.color ?? threadColorFallbackRef.current;
+    if (openThreadId && color) {
+      dispatch({ type: 'SET_COLOR', payload: color });
+    }
+  }, [openThreadId]);
 
   // Event stream hover visibility (debounced to bridge gap between crosshair and stack)
   const [eventStreamVisible, setEventStreamVisible] = useState(false);
@@ -1264,6 +1361,8 @@ export function PopmeltProvider({
         dispatch={dispatch}
         onScreenshot={handleScreenshot}
         inFlightAnnotationIds={inFlightAnnotationIds}
+        activeAnnotationIds={activeAnnotationIds}
+        queuePositionMap={queuePositionMap}
         inFlightStyleSelectors={inFlightStyleSelectors}
         inFlightSelectorColors={inFlightSelectorColors}
         onAttachImages={handleAttachImages}
@@ -1304,7 +1403,7 @@ export function PopmeltProvider({
             modelLabel={currentModel.label}
             onModelChange={bridge.isConnected ? handleModelChange : undefined}
             onViewThread={bridge.isConnected ? handleViewThread : undefined}
-            isThreadPanelOpen={openThreadId !== null}
+            isThreadPanelOpen={openThreadId !== null && openThreadId !== synthesizeThreadId}
             mcpStatus={mcpStatus}
             onInstallMcp={bridge.isConnected ? handleInstallMcp : undefined}
             mcpJustInstalled={mcpJustInstalled}
@@ -1319,6 +1418,8 @@ export function PopmeltProvider({
             modelRefreshKey={modelRefreshKey}
             onModelComponentAdded={handleModelComponentAdded}
             onModelComponentRemoved={handleModelComponentRemoved}
+            onSynthesizeRules={bridge.isConnected ? handleSynthesizeRules : undefined}
+            isSynthesizing={synthesizeJobId !== null}
             toolbarRef={toolbarRef}
           />
 
@@ -1326,9 +1427,18 @@ export function PopmeltProvider({
             <ThreadPanel
               threadId={openThreadId}
               bridgeUrl={resolvedBridgeUrl}
-              accentColor={threadAnnotation?.color ?? threadColorFallbackRef.current ?? state.activeColor}
+              accentColor={threadAccentColor}
               isStreaming={threadActiveJobId !== null}
-              streamingEvents={threadActiveJobId ? bridge.events.filter(e => e.data.jobId === threadActiveJobId) : []}
+              isQueued={threadActiveJobId !== null && !bridge.activeJobIds.includes(threadActiveJobId)}
+              queuePosition={threadActiveJobId && !bridge.activeJobIds.includes(threadActiveJobId)
+                ? (() => {
+                    const activeSet = new Set(bridge.activeJobIds);
+                    const queued = Object.keys(inFlightJobs).filter(id => !activeSet.has(id));
+                    const idx = queued.indexOf(threadActiveJobId);
+                    return idx >= 0 ? `(${idx + 1}/${queued.length})` : undefined;
+                  })()
+                : undefined}
+              streamingEvents={threadStreamingEvents}
               onClose={() => setOpenThreadId(null)}
               onReply={handleReply}
               onCancel={threadActiveJobId ? () => handleCancelJob(threadActiveJobId) : undefined}

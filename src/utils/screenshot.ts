@@ -366,9 +366,10 @@ export async function captureScreenshot(
   targetElement: HTMLElement,
   annotationCanvas: HTMLCanvasElement,
   annotations: Annotation[] = [],
+  options?: { dpr?: number },
 ): Promise<Blob[]> {
   try {
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = options?.dpr ?? (window.devicePixelRatio || 1);
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
 
@@ -484,7 +485,7 @@ async function captureSingleRegion(
 
     // Export as blob
     return new Promise((resolve) => {
-      composite.toBlob((blob) => resolve(blob), 'image/png');
+      composite.toBlob((blob) => resolve(blob), 'image/webp', 0.80);
     });
   } catch (error) {
     console.error('Region capture failed:', error);
@@ -531,7 +532,7 @@ export async function stitchBlobs(blobs: Blob[]): Promise<Blob | null> {
 
   // Export as blob
   return new Promise((resolve) => {
-    canvas.toBlob((blob) => resolve(blob), 'image/png');
+    canvas.toBlob((blob) => resolve(blob), 'image/webp', 0.80);
   });
 }
 
@@ -608,9 +609,22 @@ export async function copyToClipboard(
     const stitchedBlob = await stitchBlobs(blobArray);
     if (!stitchedBlob) return false;
 
+    // Clipboard API requires image/png — re-encode if source is WebP
+    let pngBlob = stitchedBlob;
+    if (stitchedBlob.type !== 'image/png') {
+      const img = new Image();
+      const url = URL.createObjectURL(stitchedBlob);
+      await new Promise<void>((res) => { img.onload = () => res(); img.src = url; });
+      URL.revokeObjectURL(url);
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      c.getContext('2d')!.drawImage(img, 0, 0);
+      pngBlob = await new Promise<Blob>((res) => c.toBlob((b) => res(b!), 'image/png'));
+    }
+
     // Build structured feedback data if annotations or style modifications provided
     const clipboardItems: Record<string, Blob> = {
-      'image/png': stitchedBlob,
+      'image/png': pngBlob,
     };
 
     const hasAnnotations = annotations && annotations.length > 0;

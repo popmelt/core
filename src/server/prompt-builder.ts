@@ -163,8 +163,30 @@ export function buildPrompt(
     if (Array.isArray(rules) && rules.length > 0) {
       lines.push('');
       lines.push('Rules:');
-      for (const rule of rules) {
-        if (typeof rule === 'string') lines.push(`- ${rule}`);
+      // Detect structured rules (Rule objects with scope field)
+      const isStructured = rules.length > 0 && typeof rules[0] === 'object' && rules[0] !== null && 'scope' in rules[0];
+      if (isStructured) {
+        // Group by scope
+        const groups = new Map<string, string[]>();
+        for (const rule of rules) {
+          if (typeof rule === 'object' && rule !== null && 'text' in rule) {
+            const r = rule as { scope?: string; text: string };
+            const scope = r.scope || 'general';
+            if (!groups.has(scope)) groups.set(scope, []);
+            groups.get(scope)!.push(r.text);
+          }
+        }
+        for (const [scope, texts] of groups) {
+          lines.push(`**${scope.charAt(0).toUpperCase() + scope.slice(1)}**`);
+          for (const text of texts) {
+            lines.push(`- ${text}`);
+          }
+        }
+      } else {
+        // Legacy flat string[] format
+        for (const rule of rules) {
+          if (typeof rule === 'string') lines.push(`- ${rule}`);
+        }
       }
     }
     const tokens = options.designModel.tokens;

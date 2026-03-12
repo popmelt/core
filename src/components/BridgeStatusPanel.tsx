@@ -41,7 +41,7 @@ type StreamEntry = {
 
 const stackContainerStyle: CSSProperties = {
   position: 'fixed',
-  bottom: 86,
+  bottom: 78,
   right: 16,
   zIndex: 9999,
   display: 'flex',
@@ -58,11 +58,10 @@ const EXPANDED_GAP = 8;
 const rowStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
-  gap: 6,
-  padding: '4px 10px',
-  backgroundColor: 'rgba(255, 255, 255, 0.85)',
+  gap: 3,
+  padding: '4px 5px 4px 10px',
+  backgroundColor: '#eaeaea',
   ...POPMELT_BORDER,
-  backdropFilter: 'blur(32px)',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   fontSize: 11,
   color: '#1f2937',
@@ -116,14 +115,12 @@ function deriveDoneLabel(events: BridgeConnectionState['events'], jobId: string)
   );
   if (hasQuestion) return 'Has a question';
 
-  // Check if resolutions were applied
-  const doneEvent = events.find(
-    e => e.type === 'done' && e.data.jobId === jobId,
+  // "Applied changes" only if file-editing tools were actually used
+  const FILE_EDIT_TOOLS = new Set(['Edit', 'Write']);
+  const editedFiles = events.some(
+    e => e.type === 'tool_use' && e.data.jobId === jobId && FILE_EDIT_TOOLS.has(String(e.data.tool || '')),
   );
-  if (doneEvent) {
-    const resolutions = doneEvent.data.resolutions;
-    if (Array.isArray(resolutions) && resolutions.length > 0) return 'Applied changes';
-  }
+  if (editedFiles) return 'Applied changes';
 
   return 'Replied';
 }
@@ -202,14 +199,18 @@ function CancelButton({ onCancel }: { onCancel: () => void }) {
     const el = ref.current;
     if (!el) return;
     const handler = (e: MouseEvent) => { e.stopPropagation(); onCancel(); };
+    const enter = () => { el.style.color = '#ef4444'; };
+    const leave = () => { el.style.color = '#9ca3af'; };
     el.addEventListener('click', handler);
-    return () => el.removeEventListener('click', handler);
+    el.addEventListener('mouseenter', enter);
+    el.addEventListener('mouseleave', leave);
+    return () => { el.removeEventListener('click', handler); el.removeEventListener('mouseenter', enter); el.removeEventListener('mouseleave', leave); };
   }, [onCancel]);
   return (
     <button
       ref={ref}
       style={{ background: 'none', border: 'none', cursor: 'pointer',
-               color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+               color: '#9ca3af', fontSize: 14, padding: '0 2px', lineHeight: 1 }}
       title="Cancel"
     >×</button>
   );
@@ -221,14 +222,18 @@ function DismissButton({ onDismiss }: { onDismiss: () => void }) {
     const el = ref.current;
     if (!el) return;
     const handler = (e: MouseEvent) => { e.stopPropagation(); onDismiss(); };
+    const enter = () => { el.style.color = '#ef4444'; };
+    const leave = () => { el.style.color = '#9ca3af'; };
     el.addEventListener('click', handler);
-    return () => el.removeEventListener('click', handler);
+    el.addEventListener('mouseenter', enter);
+    el.addEventListener('mouseleave', leave);
+    return () => { el.removeEventListener('click', handler); el.removeEventListener('mouseenter', enter); el.removeEventListener('mouseleave', leave); };
   }, [onDismiss]);
   return (
     <button
       ref={ref}
       style={{ background: 'none', border: 'none', cursor: 'pointer',
-               color: '#9ca3af', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+               color: '#9ca3af', fontSize: 14, padding: '0 2px', lineHeight: 1 }}
       title="Dismiss"
     >×</button>
   );
@@ -400,7 +405,29 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
 
   if (!isRendered) return null;
 
-  const collapsed = !isHovered && entries.length > 1;
+  // Deduplicate entries by threadId — show one badge per conversation thread.
+  // Entries without a threadId pass through as-is.
+  const STATUS_PRIORITY: Record<StreamEntry['status'], number> = { working: 3, queued: 2, error: 1, done: 0 };
+  const deduped: StreamEntry[] = [];
+  const threadBest = new Map<string, StreamEntry>();
+  for (const entry of entries) {
+    if (!entry.threadId) { deduped.push(entry); continue; }
+    const existing = threadBest.get(entry.threadId);
+    if (!existing || STATUS_PRIORITY[entry.status] > STATUS_PRIORITY[existing.status]
+        || (STATUS_PRIORITY[entry.status] === STATUS_PRIORITY[existing.status])) {
+      threadBest.set(entry.threadId, entry);
+    }
+  }
+  for (const entry of threadBest.values()) deduped.push(entry);
+
+  // Compute queue position labels for queued entries
+  const queuedEntries = deduped.filter(e => e.status === 'queued');
+  const queuePosLabels = new Map<string, string>();
+  queuedEntries.forEach((e, idx) => {
+    queuePosLabels.set(e.jobId, `(${idx + 1}/${queuedEntries.length})`);
+  });
+
+  const collapsed = !isHovered && deduped.length > 1;
 
   return (
     <div
@@ -408,15 +435,16 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
       style={stackContainerStyle}
       data-devtools
     >
-      {[...entries].reverse().map((entry, i) => {
-        const isLast = i === entries.length - 1;
-        const distFromFront = entries.length - 1 - i;
+      <style>{`@keyframes popmelt-badge-march { to { background-position: 0 -5px; } }`}</style>
+      {[...deduped].reverse().map((entry, i) => {
+        const isLast = i === deduped.length - 1;
+        const distFromFront = deduped.length - 1 - i;
 
         const label =
           entry.status === 'working'
             ? formatStepText(bridge.events.filter(e => e.data.jobId === entry.jobId))
             : entry.status === 'queued'
-              ? 'Queued'
+              ? `Queued ${queuePosLabels.get(entry.jobId) ?? ''}`
               : entry.status === 'done'
                 ? (entry.doneLabel || 'Done')
                 : entry.cancelled
@@ -444,9 +472,33 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
           >
               <div
                 ref={(el) => setRowRef(entry.jobId, el)}
-                style={{ ...rowStyle, cursor: onClickJob ? 'pointer' : undefined }}
+                style={{
+                  ...rowStyle,
+                  position: 'relative',
+                  overflow: 'visible',
+                  cursor: onClickJob ? 'pointer' : undefined,
+                  ...(entry.status === 'working' && { borderImage: 'none', borderColor: 'transparent' }),
+                }}
                 title={entry.errorMessage || undefined}
               >
+                {entry.status === 'working' && (() => {
+                  const svgTile = `<svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'><path d='M-1,1 l2,-2 M0,5 l5,-5 M4,6 l2,-2' stroke='${entry.color}' stroke-width='.75'/></svg>`;
+                  return (
+                    <div style={{
+                      position: 'absolute',
+                      inset: -3,
+                      padding: 5,
+                      backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(svgTile)}")`,
+                      backgroundSize: '5px 5px',
+                      WebkitMask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+                      WebkitMaskComposite: 'xor',
+                      mask: 'linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0) border-box',
+                      maskComposite: 'exclude' as string,
+                      pointerEvents: 'none' as const,
+                      animation: 'popmelt-badge-march 0.8s linear infinite',
+                    }} />
+                  );
+                })()}
                 {entry.status === 'working' && <DotSpinner color={entry.color} />}
                 {entry.status === 'queued' && <ColorSquare color={entry.color} />}
                 {entry.status === 'done' && <Checkmark color={entry.color} />}
@@ -456,7 +508,9 @@ export function BridgeEventStack({ bridge, inFlightJobs, isVisible, onHover, cle
                   <CancelButton onCancel={() => onCancel(entry.jobId)} />
                 )}
                 {(entry.status === 'done' || entry.status === 'error') && (
-                  <DismissButton onDismiss={() => setEntries(prev => prev.filter(el => el.jobId !== entry.jobId))} />
+                  <DismissButton onDismiss={() => setEntries(prev => prev.filter(el =>
+                    entry.threadId ? el.threadId !== entry.threadId : el.jobId !== entry.jobId
+                  ))} />
                 )}
               </div>
           </div>

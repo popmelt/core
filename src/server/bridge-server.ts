@@ -10,7 +10,7 @@ import { buildCanvasHtml } from './canvas-html';
 import { spawnClaude } from './claude-spawner';
 import { spawnCodex } from './codex-spawner';
 import { DecisionStore } from './decision-store';
-import { Materializer } from './materializer';
+import { buildSynthesizePrompt, Materializer, parseModelBlock, validateRules } from './materializer';
 import { detectClaudeMcp, detectCodexMcp } from './mcp-detect';
 import { installClaudeMcp, installCodexMcp } from './mcp-install';
 import { parseMultipart } from './multipart';
@@ -222,6 +222,9 @@ export async function createPopmelt(
   type RecentJob = { id: string; status: 'done' | 'error'; completedAt: number; error?: string; threadId?: string; annotationIds?: string[] };
   const recentJobs: RecentJob[] = [];
 
+  // Track synthesize threads so reply jobs inherit kind: 'synthesize'
+  const synthesizeThreadIds = new Set<string>();
+
   // Canvas manifest cache (5-second TTL)
   let manifestCache: { data: unknown; expires: number } | null = null;
   let renderHash: string | undefined;
@@ -403,7 +406,7 @@ export async function createPopmelt(
         if (job.imagePaths) {
           for (const [annId, paths] of Object.entries(job.imagePaths)) {
             for (let i = 0; i < paths.length; i++) {
-              pastedImagePaths.push(`screenshots/p-${job.id}-${annId}-${i}.png`);
+              pastedImagePaths.push(`screenshots/p-${job.id}-${annId}-${i}.webp`);
             }
           }
         }
@@ -416,7 +419,7 @@ export async function createPopmelt(
             durationMs: completedAt - job.createdAt,
             url: job.feedback.url,
             viewport: job.feedback.viewport,
-            screenshotPath: `screenshots/s-${job.id}.png`,
+            screenshotPath: `screenshots/s-${job.id}.webp`,
             pastedImagePaths,
             annotations: job.feedback.annotations,
             styleModifications: job.feedback.styleModifications,
@@ -445,6 +448,24 @@ export async function createPopmelt(
         });
         if (hasPatternScope) {
           materializer.run().catch(() => {}); // fire-and-forget
+        }
+      }
+
+      // Synthesize jobs: write model.json if response contains a <model> block
+      if (job.kind === 'synthesize' && spawnResult.text) {
+        const parsed = parseModelBlock(spawnResult.text);
+        if (parsed) {
+          if (Array.isArray(parsed.rules)) {
+            parsed.rules = validateRules(parsed.rules as unknown[]);
+          }
+          // Preserve tokens/components from current model if not in response
+          const currentModel = await materializer.loadModel();
+          if (currentModel) {
+            if (!parsed.tokens && currentModel.tokens) parsed.tokens = currentModel.tokens;
+            if (!parsed.components && currentModel.components) parsed.components = currentModel.components;
+          }
+          await materializer.writeModel(parsed);
+          console.log(`${tag} Synthesize: model.json updated`);
         }
       }
 
@@ -543,6 +564,24 @@ export async function createPopmelt(
       } else if (req.method === 'POST' && path === '/shutdown') {
         sendJson(res, 200, { ok: true });
         setTimeout(() => process.exit(0), 100);
+      } else if (req.method === 'POST' && path === '/restart') {
+        sendJson(res, 200, { ok: true, restarting: true });
+        setTimeout(() => {
+          // Close SSE connections so server.close() completes quickly
+          for (const client of sseClients) {
+            try { client.res.end(); } catch {}
+          }
+          server.close(() => {
+            const child = spawn(process.execPath, process.argv.slice(1), {
+              detached: true,
+              stdio: 'ignore',
+              cwd: process.cwd(),
+              env: process.env,
+            });
+            child.unref();
+            setTimeout(() => process.exit(0), 200);
+          });
+        }, 100);
       } else if (req.method === 'GET' && path === '/capabilities') {
         sendJson(res, 200, { providers: capabilities });
       } else if (req.method === 'POST' && path === '/mcp/install') {
@@ -561,6 +600,12 @@ export async function createPopmelt(
         await handleUpdateToken(req, res);
       } else if (req.method === 'DELETE' && path === '/model/token') {
         await handleRemoveToken(req, res);
+      } else if (req.method === 'POST' && path === '/model/consolidate') {
+        // Fire-and-forget consolidation
+        materializer.consolidate().catch(err => console.error('[Bridge] Consolidation error:', err));
+        sendJson(res, 200, { started: true });
+      } else if (req.method === 'POST' && path === '/model/synthesize') {
+        await handleSynthesize(req, res);
       } else if (req.method === 'GET' && path === '/model') {
         const model = await materializer.loadModel();
         sendJson(res, 200, { model });
@@ -618,21 +663,21 @@ export async function createPopmelt(
     if (pageScreenshots.length > 0) {
       for (const ps of pageScreenshots) {
         const encoded = encodeURIComponent(ps.pathname);
-        const path = join(tempDir, `screenshot-${jobId}-${encoded}.png`);
+        const path = join(tempDir, `screenshot-${jobId}-${encoded}.webp`);
         await writeFile(path, ps.data);
         screenshotPaths[ps.pathname] = path;
       }
     }
 
     // Write fallback single screenshot (always present for backward compat)
-    const screenshotPath = join(tempDir, `screenshot-${jobId}.png`);
+    const screenshotPath = join(tempDir, `screenshot-${jobId}.webp`);
     await writeFile(screenshotPath, screenshot);
 
     // Write pasted images to temp dir
     const imagePaths: Record<string, string[]> = {};
     if (pastedImages.length > 0) {
       for (const img of pastedImages) {
-        const imgPath = join(tempDir, `pasted-${jobId}-${img.annotationId}-${img.index}.png`);
+        const imgPath = join(tempDir, `pasted-${jobId}-${img.annotationId}-${img.index}.webp`);
         await writeFile(imgPath, img.data);
         if (!imagePaths[img.annotationId]) imagePaths[img.annotationId] = [];
         imagePaths[img.annotationId]!.push(imgPath);
@@ -788,7 +833,7 @@ export async function createPopmelt(
     // Write reply images to temp dir
     const replyImagePaths: string[] = [];
     for (let i = 0; i < replyImageBuffers.length; i++) {
-      const imgPath = join(tempDir, `reply-${jobId}-${i}.png`);
+      const imgPath = join(tempDir, `reply-${jobId}-${i}.webp`);
       await writeFile(imgPath, replyImageBuffers[i]!);
       replyImagePaths.push(imgPath);
     }
@@ -805,7 +850,7 @@ export async function createPopmelt(
       }
     }
 
-    if (!screenshotPath) {
+    if (!screenshotPath && !synthesizeThreadIds.has(threadId)) {
       sendJson(res, 400, { error: 'No screenshot available' });
       return;
     }
@@ -854,6 +899,11 @@ export async function createPopmelt(
       model: modelStr || undefined,
       sourceId: sourceIdStr || undefined,
     };
+
+    // Propagate synthesize kind for replies on synthesize threads
+    if (synthesizeThreadIds.has(threadId)) {
+      job.kind = 'synthesize';
+    }
 
     // Override the job processor prompt for this job by storing it
     (job as Job & { _replyPrompt?: string; _replyImagePaths?: string[] })._replyPrompt = prompt;
@@ -960,6 +1010,56 @@ export async function createPopmelt(
     }
     materializer.run().catch(() => {}); // fire-and-forget
     sendJson(res, 200, { started: true, decisionCount: pending.length, decisionIds: pending.map(d => d.id) });
+  }
+
+  async function handleSynthesize(req: IncomingMessage, res: ServerResponse) {
+    const model = await materializer.loadModel();
+    if (!model) {
+      sendJson(res, 400, { error: 'No model exists yet' });
+      return;
+    }
+
+    // Read provider/model from request body
+    let providerStr: string | undefined;
+    let modelStr: string | undefined;
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      providerStr = body.provider;
+      modelStr = body.model;
+    } catch { /* empty body is fine */ }
+
+    const prompt = buildSynthesizePrompt(model);
+    const jobId = randomUUID().slice(0, 8);
+    const thread = await threadStore.createThread(jobId, []);
+    const threadId = thread.id;
+
+    synthesizeThreadIds.add(threadId);
+
+    // Append a human message describing the synthesize request
+    await threadStore.appendMessage(threadId, {
+      role: 'human',
+      timestamp: Date.now(),
+      jobId,
+      feedbackSummary: 'Synthesize rules — review and propose improvements',
+    });
+
+    const job: Job = {
+      id: jobId,
+      status: 'queued',
+      screenshotPath: '',
+      feedback: { timestamp: new Date().toISOString(), url: '', viewport: { width: 0, height: 0 }, scrollPosition: { x: 0, y: 0 }, annotations: [], styleModifications: [] },
+      createdAt: Date.now(),
+      threadId,
+      kind: 'synthesize',
+      provider: (providerStr === 'claude' || providerStr === 'codex') ? providerStr : undefined,
+      model: modelStr || undefined,
+    };
+    (job as Job & { _replyPrompt?: string })._replyPrompt = prompt;
+
+    const position = queue.enqueue(job);
+    sendJson(res, 200, { jobId, position, threadId });
   }
 
   async function handleMcpInstall(req: IncomingMessage, res: ServerResponse) {
@@ -1164,7 +1264,7 @@ export async function createPopmelt(
     try {
       const data = await readFile(join(tempDir, filename));
       const ext = filename.split('.').pop()?.toLowerCase();
-      const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'application/octet-stream';
+      const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'application/octet-stream';
       res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
       res.end(data);
     } catch {

@@ -25,7 +25,7 @@ export class DecisionStore {
 
       // Copy screenshot from temp to persistent storage
       try {
-        await copyFile(tempScreenshotPath, join(this.screenshotsDir, `s-${record.id}.png`));
+        await copyFile(tempScreenshotPath, join(this.screenshotsDir, `s-${record.id}.webp`));
       } catch {
         // Source missing (already cleaned up) — record still written
       }

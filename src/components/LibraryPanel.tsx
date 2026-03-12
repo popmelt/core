@@ -27,6 +27,8 @@ type LibraryPanelProps = {
   onDeleteSpacingToken?: (tokenPath: string, originalValue: string) => void;
   onComponentAdded?: () => void;
   onComponentRemoved?: (name: string) => void;
+  onSynthesizeRules?: () => void;
+  isSynthesizing?: boolean;
 };
 
 type Tab = 'patterns' | 'principles' | 'rules';
@@ -577,16 +579,77 @@ function PrinciplesTab() {
   );
 }
 
-function RulesTab({ rules }: { rules?: string[] }) {
+type RuleItem = string | { id: string; scope: string; text: string; sources: string[] };
+
+function RulesTab({ rules, onSynthesize, isSynthesizing }: { rules?: RuleItem[]; onSynthesize?: () => void; isSynthesizing?: boolean }) {
   if (!rules || rules.length === 0) {
     return <div style={{ color: '#9ca3af', fontSize: 11 }}>No rules defined yet.</div>;
   }
+
+  // Detect structured rules
+  const isStructured = rules.some(r => typeof r === 'object' && r !== null && 'scope' in r);
+
+  if (!isStructured) {
+    // Legacy flat string list
+    return (
+      <>
+        {rules.map((rule, i) => (
+          <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 4, lineHeight: 1.4, fontSize: 11 }}>
+            <span style={{ color: '#9ca3af', flexShrink: 0 }}>{i + 1}.</span>
+            <span>{typeof rule === 'string' ? rule : (rule as { text: string }).text}</span>
+          </div>
+        ))}
+      </>
+    );
+  }
+
+  // Group structured rules by scope
+  const groups = new Map<string, { id: string; text: string }[]>();
+  for (const rule of rules) {
+    if (typeof rule === 'string') {
+      if (!groups.has('general')) groups.set('general', []);
+      groups.get('general')!.push({ id: '', text: rule });
+    } else {
+      const scope = rule.scope || 'general';
+      if (!groups.has(scope)) groups.set(scope, []);
+      groups.get(scope)!.push({ id: rule.id, text: rule.text });
+    }
+  }
+
   return (
     <>
-      {rules.map((rule, i) => (
-        <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 4, lineHeight: 1.4, fontSize: 11 }}>
-          <span style={{ color: '#9ca3af', flexShrink: 0 }}>{i + 1}.</span>
-          <span>{rule}</span>
+      {onSynthesize && (
+        <button
+          type="button"
+          disabled={isSynthesizing}
+          onClick={onSynthesize}
+          style={{
+            width: '100%',
+            border: '1px solid rgba(0,0,0,0.12)',
+            background: isSynthesizing ? 'rgba(0,0,0,0.04)' : 'rgba(0,0,0,0.02)',
+            cursor: isSynthesizing ? 'default' : 'pointer',
+            fontFamily: 'inherit',
+            fontSize: 11,
+            fontWeight: 600,
+            padding: '5px 8px',
+            marginBottom: 10,
+            color: isSynthesizing ? '#9ca3af' : '#6b7280',
+          }}
+        >
+          {isSynthesizing ? 'Synthesizing…' : 'Synthesize'}
+        </button>
+      )}
+      {Array.from(groups.entries()).map(([scope, items]) => (
+        <div key={scope} style={{ marginBottom: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 10, color: '#6b7280', letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 4 }}>
+            {scope}
+          </div>
+          {items.map((item, i) => (
+            <div key={item.id || i} style={{ display: 'flex', gap: 6, marginBottom: 3, lineHeight: 1.4, fontSize: 11 }}>
+              <span style={{ color: '#9ca3af', flexShrink: 0 }}>•</span>
+              <span>{item.text}</span>
+            </div>
+          ))}
         </div>
       ))}
     </>
@@ -777,7 +840,7 @@ function ComponentsTab({ components, selectedComponent, hoveredComponent, onRemo
 
 // --- Main ---
 
-export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onModifySpacingToken, onDeleteSpacingToken, onComponentAdded, onComponentRemoved }: LibraryPanelProps) {
+export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouseLeave, selectedComponent, hoveredComponent, onComponentHover, onSpacingTokenHover, onModifySpacingToken, onDeleteSpacingToken, onComponentAdded, onComponentRemoved, onSynthesizeRules, isSynthesizing }: LibraryPanelProps) {
   const [model, setModel] = useState<DesignModel>(undefined as unknown as DesignModel);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>(() => {
@@ -822,7 +885,7 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
   }, [onComponentRemoved]);
 
   const components = model?.components as Record<string, unknown> | undefined;
-  const rules = model?.rules as string[] | undefined;
+  const rules = model?.rules as RuleItem[] | undefined;
 
   const hasComponents = components && Object.keys(components).length > 0;
   const hasRules = rules && rules.length > 0;
@@ -883,7 +946,7 @@ export function LibraryPanel({ bridgeUrl, modelRefreshKey, onMouseEnter, onMouse
         ) : (
           <>
             {activeTab === 'patterns' && <ComponentsTab components={components} selectedComponent={selectedComponent} hoveredComponent={hoveredComponent} onRemove={handleRemove} onHover={onComponentHover} />}
-            {activeTab === 'rules' && <RulesTab rules={rules} />}
+            {activeTab === 'rules' && <RulesTab rules={rules} onSynthesize={onSynthesizeRules} isSynthesizing={isSynthesizing} />}
           </>
         )}
       </div>

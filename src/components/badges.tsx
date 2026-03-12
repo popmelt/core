@@ -64,6 +64,8 @@ export function AnnotationBadges({
   annotations,
   supersededAnnotations,
   inFlightIds,
+  activeIds,
+  queuePositions,
   scrollX,
   scrollY,
   annotationGroupMap,
@@ -75,6 +77,8 @@ export function AnnotationBadges({
   annotations: Annotation[];
   supersededAnnotations: Set<Annotation>;
   inFlightIds?: Set<string>;
+  activeIds?: Set<string>;
+  queuePositions?: Map<string, string>;
   scrollX: number;
   scrollY: number;
   annotationGroupMap: Map<string, number>;
@@ -111,6 +115,8 @@ export function AnnotationBadges({
     size: number;
     color: string;
     isInFlight: boolean;
+    isQueued: boolean;
+    queuePosition?: string;
     isNeedsReview: boolean;
     replyCount: number;
   };
@@ -170,6 +176,10 @@ export function AnnotationBadges({
     const truncated = truncateWithEllipsis(ctx, displayText, capWidth);
     const textWidth = ctx.measureText(truncated).width;
 
+    // Queued = in-flight but not yet actively running (waiting for another job)
+    const isQueued = isInFlight && !!activeIds && !activeIds.has(annotation.id)
+      && !groupAnns.some(a => activeIds.has(a.id));
+
     badges.push({
       id: annotation.id,
       threadId,
@@ -179,8 +189,19 @@ export function AnnotationBadges({
       size: lineHeightPx + PADDING * 2,
       color: annotation.color,
       isInFlight,
+      isQueued,
+      queuePosition: undefined, // filled in below
       isNeedsReview,
       replyCount,
+    });
+  }
+
+  // Assign queue positions locally from the built badges (covers annotation.status
+  // === 'in_flight' cases that aren't in queuePositions from inFlightJobs)
+  const queuedBadges = badges.filter(b => b.isQueued);
+  if (queuedBadges.length > 0) {
+    queuedBadges.forEach((b, idx) => {
+      b.queuePosition = queuePositions?.get(b.id) ?? `(${idx + 1}/${queuedBadges.length})`;
     });
   }
 
@@ -193,15 +214,18 @@ export function AnnotationBadges({
   const badgeCtx = canvasRef?.current?.getContext('2d') ?? document.createElement('canvas').getContext('2d');
   const badgeWidths: number[] = badges.map((pos) => {
     let labelText: string;
-    if (pos.isInFlight) {
+    if (pos.isQueued) {
+      labelText = pos.queuePosition ? `queued ${pos.queuePosition}` : 'queued';
+    } else if (pos.isInFlight) {
       labelText = THINKING_WORDS[wordIndex] ?? 'thinking';
     } else if (pos.replyCount > 0) {
       labelText = `${pos.replyCount} ${pos.replyCount === 1 ? 'reply' : 'replies'}`;
     } else {
       labelText = 'Cancelled';
     }
-    const iconWidth = 11; // svg icon or "?" glyph
-    const gap = 4;
+    const hasIcon = !pos.isQueued; // queued badges have no icon
+    const iconWidth = hasIcon ? 11 : 0;
+    const gap = hasIcon ? 4 : 0;
     let textPx = labelText.length * 7.2; // fallback estimate
     if (badgeCtx) {
       badgeCtx.font = `12px ${FONT_FAMILY}`;
@@ -288,7 +312,9 @@ export function AnnotationBadges({
               whiteSpace: 'nowrap',
             }}
           >
-            {pos.isInFlight ? (
+            {pos.isQueued ? (
+              <span style={{ opacity: 0.5, color: 'inherit' }}>queued{pos.queuePosition ? ` ${pos.queuePosition}` : ''}</span>
+            ) : pos.isInFlight ? (
               <>
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style={{ verticalAlign: 'middle' }}>
                   {charIndex === 1 ? (

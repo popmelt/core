@@ -200,20 +200,20 @@ export async function sendToBridge(
     let first = true;
     for (const [pathname, blob] of screenshots) {
       const encoded = encodeURIComponent(pathname);
-      formData.append(`screenshot-${encoded}`, blob, `screenshot-${encoded}.png`);
+      formData.append(`screenshot-${encoded}`, blob, `screenshot-${encoded}.webp`);
       // Backward compat: also send the first one as 'screenshot'
       if (first) {
-        formData.append('screenshot', blob, 'screenshot.png');
+        formData.append('screenshot', blob, 'screenshot.webp');
         first = false;
       }
     }
     // Edge case: empty map — send a placeholder
     if (first) {
-      formData.append('screenshot', new Blob([], { type: 'image/png' }), 'screenshot.png');
+      formData.append('screenshot', new Blob([], { type: 'image/webp' }), 'screenshot.webp');
     }
   } else {
     // Single blob (backward compat)
-    formData.append('screenshot', screenshots, 'screenshot.png');
+    formData.append('screenshot', screenshots, 'screenshot.webp');
   }
 
   formData.append('feedback', feedbackJson);
@@ -224,7 +224,7 @@ export async function sendToBridge(
   if (pastedImages) {
     for (const [annotationId, blobs] of pastedImages) {
       for (let i = 0; i < blobs.length; i++) {
-        formData.append(`image-${annotationId}-${i}`, blobs[i]!, `image-${annotationId}-${i}.png`);
+        formData.append(`image-${annotationId}-${i}`, blobs[i]!, `image-${annotationId}-${i}.webp`);
       }
     }
   }
@@ -270,7 +270,7 @@ export async function installMcp(
 export type DesignModel = {
   tokens?: Record<string, Record<string, string>>;
   components?: Record<string, Record<string, string>>;
-  rules?: string[];
+  rules?: (string | { id: string; scope: string; text: string; sources: string[] })[];
 } | null;
 
 export async function addComponentToModel(
@@ -351,6 +351,44 @@ export async function fetchModel(
   }
 }
 
+export async function restartBridge(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+): Promise<boolean> {
+  try {
+    // Try /restart first (self-respawning), fall back to /shutdown for older bridges
+    const res = await fetchWithTimeout(`${bridgeUrl}/restart`, { method: 'POST' }, 5000);
+    if (res.ok) return true;
+    // /restart returned non-200 (shouldn't happen, but just in case)
+    await fetchWithTimeout(`${bridgeUrl}/shutdown`, { method: 'POST' }, 5000);
+    return true;
+  } catch {
+    // Network error likely means /restart 404'd and the bridge is old — try shutdown
+    try {
+      await fetchWithTimeout(`${bridgeUrl}/shutdown`, { method: 'POST' }, 5000);
+    } catch {
+      // Bridge already down or unreachable
+    }
+    return true;
+  }
+}
+
+export async function synthesizeRules(
+  bridgeUrl = DEFAULT_BRIDGE_URL,
+  provider?: string,
+  model?: string,
+): Promise<{ jobId: string; threadId: string }> {
+  const res = await fetchWithTimeout(`${bridgeUrl}/model/synthesize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, model }),
+  }, 10000);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Bridge returned ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
 export async function sendReplyToBridge(
   threadId: string,
   reply: string,
@@ -378,7 +416,7 @@ export async function sendReplyToBridge(
     formData.append('screenshot', placeholder, 'screenshot.png');
     formData.append('feedback', JSON.stringify({ threadId, reply, color, provider, model, sourceId }));
     for (let i = 0; i < images.length; i++) {
-      formData.append(`image-reply-${i}`, images[i]!, `reply-image-${i}.png`);
+      formData.append(`image-reply-${i}`, images[i]!, `reply-image-${i}.webp`);
     }
     res = await fetchWithTimeout(`${bridgeUrl}/reply`, {
       method: 'POST',

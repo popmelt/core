@@ -101,7 +101,7 @@ export function spawnClaude(
   const child = spawn(claudePath, args, {
     cwd: projectRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ANTHROPIC_API_KEY: undefined },
+    env: { ...process.env, ANTHROPIC_API_KEY: undefined, CLAUDECODE: undefined },
   });
 
   const result = new Promise<SpawnResult>((resolve) => {

@@ -53,6 +53,8 @@ type AnnotationCanvasProps = {
   dispatch: React.Dispatch<AnnotationAction>;
   onScreenshot: () => Promise<boolean>;
   inFlightAnnotationIds?: Set<string>;
+  activeAnnotationIds?: Set<string>;
+  queuePositionMap?: Map<string, string>;
   inFlightStyleSelectors?: Set<string>;
   inFlightSelectorColors?: Map<string, string>;
   onAttachImages?: (annotationId: string, images: Blob[]) => void;
@@ -148,7 +150,7 @@ function calculateLinkedPosition(
   return { x, y };
 }
 
-export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds, focusedThreadAnnotationId, externalCanvasRef, toolbarRef }: AnnotationCanvasProps) {
+export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnotationIds, activeAnnotationIds, queuePositionMap, inFlightStyleSelectors, inFlightSelectorColors, onAttachImages, onReply, onViewThread, onCloseThread, onModelComponentsAdd, onModelComponentFocus, onModelComponentHover, modelComponentNames, modelPanelHoveredComponent, modelSpacingTokenHover, highlightedAnnotationIds, focusedThreadAnnotationId, externalCanvasRef, toolbarRef }: AnnotationCanvasProps) {
   const { canvasRef, redrawAll, resizeCanvas } = useCanvasDrawing();
 
   // Callback ref that sets both the internal (useCanvasDrawing) ref and the external one
@@ -3089,6 +3091,8 @@ export function AnnotationCanvas({ state, dispatch, onScreenshot, inFlightAnnota
           annotations={pageAnnotations}
           supersededAnnotations={supersededAnnotations}
           inFlightIds={inFlightAnnotationIds}
+          activeIds={activeAnnotationIds}
+          queuePositions={queuePositionMap}
           scrollX={scroll.x}
           scrollY={scroll.y}
           annotationGroupMap={annotationGroupMap}

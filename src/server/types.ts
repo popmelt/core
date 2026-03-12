@@ -108,6 +108,7 @@ export type Job = {
   imagePaths?: Record<string, string[]>; // annotationId → temp file paths for pasted images
   sourceId?: string; // SSE scoping — only the originating client sees job events
   screenshotPaths?: Record<string, string>; // pathname → temp file path for per-page screenshots
+  kind?: 'synthesize'; // flags special job types for post-processing
 };
 
 export type SSEEvent =
@@ -129,6 +130,13 @@ export type NovelPattern = {
   element: string;
   decision: string;
   reason: string;
+};
+
+export type Rule = {
+  id: string;        // 8-char hex
+  scope: string;     // category: typography, color, spacing, border, component, layout, copy, ssr, accessibility, structure
+  text: string;
+  sources: string[]; // decision IDs that informed this rule
 };
 
 export type SSEClient = {

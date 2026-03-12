@@ -59,7 +59,7 @@ export function spawnCodex(
   const child = spawn('codex', args, {
     cwd: projectRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
+    env: { ...process.env, CLAUDECODE: undefined },
   });
 
   const result = new Promise<SpawnResult>((resolve) => {

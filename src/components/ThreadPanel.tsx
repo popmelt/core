@@ -1,7 +1,7 @@
 'use client';
 
 import type { CSSProperties } from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { BridgeEvent } from '../hooks/useBridgeConnection';
 import { FONT_FAMILY, PADDING } from '../tools/text';
@@ -52,6 +52,8 @@ type ThreadPanelProps = {
   bridgeUrl: string;
   accentColor: string;
   isStreaming?: boolean;
+  isQueued?: boolean;
+  queuePosition?: string;
   streamingEvents?: BridgeEvent[];
   onClose: () => void;
   onReply?: (threadId: string, reply: string, images?: Blob[]) => void;
@@ -162,7 +164,31 @@ function stripInternalTags(text: string): string {
     .replace(/<question>[\s\S]*?<\/question>/g, '')
     .replace(/<plan>[\s\S]*?<\/plan>/g, '')
     .replace(/<review>[\s\S]*?<\/review>/g, '')
+    .replace(/<novel>[\s\S]*?<\/novel>/g, '')
     .trim();
+}
+
+type NovelPattern = { category: string; element: string; decision: string; reason: string };
+
+function parseNovelPatterns(responseText: string): NovelPattern[] {
+  const match = responseText.match(/<novel>\s*([\s\S]*?)\s*<\/novel>/);
+  if (!match?.[1]) return [];
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((p: unknown): p is NovelPattern => {
+      if (typeof p !== 'object' || p === null) return false;
+      const obj = p as Record<string, unknown>;
+      return (
+        typeof obj.category === 'string' &&
+        typeof obj.element === 'string' &&
+        typeof obj.decision === 'string' &&
+        typeof obj.reason === 'string'
+      );
+    });
+  } catch {
+    return [];
+  }
 }
 
 function formatTimestamp(ts: number): string {
@@ -572,11 +598,198 @@ function ToolGroupLine({ tool, items }: { tool: string; items: ToolGroupItem[] }
   );
 }
 
+// --- Memoized message bubble (skips re-render unless props change) ---
+type MessageBubbleProps = {
+  msg: ThreadMessage;
+  index: number;
+  bridgeUrl: string;
+  accentColor: string;
+  onLightbox: (src: string) => void;
+};
+
+const MessageBubble = memo(function MessageBubble({ msg, index: i, bridgeUrl, accentColor, onLightbox }: MessageBubbleProps) {
+  const isHuman = msg.role === 'human';
+
+  // Cancelled or errored jobs
+  if (msg.cancelled || msg.error) {
+    return (
+      <div data-msg key={`${msg.jobId}-${i}`} style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ fontSize: 11, color: msg.error ? '#dc2626' : '#9ca3af', fontStyle: 'italic' }}>
+            {msg.error ? 'Error' : 'Cancelled'}
+          </span>
+          <span style={{ fontSize: 10, color: '#9ca3af', marginLeft: 'auto' }}>
+            {formatTimestamp(msg.timestamp)}
+          </span>
+        </div>
+        {msg.error && (
+          <div style={{ fontSize: 12, color: '#6b7280', lineHeight: 1.4 }}>{msg.error}</div>
+        )}
+      </div>
+    );
+  }
+
+  const text = isHuman
+    ? (msg.replyToQuestion || msg.feedbackSummary || '(annotation)')
+    : stripInternalTags(msg.responseText || '');
+
+  const questionText = !isHuman ? msg.question : undefined;
+  const hasResolutions = !isHuman && msg.resolutions && msg.resolutions.length > 0;
+  const hasSegments = !isHuman && msg.segments && msg.segments.length > 0;
+  const hasToolsUsed = !isHuman && !hasSegments && msg.toolsUsed && msg.toolsUsed.length > 0;
+
+  if (!text && !questionText && !hasResolutions && !hasSegments) return null;
+
+  return (
+    <div data-msg key={`${msg.jobId}-${i}`} style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        {!isHuman && <ProviderIcon provider={msg.provider} size={11} style={{ color: '#6b7280' }} />}
+        <span style={{ fontWeight: 600, fontSize: 11, color: isHuman ? accentColor : '#6b7280' }}>
+          {isHuman ? 'You' : modelLabel(msg.model, msg.provider)}
+        </span>
+        <span style={{ fontSize: 10, color: '#9ca3af', marginLeft: 'auto' }}>
+          {formatTimestamp(msg.timestamp)}
+        </span>
+      </div>
+      {/* Human messages: inline thumbnails next to route/annotation */}
+      {isHuman && !msg.replyToQuestion && (() => {
+        const routeSections = text ? parseRouteSections(text) : null;
+
+        if (routeSections && msg.screenshotUrls) {
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {routeSections.map((sec, j) => {
+                const relUrl = msg.screenshotUrls?.[sec.route];
+                const thumbUrl = relUrl ? `${bridgeUrl}${relUrl}` : null;
+                return (
+                  <div key={j} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                    {thumbUrl ? (
+                      <img src={thumbUrl} title={sec.route} style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }} onClick={() => onLightbox(thumbUrl)} />
+                    ) : (
+                      <div style={{ width: THUMB_SIZE, height: THUMB_SIZE, flexShrink: 0 }} />
+                    )}
+                    <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
+                      <code style={{ fontSize: 10, backgroundColor: 'rgba(0,0,0,0.06)', padding: '1px 4px' }}>{sec.route}</code>
+                      {sec.text && <div style={{ marginTop: 2 }}>{renderMarkdown(sec.text)}</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        }
+
+        const thumbUrl = msg.screenshotUrl ? `${bridgeUrl}${msg.screenshotUrl}` : null;
+        if (thumbUrl && text) {
+          return (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+              <img src={thumbUrl} title="screenshot" style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }} onClick={() => onLightbox(thumbUrl)} />
+              <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
+                {text.includes('\n') ? renderMarkdown(text) : text}
+              </div>
+            </div>
+          );
+        }
+
+        if (text) {
+          return <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>{text.includes('\n') ? renderMarkdown(text) : text}</div>;
+        }
+        return null;
+      })()}
+      {/* Reply messages or assistant: plain text */}
+      {isHuman && msg.replyToQuestion && text && (
+        <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>{text.includes('\n') ? renderMarkdown(text) : text}</div>
+      )}
+      {!isHuman && hasSegments && msg.segments!.map((seg, si) => {
+        if (seg.kind === 'tool_group') {
+          return <ToolGroupLine key={si} tool={seg.tool} items={seg.items} />;
+        }
+        const stripped = stripInternalTags(seg.text);
+        if (!stripped) return null;
+        return <div key={si} style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>{renderMarkdown(stripped)}</div>;
+      })}
+      {!isHuman && !hasSegments && text && (
+        <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>{renderMarkdown(text)}</div>
+      )}
+      {/* Reply image thumbnails */}
+      {isHuman && msg.replyToQuestion && (() => {
+        const images = collectReplyImages(msg, bridgeUrl);
+        if (images.length === 0) return null;
+        return (
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
+            {images.map((img, j) => (
+              <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => onLightbox(img.url)} />
+            ))}
+          </div>
+        );
+      })()}
+      {/* Pasted annotation images (not screenshots) */}
+      {isHuman && !msg.replyToQuestion && (() => {
+        const images = collectPastedImages(msg, bridgeUrl);
+        if (images.length === 0) return null;
+        return (
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
+            {images.map((img, j) => (
+              <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => onLightbox(img.url)} />
+            ))}
+          </div>
+        );
+      })()}
+      {questionText && (
+        <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>{renderMarkdown(questionText)}</div>
+      )}
+      {/* Tool activity + resolution summary */}
+      {(hasToolsUsed || hasResolutions) && (
+        <div style={{ padding: '8px 16px', backgroundColor: 'rgba(0, 0, 0, 0.03)', fontSize: 11, lineHeight: 1.5, color: '#374151' }}>
+          {hasToolsUsed && (
+            <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 }}>
+              {msg.toolsUsed!.map((t, j) => <div key={j}>{t}</div>)}
+            </div>
+          )}
+          {hasResolutions && msg.resolutions!.map((r, j) => {
+            const scope = r.finalScope ?? r.inferredScope;
+            return (
+              <div key={j} style={{ marginTop: hasToolsUsed ? 4 : 0 }}>
+                <span style={{ color: r.status === 'resolved' ? '#10b981' : '#f59e0b' }}>
+                  {r.status === 'resolved' ? 'Done' : 'Needs review'}
+                </span>
+                {r.summary ? ` \u2014 ${r.summary}` : ''}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {/* Novel patterns */}
+      {!isHuman && msg.responseText && (() => {
+        const novels = parseNovelPatterns(msg.responseText);
+        if (novels.length === 0) return null;
+        return (
+          <div style={{ padding: '8px 16px', backgroundColor: 'rgba(0, 0, 0, 0.03)', fontSize: 11, lineHeight: 1.5, color: '#374151', marginTop: 2 }}>
+            {novels.map((n, j) => (
+              <div key={j} style={{ marginTop: j > 0 ? 6 : 0 }}>
+                <span style={{ display: 'inline-block', backgroundColor: '#8b5cf6', color: '#fff', fontSize: 9, fontWeight: 600, textTransform: 'uppercase', padding: '1px 5px', borderRadius: 3, marginRight: 6, verticalAlign: 'middle' }}>
+                  {n.category}
+                </span>
+                <strong>{n.element}</strong>
+                {' \u2014 '}
+                {n.decision}
+                <div style={{ color: '#9ca3af', fontStyle: 'italic', marginTop: 1 }}>{n.reason}</div>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
+    </div>
+  );
+});
+
 export function ThreadPanel({
   threadId,
   bridgeUrl,
   accentColor,
   isStreaming,
+  isQueued,
+  queuePosition,
   streamingEvents,
   onClose,
   onReply,
@@ -593,11 +806,20 @@ export function ThreadPanel({
   const [loading, setLoading] = useState(true);
   const [replyText, setReplyText] = useState('');
   const [replyImages, setReplyImages] = useState<Blob[]>([]);
-  const [inputFocused, setInputFocused] = useState(false);
+  const inputFocusedRef = useRef(false);
+  const replyAreaRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [belowCount, setBelowCount] = useState(0);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const handleLightbox = useCallback((src: string) => setLightboxSrc(src), []);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Update messages opacity + reply border based on input focus (avoids state-driven re-render)
+  const updateReplyVisuals = useCallback((focused: boolean, text: string) => {
+    const active = focused && text.trim();
+    if (scrollRef.current) scrollRef.current.style.opacity = active ? '0.65' : '1';
+    if (replyAreaRef.current) replyAreaRef.current.style.borderTop = `1px solid ${active ? accentColor : 'rgba(0,0,0,0.12)'}`;
+  }, [accentColor]);
   const panelRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef(isStreaming);
@@ -739,17 +961,27 @@ export function ThreadPanel({
     fetchThread();
   }, [fetchThread]);
 
-  // Re-fetch when streaming completes (new messages from the agent)
+  // Re-fetch when streaming completes (new messages from the agent).
+  // fetchThread is intentionally excluded from deps — we only want this to fire
+  // on the isStreaming true→false transition, not when fetchThread is recreated.
   useEffect(() => {
     if (prevStreamingRef.current && !isStreaming) {
       fetchThread();
     }
     prevStreamingRef.current = isStreaming;
-  }, [isStreaming, fetchThread]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStreaming]);
 
-  // Build a unified chronological timeline interleaving tool events and text
-  const streamSegments = streamingEvents ? buildStreamSegments(streamingEvents) : [];
-  const streamPhase = streamingEvents ? getStreamPhase(streamingEvents) : null;
+  // Build a unified chronological timeline interleaving tool events and text.
+  // Memoized on streamingEvents reference to avoid recomputing on unrelated re-renders.
+  const streamSegments = useMemo(
+    () => streamingEvents ? buildStreamSegments(streamingEvents) : [],
+    [streamingEvents],
+  );
+  const streamPhase = useMemo(
+    () => streamingEvents ? getStreamPhase(streamingEvents) : null,
+    [streamingEvents],
+  );
 
   // Track scroll position
   useEffect(() => {
@@ -928,7 +1160,7 @@ export function ThreadPanel({
 ` }} />
 
       {/* Messages */}
-      <div ref={scrollRef} style={{ ...messagesStyle, opacity: inputFocused && replyText.trim() ? 0.65 : 1, transition: 'opacity 150ms ease' }} data-devtools="thread-panel-messages">
+      <div ref={scrollRef} style={{ ...messagesStyle, transition: 'opacity 150ms ease' }} data-devtools="thread-panel-messages">
         {loading && (
           <div style={{ padding: 16, color: '#9ca3af', textAlign: 'center' }}>
             Loading...
@@ -941,313 +1173,102 @@ export function ThreadPanel({
           </div>
         )}
 
-        {messages.map((msg, i) => {
-          const isHuman = msg.role === 'human';
-          // Cancelled or errored jobs get a distinct message
-          if (msg.cancelled || msg.error) {
-            return (
-              <div
-                data-msg
-                key={`${msg.jobId}-${i}`}
-                style={{
-                  padding: 16,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 8,
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span style={{ fontSize: 11, color: msg.error ? '#dc2626' : '#9ca3af', fontStyle: 'italic' }}>
-                    {msg.error ? 'Error' : 'Cancelled'}
-                  </span>
-                  <span style={{ fontSize: 10, color: '#9ca3af', marginLeft: 'auto' }}>
-                    {formatTimestamp(msg.timestamp)}
-                  </span>
-                </div>
-                {msg.error && (
-                  <div style={{ fontSize: 12, color: '#6b7280', lineHeight: 1.4 }}>
-                    {msg.error}
-                  </div>
-                )}
-              </div>
-            );
-          }
-
-          const text = isHuman
-            ? (msg.replyToQuestion || msg.feedbackSummary || '(annotation)')
-            : stripInternalTags(msg.responseText || '');
-
-          // Show the question field separately (it's stripped from responseText by stripInternalTags)
-          const questionText = !isHuman ? msg.question : undefined;
-
-          // Build resolution summary for assistant messages that applied changes
-          const hasResolutions = !isHuman && msg.resolutions && msg.resolutions.length > 0;
-          const hasSegments = !isHuman && msg.segments && msg.segments.length > 0;
-          const hasToolsUsed = !isHuman && !hasSegments && msg.toolsUsed && msg.toolsUsed.length > 0;
-
-          if (!text && !questionText && !hasResolutions && !hasSegments) return null;
-
-
-          return (
-            <div
-              data-msg
-              key={`${msg.jobId}-${i}`}
-              style={{
-                padding: 16,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 8,
-              }}
-            >
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-              }}>
-                {!isHuman && <ProviderIcon provider={msg.provider} size={11} style={{ color: '#6b7280' }} />}
-                <span style={{
-                  fontWeight: 600,
-                  fontSize: 11,
-                  color: isHuman ? accentColor : '#6b7280',
-                }}>
-                  {isHuman ? 'You' : modelLabel(msg.model, msg.provider)}
-                </span>
-                <span style={{ fontSize: 10, color: '#9ca3af', marginLeft: 'auto' }}>
-                  {formatTimestamp(msg.timestamp)}
-                </span>
-              </div>
-              {/* Human messages: inline thumbnails next to route/annotation */}
-              {isHuman && !msg.replyToQuestion && (() => {
-                const routeSections = text ? parseRouteSections(text) : null;
-
-                if (routeSections && msg.screenshotUrls) {
-                  // Multi-page: render each route section with thumbnail to the left
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      {routeSections.map((sec, j) => {
-                        const relUrl = msg.screenshotUrls?.[sec.route];
-                        const thumbUrl = relUrl ? `${bridgeUrl}${relUrl}` : null;
-                        return (
-                          <div key={j} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
-                            {thumbUrl ? (
-                              <img
-                                src={thumbUrl}
-                                title={sec.route}
-                                style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }}
-                                onClick={() => setLightboxSrc(thumbUrl)}
-                              />
-                            ) : (
-                              <div style={{ width: THUMB_SIZE, height: THUMB_SIZE, flexShrink: 0 }} />
-                            )}
-                            <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
-                              <code style={{
-                                fontSize: 10,
-                                backgroundColor: 'rgba(0,0,0,0.06)',
-                                padding: '1px 4px',
-                              }}>{sec.route}</code>
-                              {sec.text && <div style={{ marginTop: 2 }}>{renderMarkdown(sec.text)}</div>}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  );
-                }
-
-                // Single-page: thumbnail left, text right
-                const thumbUrl = msg.screenshotUrl ? `${bridgeUrl}${msg.screenshotUrl}` : null;
-                if (thumbUrl && text) {
-                  return (
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
-                      <img
-                        src={thumbUrl}
-                        title="screenshot"
-                        style={{ ...thumbStyle, flexShrink: 0, marginTop: 1 }}
-                        onClick={() => setLightboxSrc(thumbUrl)}
-                      />
-                      <div style={{ lineHeight: 1.5, wordBreak: 'break-word', minWidth: 0 }}>
-                        {text.includes('\n') ? renderMarkdown(text) : text}
-                      </div>
-                    </div>
-                  );
-                }
-
-                // No screenshot — plain text
-                if (text) {
-                  return (
-                    <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
-                      {text.includes('\n') ? renderMarkdown(text) : text}
-                    </div>
-                  );
-                }
-                return null;
-              })()}
-              {/* Reply messages or assistant: plain text */}
-              {isHuman && msg.replyToQuestion && text && (
-                <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
-                  {text.includes('\n') ? renderMarkdown(text) : text}
-                </div>
-              )}
-              {!isHuman && hasSegments && msg.segments!.map((seg, si) => {
-                if (seg.kind === 'tool_group') {
-                  return <ToolGroupLine key={si} tool={seg.tool} items={seg.items} />;
-                }
-                const stripped = stripInternalTags(seg.text);
-                if (!stripped) return null;
-                return (
-                  <div key={si} style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
-                    {renderMarkdown(stripped)}
-                  </div>
-                );
-              })}
-              {!isHuman && !hasSegments && text && (
-                <div style={{ lineHeight: 1.5, wordBreak: 'break-word' }}>
-                  {renderMarkdown(text)}
-                </div>
-              )}
-              {/* Reply image thumbnails */}
-              {isHuman && msg.replyToQuestion && (() => {
-                const images = collectReplyImages(msg, bridgeUrl);
-                if (images.length === 0) return null;
-                return (
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
-                    {images.map((img, j) => (
-                      <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => setLightboxSrc(img.url)} />
-                    ))}
-                  </div>
-                );
-              })()}
-              {/* Pasted annotation images (not screenshots) */}
-              {isHuman && !msg.replyToQuestion && (() => {
-                const images = collectPastedImages(msg, bridgeUrl);
-                if (images.length === 0) return null;
-                return (
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
-                    {images.map((img, j) => (
-                      <img key={j} src={img.url} title={img.label} style={thumbStyle} onClick={() => setLightboxSrc(img.url)} />
-                    ))}
-                  </div>
-                );
-              })()}
-              {questionText && (
-                <div style={{
-                  lineHeight: 1.5,
-                  wordBreak: 'break-word',
-                }}>
-                  {renderMarkdown(questionText)}
-                </div>
-              )}
-              {/* Tool activity + resolution summary */}
-              {(hasToolsUsed || hasResolutions) && (
-                <div style={{
-                  padding: '8px 16px',
-                  backgroundColor: 'rgba(0, 0, 0, 0.03)',
-                  fontSize: 11,
-                  lineHeight: 1.5,
-                  color: '#374151',
-                }}>
-                  {hasToolsUsed && (
-                    <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 10 }}>
-                      {msg.toolsUsed!.map((t, j) => (
-                        <div key={j}>{t}</div>
-                      ))}
-                    </div>
-                  )}
-                  {hasResolutions && msg.resolutions!.map((r, j) => {
-                    const scope = r.finalScope ?? r.inferredScope;
-                    const scopeLabel = scope ? `${scope.breadth} \u00b7 ${scope.target}` : null;
-                    return (
-                      <div key={j} style={{ marginTop: hasToolsUsed ? 4 : 0 }}>
-                        <span style={{ color: r.status === 'resolved' ? '#10b981' : '#f59e0b' }}>
-                          {r.status === 'resolved' ? 'Done' : 'Needs review'}
-                        </span>
-                        {r.summary ? ` \u2014 ${r.summary}` : ''}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {messages.map((msg, i) => (
+          <MessageBubble key={`${msg.jobId}-${i}`} msg={msg} index={i} bridgeUrl={bridgeUrl} accentColor={accentColor} onLightbox={handleLightbox} />
+        ))}
 
         {/* Live streaming section — unified chronological timeline */}
         {isStreaming && (
           <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {/* Claude header */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <ProviderIcon provider={currentProvider} size={11} style={{ color: '#6b7280' }} />
-              <span style={{ fontWeight: 600, fontSize: 11, color: '#6b7280' }}>
-                {modelLabel(currentModel, currentProvider)}
-              </span>
-            </div>
-
-            {/* Interleaved tool actions, thinking, and response text */}
-            {streamSegments.map((seg, i) => {
-              if (seg.kind === 'tool_group') {
-                return <ToolGroupLine key={i} tool={seg.tool} items={seg.items} />;
-              }
-              if (seg.kind === 'file_content') {
-                return (
-                  <FileContentBlock
-                    key={i}
-                    file={seg.file}
-                    content={seg.content}
-                    ext={seg.ext}
-                    isPlan={seg.isPlan}
-                    onAccept={seg.isPlan && onReply ? () => onReply(threadId, 'Looks good, please proceed with implementation.') : undefined}
-                  />
-                );
-              }
-              if (seg.kind === 'thinking') {
-                return (
-                  <div
-                    key={i}
-                    style={{
-                      paddingLeft: 12,
-                      fontSize: 11,
-                      color: '#9ca3af',
-                      fontStyle: 'italic',
-                      lineHeight: 1.4,
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-word',
-                      maxHeight: 80,
-                      overflowY: 'auto',
-                    }}
-                  >
-                    {seg.text}
-                  </div>
-                );
-              }
-              // text segment
-              const stripped = stripInternalTags(seg.text);
-              if (!stripped) return null;
-              return (
-                <div
-                  key={i}
-                  style={{
-                    paddingLeft: 12,
-                    lineHeight: 1.5,
-                    wordBreak: 'break-word',
-                  }}
-                >
-                  {renderMarkdown(stripped)}
+            {isQueued ? (
+              /* Queued — waiting for another job to finish */
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill={accentColor} style={{ verticalAlign: 'middle', flexShrink: 0, opacity: 0.5 }}>
+                  <circle cx="12" cy="6" r="2" />
+                  <circle cx="6" cy="12" r="2" />
+                  <circle cx="18" cy="12" r="2" />
+                  <circle cx="12" cy="18" r="2" />
+                </svg>
+                <span style={{ fontSize: 11, color: '#9ca3af', fontStyle: 'italic' }}>queued{queuePosition ? ` ${queuePosition}` : ''}</span>
+              </div>
+            ) : (
+              <>
+                {/* Claude header */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <ProviderIcon provider={currentProvider} size={11} style={{ color: '#6b7280' }} />
+                  <span style={{ fontWeight: 600, fontSize: 11, color: '#6b7280' }}>
+                    {modelLabel(currentModel, currentProvider)}
+                  </span>
                 </div>
-              );
-            })}
 
-            {/* Thinking spinner + cancel at bottom of stream */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <ThinkingBadge color={accentColor} />
-              {onCancel && (
-                <button onClick={onCancel} style={{
-                  background: 'none', border: '1px solid rgba(0,0,0,0.1)',
-                  color: '#6b7280', fontSize: 10, padding: '2px 8px',
-                  cursor: 'pointer', fontFamily: 'inherit',
-                  marginLeft: 'auto',
-                }}>Cancel</button>
-              )}
-            </div>
+                {/* Interleaved tool actions, thinking, and response text */}
+                {streamSegments.map((seg, i) => {
+                  if (seg.kind === 'tool_group') {
+                    return <ToolGroupLine key={i} tool={seg.tool} items={seg.items} />;
+                  }
+                  if (seg.kind === 'file_content') {
+                    return (
+                      <FileContentBlock
+                        key={i}
+                        file={seg.file}
+                        content={seg.content}
+                        ext={seg.ext}
+                        isPlan={seg.isPlan}
+                        onAccept={seg.isPlan && onReply ? () => onReply(threadId, 'Looks good, please proceed with implementation.') : undefined}
+                      />
+                    );
+                  }
+                  if (seg.kind === 'thinking') {
+                    return (
+                      <div
+                        key={i}
+                        style={{
+                          paddingLeft: 12,
+                          fontSize: 11,
+                          color: '#9ca3af',
+                          fontStyle: 'italic',
+                          lineHeight: 1.4,
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          maxHeight: 80,
+                          overflowY: 'auto',
+                        }}
+                      >
+                        {seg.text}
+                      </div>
+                    );
+                  }
+                  // text segment
+                  const stripped = stripInternalTags(seg.text);
+                  if (!stripped) return null;
+                  return (
+                    <div
+                      key={i}
+                      style={{
+                        paddingLeft: 12,
+                        lineHeight: 1.5,
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {renderMarkdown(stripped)}
+                    </div>
+                  );
+                })}
+
+                {/* Thinking spinner + cancel at bottom of stream */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <ThinkingBadge color={accentColor} />
+                  {onCancel && (
+                    <button onClick={onCancel} style={{
+                      background: 'none', border: '1px solid rgba(0,0,0,0.1)',
+                      color: '#6b7280', fontSize: 10, padding: '2px 8px',
+                      cursor: 'pointer', fontFamily: 'inherit',
+                      marginLeft: 'auto',
+                    }}>Cancel</button>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -1333,14 +1354,14 @@ export function ThreadPanel({
               ))}
             </div>
           )}
-          <div style={{ ...replyAreaStyle, borderTop: `1px solid ${inputFocused && replyText.trim() ? accentColor : 'rgba(0,0,0,0.12)'}` }}>
+          <div ref={replyAreaRef} style={{ ...replyAreaStyle, borderTop: '1px solid rgba(0,0,0,0.12)' }}>
           <input
             data-popmelt-reply
             autoFocus
             value={replyText}
-            onChange={(e) => setReplyText(e.target.value)}
-            onFocus={() => setInputFocused(true)}
-            onBlur={() => setInputFocused(false)}
+            onChange={(e) => { setReplyText(e.target.value); updateReplyVisuals(inputFocusedRef.current, e.target.value); }}
+            onFocus={() => { inputFocusedRef.current = true; updateReplyVisuals(true, replyText); }}
+            onBlur={() => { inputFocusedRef.current = false; updateReplyVisuals(false, replyText); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste as unknown as React.ClipboardEventHandler<HTMLInputElement>}
             placeholder="Reply here (cmd + enter to send)"
